@@ -41,7 +41,22 @@ import {
 	resolveConfigValueUncached,
 	resolveHeadersOrThrow,
 } from "./resolve-config-value.js";
+import {
+	type CopilotApiMode,
+	copilotPinIdentity,
+	copilotPinnedBaseUrl,
+	fetchCopilotCatalogInfo,
+	resolvePinnedCopilotToken,
+} from "./copilot-credentials.js";
 
+// Built-in providers that ship in the shared pi-ai catalog but are turned off
+// in prime-agent. Filtered out of the model list so they never appear in the
+// picker, the /login options, or model resolution. The shared library keeps the
+// provider (and its own tests keep passing); this is a product-level policy.
+// Set PRIME_ENABLE_BEDROCK=1 to re-enable Amazon Bedrock without a rebuild.
+const DISABLED_PROVIDERS: ReadonlySet<string> = new Set(
+	process.env.PRIME_ENABLE_BEDROCK === "1" ? [] : ["amazon-bedrock"],
+);
 const PercentileCutoffsSchema = Type.Object({
 	p50: Type.Optional(Type.Number()),
 	p75: Type.Optional(Type.Number()),
@@ -414,6 +429,49 @@ const PRIVATE_PRIME_AUTHORIZATION_CACHE_FILE = "prime-inference-private-models.j
 const PRIVATE_PRIME_AUTHORIZATION_CACHE_TTL_MS = 5 * 60_000;
 const PRIVATE_PRIME_BACKGROUND_REFRESH_TIMEOUT_MS = 3_000;
 
+// GitHub Copilot entitlement cache. Prime's baked Copilot catalog is a superset
+// of any single account's entitlements, so an unentitled model 400s at request
+// time. We fetch the account's live /models list and filter the catalog to it.
+// Cached per-account with a TTL so startup never blocks on the network; a stale
+// cache is served immediately and refreshed in the background.
+const COPILOT_ENTITLEMENT_CACHE_FILE = "copilot-entitled-models.json";
+const COPILOT_ENTITLEMENT_CACHE_TTL_MS = 10 * 60_000;
+
+interface CopilotEntitlementCache {
+	fingerprint: string;
+	modelIds: string[];
+	/** id -> api mode from live supported_endpoints (fixes routing for grok/mai-code/etc). */
+	apiById?: Record<string, string>;
+	refreshedAt: number;
+}
+
+const COPILOT_API_MODES: ReadonlySet<string> = new Set<CopilotApiMode>([
+	"anthropic-messages",
+	"openai-responses",
+	"openai-completions",
+]);
+
+function apiByIdFromRecord(record: Record<string, string> | undefined): Map<string, CopilotApiMode> {
+	const map = new Map<string, CopilotApiMode>();
+	if (!record) {
+		return map;
+	}
+	for (const [id, api] of Object.entries(record)) {
+		if (COPILOT_API_MODES.has(api)) {
+			map.set(id, api as CopilotApiMode);
+		}
+	}
+	return map;
+}
+
+function apiByIdToRecord(map: Map<string, CopilotApiMode>): Record<string, string> {
+	const record: Record<string, string> = {};
+	for (const [id, api] of map) {
+		record[id] = api;
+	}
+	return record;
+}
+
 interface PrivatePrimeAuthorizationCache {
 	fingerprint: string;
 	modelIds: Set<string>;
@@ -445,6 +503,16 @@ export class ModelRegistry {
 	private explicitPrivatePrimeInferenceModelIds = new Set<string>();
 	private openAICodexModelsCache: { authFingerprint: string; modelIds: Set<string>; refreshedAt: number } | undefined;
 	private backgroundPrivatePrimeAuthorization: { fingerprint: string; promise: Promise<void> } | undefined;
+	// Copilot entitlement: model ids the active account is actually entitled to,
+	// loaded synchronously from the on-disk cache and refreshed asynchronously.
+	// Empty set means "unknown / not yet fetched" -> do not filter (show full catalog).
+	private copilotEntitledModelIds = new Set<string>();
+	// Per-model api mode derived from the account's live supported_endpoints,
+	// used to correct routing for models prime's name-heuristics misroute
+	// (grok, mai-code/oswe -> /responses). Empty means "use the baked api".
+	private copilotApiById = new Map<string, CopilotApiMode>();
+	private copilotEntitlementFingerprint: string | undefined;
+	private backgroundCopilotEntitlement: { fingerprint: string; promise: Promise<void> } | undefined;
 	private loadError: string | undefined = undefined;
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
@@ -522,6 +590,11 @@ export class ModelRegistry {
 			this.loadError = error;
 		}
 
+		// Load the Copilot entitlement set synchronously from the on-disk cache so
+		// loadBuiltInModels can filter to it without blocking on the network. The
+		// async refresh (refreshAvailableModels) keeps the cache current.
+		this.loadCopilotEntitlementFromCache();
+
 		this.explicitPrivatePrimeInferenceModelIds = new Set(
 			customModels.filter(isPrivatePrimeInferenceModel).map((model) => model.id),
 		);
@@ -529,6 +602,14 @@ export class ModelRegistry {
 		let combined = this.mergeCustomModels(builtInModels, customModels);
 
 		for (const oauthProvider of this.authStorage.getOAuthProviders()) {
+			// When a Copilot account/host is pinned, the pinned token (and its
+			// front-door baseUrl set in loadBuiltInModels) takes precedence over
+			// any stored OAuth credential, so skip the OAuth modifyModels rewrite
+			// for Copilot which would otherwise reset the baseUrl from a stale
+			// stored token's proxy-ep.
+			if (oauthProvider.id === "github-copilot" && copilotPinnedBaseUrl() !== undefined) {
+				continue;
+			}
 			const cred = this.authStorage.get(oauthProvider.id);
 			if (cred?.type === "oauth" && oauthProvider.modifyModels) {
 				combined = oauthProvider.modifyModels(combined, cred);
@@ -543,30 +624,66 @@ export class ModelRegistry {
 		overrides: Map<string, ProviderOverride>,
 		modelOverrides: Map<string, Map<string, ModelOverride>>,
 	): Model<Api>[] {
-		return getProviders().flatMap((provider) => {
-			const models = getModels(provider as KnownProvider) as Model<Api>[];
-			const providerOverride = overrides.get(provider);
-			const perModelOverrides = modelOverrides.get(provider);
+		return getProviders()
+			.filter((provider) => !DISABLED_PROVIDERS.has(provider))
+			.flatMap((provider) => {
+				const models = getModels(provider as KnownProvider) as Model<Api>[];
+				const providerOverride = overrides.get(provider);
+				const perModelOverrides = modelOverrides.get(provider);
+				// When a specific GitHub account/host is pinned for Copilot, the
+				// resolved token is a raw gh token with no embedded proxy-ep, so
+				// the per-plan host (api.individual.githubcopilot.com) rejects it
+				// with 421. Route Copilot to the shared front door (or enterprise
+				// Copilot host) that accepts the raw pinned token.
+				const copilotBaseUrl = provider === "github-copilot" ? copilotPinnedBaseUrl() : undefined;
 
-			return models.map((m) => {
-				let model = m;
+				// Filter Copilot to the account's live entitlements when known, so
+				// an unentitled model can never be selected (which would 400). An
+				// empty set means "unknown / not fetched yet" -> keep the full
+				// catalog rather than hiding everything.
+				const entitled = provider === "github-copilot" ? this.copilotEntitledModelIds : undefined;
+				const scopedModels =
+					entitled && entitled.size > 0 ? models.filter((m) => entitled.has(m.id)) : models;
 
-				if (providerOverride) {
-					model = {
-						...model,
-						baseUrl: providerOverride.baseUrl ?? model.baseUrl,
-						compat: mergeCompat(model.compat, providerOverride.compat),
-					};
-				}
+				return scopedModels.map((m) => {
+					let model = m;
 
-				const modelOverride = perModelOverrides?.get(m.id);
-				if (modelOverride) {
-					model = applyModelOverride(model, modelOverride);
-				}
+					if (copilotBaseUrl) {
+						model = { ...model, baseUrl: copilotBaseUrl };
+					}
 
-				return model;
+					// Correct the api mode from the account's live
+					// supported_endpoints when it disagrees with the baked
+					// routing. This fixes responses-only models (grok, mai-code/
+					// oswe) that prime's name-heuristics route to
+					// /chat/completions and that 400 there. The baked `compat`
+					// block is api-family-specific, so drop it when the family
+					// changes so a stale completions compat can't leak onto the
+					// responses path (and vice versa).
+					if (provider === "github-copilot") {
+						const liveApi = this.copilotApiById.get(m.id);
+						if (liveApi && liveApi !== model.api) {
+							const { compat: _staleCompat, ...rest } = model as Model<Api> & { compat?: unknown };
+							model = { ...rest, api: liveApi } as Model<Api>;
+						}
+					}
+
+					if (providerOverride) {
+						model = {
+							...model,
+							baseUrl: providerOverride.baseUrl ?? model.baseUrl,
+							compat: mergeCompat(model.compat, providerOverride.compat),
+						};
+					}
+
+					const modelOverride = perModelOverrides?.get(m.id);
+					if (modelOverride) {
+						model = applyModelOverride(model, modelOverride);
+					}
+
+					return model;
+				});
 			});
-		});
 	}
 
 	/** Merge custom models into built-in list by provider+id (custom wins on conflicts). */
@@ -776,9 +893,166 @@ export class ModelRegistry {
 	async refreshAvailableModels(): Promise<Model<Api>[]> {
 		const previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds);
 		const previousTeamId = this.authorizedPrivatePrimeInferenceTeamId;
+		await this.refreshCopilotEntitlement();
 		this.refresh();
 		await this.refreshPrivatePrimeInferenceAuthorization(previousPrivateModelIds, previousTeamId);
 		return this.getAvailable();
+	}
+
+	// ---- GitHub Copilot entitlement (live /models filtering) ----
+
+	private copilotEntitlementCachePath(): string | undefined {
+		if (!this.modelsJsonPath) {
+			return undefined;
+		}
+		return join(dirname(this.modelsJsonPath), COPILOT_ENTITLEMENT_CACHE_FILE);
+	}
+
+	private readCopilotEntitlementCache(): CopilotEntitlementCache | undefined {
+		const cachePath = this.copilotEntitlementCachePath();
+		if (!cachePath) {
+			return undefined;
+		}
+		try {
+			const parsed = JSON.parse(readFileSync(cachePath, "utf8")) as Partial<CopilotEntitlementCache>;
+			if (
+				typeof parsed.fingerprint !== "string" ||
+				!Array.isArray(parsed.modelIds) ||
+				typeof parsed.refreshedAt !== "number"
+			) {
+				return undefined;
+			}
+			return {
+				fingerprint: parsed.fingerprint,
+				modelIds: parsed.modelIds,
+				apiById: parsed.apiById && typeof parsed.apiById === "object" ? parsed.apiById : undefined,
+				refreshedAt: parsed.refreshedAt,
+			};
+		} catch {
+			return undefined;
+		}
+	}
+
+	private writeCopilotEntitlementCache(cache: CopilotEntitlementCache): void {
+		const cachePath = this.copilotEntitlementCachePath();
+		if (!cachePath) {
+			return;
+		}
+		try {
+			writeFileSync(cachePath, JSON.stringify(cache));
+		} catch {
+			// Non-fatal: entitlement filtering degrades to the full catalog.
+		}
+	}
+
+	/**
+	 * Synchronously seed the entitlement set from the on-disk cache, keyed by the
+	 * active Copilot identity (pinned user/host or explicit token). A cache from a
+	 * different identity is ignored so switching accounts never shows stale
+	 * entitlements. Missing/mismatched cache leaves the set empty -> full catalog.
+	 */
+	private loadCopilotEntitlementFromCache(): void {
+		const fingerprint = copilotPinIdentity();
+		this.copilotEntitlementFingerprint = fingerprint;
+		const cached = this.readCopilotEntitlementCache();
+		if (cached && cached.fingerprint === fingerprint) {
+			this.copilotEntitledModelIds = new Set(cached.modelIds);
+			this.copilotApiById = apiByIdFromRecord(cached.apiById);
+		} else {
+			this.copilotEntitledModelIds = new Set();
+			this.copilotApiById = new Map();
+		}
+	}
+
+	/**
+	 * Refresh the Copilot entitlement set from the live /models endpoint. Serves a
+	 * fresh cache without a network call; a stale cache is served immediately and
+	 * refreshed in the background. Any failure keeps the previous set (or the full
+	 * catalog when unknown), so this never hides models on a transient error.
+	 */
+	private async refreshCopilotEntitlement(): Promise<void> {
+		if (isOfflineModeEnabled()) {
+			return;
+		}
+		// Only scope for a persistent registry (one with a config dir for the
+		// cache). Ephemeral / in-memory registries skip the network fetch so a
+		// transient registry can't consume an unrelated caller's fetch or hit the
+		// network for a list it will not cache.
+		if (!this.copilotEntitlementCachePath()) {
+			return;
+		}
+		const token = resolvePinnedCopilotToken();
+		if (!token) {
+			// No resolvable Copilot token (provider not in use) — nothing to scope.
+			return;
+		}
+		const fingerprint = copilotPinIdentity();
+		const cached = this.readCopilotEntitlementCache();
+		if (cached && cached.fingerprint === fingerprint) {
+			this.copilotEntitledModelIds = new Set(cached.modelIds);
+			this.copilotApiById = apiByIdFromRecord(cached.apiById);
+			this.copilotEntitlementFingerprint = fingerprint;
+			const fresh = Date.now() - cached.refreshedAt < COPILOT_ENTITLEMENT_CACHE_TTL_MS;
+			if (fresh) {
+				return;
+			}
+			this.startBackgroundCopilotEntitlementRefresh(token, fingerprint);
+			return;
+		}
+
+		let info: Awaited<ReturnType<typeof fetchCopilotCatalogInfo>>;
+		try {
+			info = await fetchCopilotCatalogInfo(token);
+		} catch {
+			return;
+		}
+		if (info.ids.size === 0) {
+			// Empty means the fetch failed or returned nothing usable; do not hide
+			// the catalog. Leave whatever we already had (cache seed or empty).
+			return;
+		}
+		this.copilotEntitledModelIds = info.ids;
+		this.copilotApiById = info.apiById;
+		this.copilotEntitlementFingerprint = fingerprint;
+		this.writeCopilotEntitlementCache({
+			fingerprint,
+			modelIds: [...info.ids],
+			apiById: apiByIdToRecord(info.apiById),
+			refreshedAt: Date.now(),
+		});
+	}
+
+	private startBackgroundCopilotEntitlementRefresh(token: string, fingerprint: string): void {
+		if (this.backgroundCopilotEntitlement?.fingerprint === fingerprint) {
+			return;
+		}
+		const run = async () => {
+			try {
+				const info = await fetchCopilotCatalogInfo(token);
+				if (info.ids.size === 0 || copilotPinIdentity() !== fingerprint) {
+					return;
+				}
+				this.copilotEntitledModelIds = info.ids;
+				this.copilotApiById = info.apiById;
+				this.copilotEntitlementFingerprint = fingerprint;
+				this.writeCopilotEntitlementCache({
+					fingerprint,
+					modelIds: [...info.ids],
+					apiById: apiByIdToRecord(info.apiById),
+					refreshedAt: Date.now(),
+				});
+			} catch {
+				// Keep the cached entitlement.
+			}
+		};
+		const pending = this.backgroundCopilotEntitlement?.promise;
+		const promise = (pending ?? Promise.resolve()).then(run);
+		this.backgroundCopilotEntitlement = { fingerprint, promise };
+		void promise.finally(() => {
+			if (this.backgroundCopilotEntitlement?.promise === promise) {
+				this.backgroundCopilotEntitlement = undefined;
+			}
+		});
 	}
 
 	private async refreshPrivatePrimeInferenceAuthorization(

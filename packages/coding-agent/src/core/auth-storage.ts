@@ -16,6 +16,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { copilotPinIdentity, hasCopilotPin, resolvePinnedCopilotToken } from "./copilot-credentials.js";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
@@ -855,6 +856,37 @@ export class AuthStorage {
 				apiKey: runtimeKey,
 				sourceToken: this.getAuthSourceTokenForCandidate(providerId, runtimeCandidate),
 			};
+		}
+
+		// GitHub Copilot credential pinning. On a host with several gh accounts
+		// (or an ambient GH_TOKEN / GITHUB_TOKEN exported in the shell), an
+		// explicit COPILOT_GITHUB_TOKEN, or a COPILOT_GH_USER / COPILOT_GH_HOST
+		// pin, must win over both the ambient env token and the active gh
+		// account, so a different account cannot silently redirect Copilot to the
+		// wrong identity. When a pin is configured we resolve strictly from it
+		// (via `gh auth token --user/--hostname` with ambient tokens stripped) and
+		// do not fall through to the generic env/stored resolution below.
+		if (providerId === "github-copilot") {
+			const pinnedToken = resolvePinnedCopilotToken();
+			if (pinnedToken) {
+				const pinCandidate = this.createAuthSourceCandidate({
+					configured: true,
+					source: "environment",
+					label: hasCopilotPin() ? "pinned account" : undefined,
+					identityMaterial: copilotPinIdentity(),
+					valueMaterial: `${copilotPinIdentity()}\0${pinnedToken}`,
+				});
+				return {
+					apiKey: pinnedToken,
+					sourceToken: this.getAuthSourceTokenForCandidate(providerId, pinCandidate),
+				};
+			}
+			// An explicit pin was requested but no token could be resolved (e.g.
+			// gh has no credential for that user/host). Fail closed rather than
+			// leaking the wrong ambient token or active account.
+			if (hasCopilotPin()) {
+				return {};
+			}
 		}
 
 		const envCandidate = this.getEnvironmentAuthCandidate(providerId);

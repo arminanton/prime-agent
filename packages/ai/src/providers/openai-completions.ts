@@ -532,6 +532,8 @@ function createClient(
 		const copilotHeaders = buildCopilotDynamicHeaders({
 			messages: context.messages,
 			hasImages,
+			sessionId,
+			isStreaming: true,
 		});
 		Object.assign(headers, copilotHeaders);
 	}
@@ -628,7 +630,20 @@ function buildParams(
 		params.tool_choice = options.toolChoice;
 	}
 
-	if (compat.thinkingFormat === "zai" && model.reasoning) {
+	if (model.provider === "github-copilot" && model.reasoning && options?.reasoningEnabled !== false) {
+		// Copilot runs reasoning server-side but returns only the opaque
+		// encrypted handle unless the request asks for a summary, so the visible
+		// reasoning_text never arrives. Send a nested reasoning object with a
+		// detailed summary (matching the official CLI) so the thinking stream is
+		// readable. These models do not take an explicit effort scale
+		// (supportsReasoningEffort is false), so honor a requested effort when
+		// the catalog maps it and otherwise fall back to medium. Skipped when the
+		// caller explicitly disables reasoning.
+		const effort = options?.reasoningEffort
+			? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
+			: "medium";
+		(params as any).reasoning = { effort, summary: "detailed" };
+	} else if (compat.thinkingFormat === "zai" && model.reasoning) {
 		(params as any).enable_thinking = !!options?.reasoningEffort;
 	} else if (compat.thinkingFormat === "qwen" && model.reasoning) {
 		(params as any).enable_thinking = !!options?.reasoningEffort;

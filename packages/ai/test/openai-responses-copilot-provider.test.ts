@@ -91,6 +91,41 @@ describe("openai-responses provider defaults", () => {
 		});
 	});
 
+	it("never sends service_tier for Copilot (the provider rejects it with 400)", async () => {
+		const model = getModel("github-copilot", "gpt-5.5");
+		let capturedPayload: Record<string, unknown> | undefined;
+
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("data: [DONE]\n\n", {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+		);
+
+		const stream = streamOpenAIResponses(
+			model,
+			{
+				systemPrompt: "sys",
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			},
+			{
+				apiKey: "test-key",
+				// Even when the session hands us a tier, Copilot must not receive it.
+				serviceTier: "default",
+				onPayload: (payload) => {
+					capturedPayload = payload as Record<string, unknown>;
+				},
+			},
+		);
+
+		for await (const event of stream) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		expect(capturedPayload).toBeDefined();
+		expect(capturedPayload).not.toHaveProperty("service_tier");
+	});
+
 	it.each(["gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.5"] as const)(
 		"sends none reasoning effort for OpenAI %s when no reasoning is requested",
 		async (modelId) => {

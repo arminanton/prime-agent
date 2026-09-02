@@ -1,4 +1,5 @@
 import { getModels } from "../../models.js";
+import { copilotCliVersion, copilotIntegrationId, copilotUserAgent } from "../../providers/github-copilot-headers.js";
 import type { Api, Model } from "../../types.js";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "./types.js";
 
@@ -9,12 +10,19 @@ type CopilotCredentials = OAuthCredentials & {
 const decode = (s: string) => atob(s);
 const CLIENT_ID = decode("SXYxLmI1MDdhMDhjODdlY2ZlOTg=");
 
-const COPILOT_HEADERS = {
-	"User-Agent": "GitHubCopilotChat/0.35.0",
-	"Editor-Version": "vscode/1.107.0",
-	"Editor-Plugin-Version": "copilot-chat/0.35.0",
-	"Copilot-Integration-Id": "vscode-chat",
-} as const;
+// Identity presented on the Copilot control-plane calls (token refresh via
+// /copilot_internal/v2/token and per-model policy enablement). Kept in lockstep
+// with the inference-path identity from github-copilot-headers.ts so there is
+// exactly one Copilot CLI identity across every Copilot-facing request. Built
+// per-call because the values are environment-overridable.
+function copilotControlPlaneHeaders(): Record<string, string> {
+	return {
+		"User-Agent": copilotUserAgent(),
+		"Editor-Version": `copilot/${copilotCliVersion()}`,
+		"Editor-Plugin-Version": `copilot/${copilotCliVersion()}`,
+		"Copilot-Integration-Id": copilotIntegrationId(),
+	};
+}
 
 const INITIAL_POLL_INTERVAL_MULTIPLIER = 1.2;
 const SLOW_DOWN_POLL_INTERVAL_MULTIPLIER = 1.4;
@@ -100,7 +108,7 @@ async function startDeviceFlow(domain: string): Promise<DeviceCodeResponse> {
 		headers: {
 			Accept: "application/json",
 			"Content-Type": "application/x-www-form-urlencoded",
-			"User-Agent": "GitHubCopilotChat/0.35.0",
+			"User-Agent": copilotUserAgent(),
 		},
 		body: new URLSearchParams({
 			client_id: CLIENT_ID,
@@ -184,7 +192,7 @@ async function pollForGitHubAccessToken(
 			headers: {
 				Accept: "application/json",
 				"Content-Type": "application/x-www-form-urlencoded",
-				"User-Agent": "GitHubCopilotChat/0.35.0",
+				"User-Agent": copilotUserAgent(),
 			},
 			body: new URLSearchParams({
 				client_id: CLIENT_ID,
@@ -236,7 +244,7 @@ export async function refreshGitHubCopilotToken(
 		headers: {
 			Accept: "application/json",
 			Authorization: `Bearer ${refreshToken}`,
-			...COPILOT_HEADERS,
+			...copilotControlPlaneHeaders(),
 		},
 	});
 
@@ -273,7 +281,7 @@ async function enableGitHubCopilotModel(token: string, modelId: string, enterpri
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${token}`,
-				...COPILOT_HEADERS,
+				...copilotControlPlaneHeaders(),
 				"openai-intent": "chat-policy",
 				"x-interaction-type": "chat-policy",
 			},

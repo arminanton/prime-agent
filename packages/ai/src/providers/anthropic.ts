@@ -493,6 +493,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					copilotDynamicHeaders = buildCopilotDynamicHeaders({
 						messages: context.messages,
 						hasImages,
+						sessionId: options?.sessionId,
+						isStreaming: true,
 					});
 				}
 

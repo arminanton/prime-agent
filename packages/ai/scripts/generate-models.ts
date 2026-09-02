@@ -63,11 +63,18 @@ interface AiGatewayModel {
 	};
 }
 
+// Static identity baked onto each Copilot model entry. This is a fallback: the
+// live per-request identity is built in github-copilot-headers.ts and merged
+// over these values on every call. Kept in sync with that module so a
+// regenerated catalog carries the same `copilot-developer-cli` identity that
+// unlocks the full premium model catalog (rather than the smaller `vscode-chat`
+// surface). Per-call values (machine/session/interaction ids, intent,
+// initiator) are added at request time, not baked here.
 const COPILOT_STATIC_HEADERS = {
-	"User-Agent": "GitHubCopilotChat/0.35.0",
-	"Editor-Version": "vscode/1.107.0",
-	"Editor-Plugin-Version": "copilot-chat/0.35.0",
-	"Copilot-Integration-Id": "vscode-chat",
+	"User-Agent": "copilot/1.0.81-6",
+	"Editor-Version": "copilot/1.0.81-6",
+	"Editor-Plugin-Version": "copilot/1.0.81-6",
+	"Copilot-Integration-Id": "copilot-developer-cli",
 } as const;
 
 const KIMI_STATIC_HEADERS = {
@@ -1371,8 +1378,11 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 
 				// Copilot proxies Claude via the Anthropic Messages API
 				const isCopilotClaude = modelId.startsWith("claude-");
-				// gpt-5 models require responses API, others use completions
-				const needsResponsesApi = modelId.startsWith("gpt-5") || modelId.startsWith("oswe");
+				// gpt-5 and grok models require the Responses API; Copilot returns
+				// a 400 (unsupported_api_for_model) if grok is sent to
+				// /chat/completions. Everything else uses completions.
+				const needsResponsesApi =
+					modelId.startsWith("gpt-5") || modelId.startsWith("oswe") || modelId.startsWith("grok");
 
 				const api: Api = isCopilotClaude
 					? "anthropic-messages"

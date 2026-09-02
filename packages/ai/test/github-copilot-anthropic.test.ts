@@ -70,11 +70,24 @@ describe("Copilot Claude via Anthropic Messages", () => {
 		expect(opts.authToken).toBe("tid_copilot_session_test_token");
 		const headers = opts.defaultHeaders as Record<string, string>;
 
-		expect(headers["User-Agent"]).toContain("GitHubCopilotChat");
-		expect(headers["Copilot-Integration-Id"]).toBe("vscode-chat");
+		// Identity matches the official @github/copilot CLI. The
+		// copilot-developer-cli integration id is what unlocks the full premium
+		// model catalog; the User-Agent and Editor-Version present as the CLI.
+		expect(headers["User-Agent"]).toContain("copilot/");
+		expect(headers["Copilot-Integration-Id"]).toBe("copilot-developer-cli");
+		expect(headers["Editor-Version"]).toContain("copilot/");
+		expect(headers["X-GitHub-Api-Version"]).toBeTruthy();
 
+		// Agentic turn attribution + fixed CLI literals.
 		expect(headers["X-Initiator"]).toBe("user");
-		expect(headers["Openai-Intent"]).toBe("conversation-edits");
+		expect(headers["Openai-Intent"]).toBe("conversation-agent");
+		expect(headers["X-Interaction-Type"]).toBe("conversation-user");
+		expect(headers["Copilot-Harness-Id"]).toBe("copilot-sdk");
+
+		// Per-install / per-conversation / per-call ids the CLI carries.
+		expect(headers["X-Client-Machine-Id"]).toBeTruthy();
+		expect(headers["X-Client-Session-Id"]).toBeTruthy();
+		expect(headers["X-Interaction-Id"]).toBeTruthy();
 
 		const beta = headers["anthropic-beta"] ?? "";
 		expect(beta).not.toContain("fine-grained-tool-streaming");

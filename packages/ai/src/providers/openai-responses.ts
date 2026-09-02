@@ -183,6 +183,8 @@ function createClient(
 		const copilotHeaders = buildCopilotDynamicHeaders({
 			messages: context.messages,
 			hasImages,
+			sessionId,
+			isStreaming: true,
 		});
 		Object.assign(headers, copilotHeaders);
 	}
@@ -237,7 +239,10 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.temperature = options?.temperature;
 	}
 
-	if (options?.serviceTier !== undefined) {
+	// GitHub Copilot does not support the OpenAI `service_tier` parameter and
+	// rejects any value (including "default") with a 400 invalid_request_error,
+	// so never send it for Copilot. It remains an OpenAI-direct feature.
+	if (options?.serviceTier !== undefined && model.provider !== "github-copilot") {
 		params.service_tier = options.serviceTier;
 	}
 
@@ -250,9 +255,15 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 			const effort = options?.reasoningEffort
 				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
 				: "medium";
+			// Copilot performs reasoning without a summary request but then
+			// returns only the opaque encrypted handle, so the visible text
+			// never arrives. Requesting "detailed" is what makes the reasoning
+			// readable, and it surfaces measurably more text than "auto". Direct
+			// OpenAI keeps "auto".
+			const defaultSummary = model.provider === "github-copilot" ? "detailed" : "auto";
 			params.reasoning = {
 				effort: effort as NonNullable<typeof params.reasoning>["effort"],
-				summary: options?.reasoningSummary || "auto",
+				summary: options?.reasoningSummary || defaultSummary,
 			};
 			params.include = ["reasoning.encrypted_content"];
 		} else if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null) {
