@@ -186,6 +186,8 @@ export interface DaemonAgentConnectionOptions {
 	ownedSession?: boolean;
 	/** Fresh runtime context used only if the owned worker must be relaunched. */
 	ownedSessionRecoveryConfig?: AgentSessionRuntimeConfig;
+	/** Fresh runtime context used only to recover a failed resident worker. */
+	residentSessionRecoveryConfig?: AgentSessionRuntimeConfig;
 	/** Require the target worker to have been created with telemetry disabled. */
 	telemetryDisabled?: true;
 }
@@ -345,14 +347,25 @@ export class DaemonAgentConnection implements AgentConnection {
 			try {
 				await connection.attach();
 			} catch (error) {
-				if (!(transport instanceof DaemonRoutedClient)) throw error;
-				transport.fallbackToSupervisor();
-				try {
-					// This retry owns its failure; a parked request would pend the attach forever.
-					await connection.attach({ recoverable: false });
-				} catch (retryError) {
+				let attachError: unknown = error;
+				if (transport instanceof DaemonRoutedClient) {
+					transport.fallbackToSupervisor();
+					try {
+						// This retry owns its failure; a parked request would pend the attach forever.
+						await connection.attach({ recoverable: false });
+						attachError = undefined;
+					} catch (retryError) {
+						attachError = retryError;
+					}
+				}
+				if (attachError !== undefined) {
 					// A control-plane close saved during the window is the authoritative cause.
-					throw connection.initialControlPlaneClose ?? retryError;
+					if (connection.initialControlPlaneClose) throw connection.initialControlPlaneClose;
+					const recoveryCommand = await connection.createResidentWorkerRecoveryCommand();
+					if (!recoveryCommand) throw attachError;
+					// One mutation only: a lost response is uncertain and must not be replayed by this attach.
+					await connection.requestData(recoveryCommand, undefined, { recoverable: false });
+					await connection.attach({ recoverable: false });
 				}
 			}
 			connection.initialAttachPending = false;
@@ -375,39 +388,41 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	async attach(options?: { recoverable?: boolean }): Promise<void> {
 		const supportsExtensionUi = this.options.supportsExtensionUi !== false;
-		const result = await this.requestData<SessionSummary | DaemonAttachResult>(
-			{
-				type: "attach",
-				activeSessionId: this.activeSessionId,
-				supportsExtensionUi,
-				clientId: this.clientId,
-				capabilities: [
-					"attach_snapshot",
-					"event_sequence",
-					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
-					"slim_attach",
-					"chunked_snapshot",
-					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
-				],
-				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
-				launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
-				...(this.options.ownedSession &&
-				this.options.ownedSessionRecoveryConfig &&
-				this.client.supportsServerCapability("owned_session_recovery_context")
-					? { recoveryConfig: this.options.ownedSessionRecoveryConfig }
-					: {}),
-				telemetryDisabled: this.options.telemetryDisabled,
-				resumeCursor:
-					this.lastEventCursor === undefined
-						? undefined
-						: {
-								activeSessionId: this.activeSessionId,
-								...this.lastEventCursor,
-							},
-			},
-			undefined,
-			options,
-		);
+		const attachCommand: Extract<DaemonCommand, { type: "attach" }> = {
+			type: "attach",
+			activeSessionId: this.activeSessionId,
+			supportsExtensionUi,
+			clientId: this.clientId,
+			capabilities: [
+				"attach_snapshot",
+				"event_sequence",
+				...(supportsExtensionUi ? (["extension_ui"] as const) : []),
+				"slim_attach",
+				"chunked_snapshot",
+				...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
+				...((this.options.residentSessionRecoveryConfig || this.options.ownedSessionRecoveryConfig) &&
+				this.client.supportsServerCapability("resident_worker_recovery_context")
+					? (["resident_worker_recovery_notifications"] as const)
+					: []),
+			],
+			env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
+			launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
+			...(this.options.ownedSession &&
+			this.options.ownedSessionRecoveryConfig &&
+			this.client.supportsServerCapability("owned_session_recovery_context")
+				? { recoveryConfig: this.options.ownedSessionRecoveryConfig }
+				: {}),
+			telemetryDisabled: this.options.telemetryDisabled,
+			resumeCursor:
+				this.lastEventCursor === undefined
+					? undefined
+					: {
+							activeSessionId: this.activeSessionId,
+							...this.lastEventCursor,
+						},
+		};
+		const result = await this.requestData<SessionSummary | DaemonAttachResult>(attachCommand, undefined, options);
+
 		this.activeSessionId = getAttachActiveSessionId(result);
 		const summary = "snapshot" in result ? result.snapshot.summary : result;
 		this.attachedSessionId = summary.sessionId;
@@ -1368,6 +1383,10 @@ export class DaemonAgentConnection implements AgentConnection {
 					"slim_attach",
 					"chunked_snapshot",
 					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
+					...((this.options.residentSessionRecoveryConfig || this.options.ownedSessionRecoveryConfig) &&
+					this.client.supportsServerCapability("resident_worker_recovery_context")
+						? (["resident_worker_recovery_notifications"] as const)
+						: []),
 				],
 				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
 				launchEnv: this.options.ownedSession ? collectDaemonLaunchEnv() : undefined,
@@ -1568,6 +1587,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			const result = await operation(promoteOwnedSession);
 			if (promoteOwnedSession) {
 				this.options.ownedSession = false;
+				this.options.residentSessionRecoveryConfig ??= this.options.ownedSessionRecoveryConfig;
 			}
 			return result;
 		});
@@ -1576,6 +1596,60 @@ export class DaemonAgentConnection implements AgentConnection {
 			() => undefined,
 		);
 		return run;
+	}
+
+	private residentWorkerRecoveryCommandForSummary(
+		target: SessionSummary,
+	): Extract<DaemonCommand, { type: "retry_worker" }> | undefined {
+		const config = this.options.residentSessionRecoveryConfig;
+		if (
+			this.options.ownedSession ||
+			!config ||
+			target.workerState !== "failed" ||
+			!this.client.supportsServerCapability("resident_worker_recovery_context")
+		) {
+			return undefined;
+		}
+		return {
+			type: "retry_worker",
+			activeSessionId: target.activeSessionId ?? target.id,
+			recoveryContext: {
+				config,
+				...(this.options.sendClientEnv ? { env: collectDaemonClientEnv() } : {}),
+				launchEnv: collectDaemonLaunchEnv(),
+			},
+		};
+	}
+
+	private async createResidentWorkerRecoveryCommand(): Promise<
+		Extract<DaemonCommand, { type: "retry_worker" }> | undefined
+	> {
+		if (
+			this.options.ownedSession ||
+			!this.options.residentSessionRecoveryConfig ||
+			!this.client.supportsServerCapability("resident_worker_recovery_context")
+		) {
+			return undefined;
+		}
+		const listed = await this.requestData<{ sessions: SessionSummary[] }>({ type: "list" }, 5000, {
+			recoverable: false,
+		});
+		if (this.disposed || this.terminalCloseEmitted || this.updateRestartPending) return undefined;
+		const target = listed.sessions.find(
+			(summary) =>
+				(summary.activeSessionId ?? summary.id) === this.activeSessionId ||
+				(this.attachedSessionId !== undefined && summary.sessionId === this.attachedSessionId) ||
+				(this.attachedSessionFile !== undefined && summary.sessionFile === this.attachedSessionFile),
+		);
+		if (!target) return undefined;
+		const recoveredActiveSessionId = target.activeSessionId ?? target.id;
+		if (recoveredActiveSessionId !== this.activeSessionId) {
+			this.activeSessionId = recoveredActiveSessionId;
+			this.lastEventSequence = undefined;
+			this.lastEventCursor = undefined;
+			this.retiredEventGenerations.clear();
+		}
+		return this.residentWorkerRecoveryCommandForSummary(target);
 	}
 
 	private async reconnect(cause: Error): Promise<void> {
@@ -1588,6 +1662,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			let deadline: number | undefined;
 			let attempt = 0;
 			let lastError: Error = cause;
+			let residentRecoveryAttempted = false;
 			while (!this.disposed) {
 				// A held direct link owns session liveness: control-plane recovery retries unbounded,
 				// and the bounded session-plane deadline arms only once the direct link is gone.
@@ -1604,8 +1679,14 @@ export class DaemonAgentConnection implements AgentConnection {
 					if (this.disposed) {
 						return;
 					}
-					await this.client.connect(1000);
-					await this.client.waitForHello(3000);
+					const controlPlaneReady =
+						this.client instanceof DaemonRoutedClient
+							? this.client.isControlPlaneReady
+							: this.client.isConnected && this.client.hello !== undefined;
+					if (!controlPlaneReady) {
+						await this.client.connect(1000);
+						await this.client.waitForHello(3000);
+					}
 					controlPlaneHandshakeComplete = true;
 					if (directSessionHeld) {
 						// The roster subscription is a control-plane accessory; its usual rebind seam (attach) is skipped while held.
@@ -1637,11 +1718,31 @@ export class DaemonAgentConnection implements AgentConnection {
 						return;
 					}
 					// A direct-half failure must not tear down a control-plane socket with a completed handshake.
-					const shouldResetControlPlane =
-						!(this.client instanceof DaemonRoutedClient) ||
+					let shouldResetControlPlane =
 						!controlPlaneHandshakeComplete ||
 						error instanceof DaemonControlPlaneTransportError ||
-						!this.client.isControlPlaneReady;
+						(this.client instanceof DaemonRoutedClient
+							? !this.client.isControlPlaneReady
+							: !this.definitiveRequestErrors.has(lastError));
+					if (!shouldResetControlPlane && !residentRecoveryAttempted) {
+						try {
+							const recoveryCommand = await this.createResidentWorkerRecoveryCommand();
+							if (recoveryCommand) {
+								// Mark before dispatch: a lost response is uncertain and must never cause a second mutation.
+								residentRecoveryAttempted = true;
+								await this.requestData(recoveryCommand, undefined, { recoverable: false });
+								attempt = 0;
+								continue;
+							}
+						} catch (recoveryError) {
+							lastError = recoveryError instanceof Error ? recoveryError : new Error(String(recoveryError));
+							shouldResetControlPlane =
+								lastError instanceof DaemonControlPlaneTransportError ||
+								(this.client instanceof DaemonRoutedClient
+									? !this.client.isControlPlaneReady
+									: !this.client.isConnected);
+						}
+					}
 					if (shouldResetControlPlane) this.client.resetTransportForReconnect();
 					if (deadline !== undefined && deadline - Date.now() <= 0) {
 						break;
@@ -1694,6 +1795,12 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (!this.isMessageForActiveSession(message)) {
+			return;
+		}
+		if (message.type === "session_worker_recovering") {
+			if (!this.initialAttachPending && !this.disposed && !this.terminalCloseEmitted && !this.updateRestartPending) {
+				void this.reconnect(new Error("The resident session worker disconnected and is recovering."));
+			}
 			return;
 		}
 		if ("snapshotId" in message && this.ignoredSnapshotIds.has(message.snapshotId)) {
@@ -1929,6 +2036,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
 		let lastError: unknown;
+		let residentRecoveryAttempted = false;
 		while (!this.disposed && Date.now() < deadline) {
 			try {
 				await this.client.reconnect(1000);
@@ -1951,6 +2059,14 @@ export class DaemonAgentConnection implements AgentConnection {
 							(sessionId !== undefined && summary.sessionId === sessionId)),
 				);
 				if (restored?.activeSessionId) {
+					if (restored.workerState === "failed" && !residentRecoveryAttempted) {
+						const recoveryCommand = this.residentWorkerRecoveryCommandForSummary(restored);
+						if (recoveryCommand) {
+							residentRecoveryAttempted = true;
+							await this.requestData(recoveryCommand, undefined, { recoverable: false });
+							continue;
+						}
+					}
 					if (this.disposed) {
 						return;
 					}

@@ -1108,6 +1108,7 @@ export class SessionManager {
 	private flushed: boolean = false;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
+	private entryByMessage = new WeakMap<AgentMessage, SessionMessageEntry>();
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
@@ -1221,6 +1222,7 @@ export class SessionManager {
 		};
 		this.fileEntries = [header];
 		this.byId.clear();
+		this.entryByMessage = new WeakMap();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
@@ -1232,14 +1234,21 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	private _indexMessageEntry(entry: SessionMessageEntry): void {
+		if (typeof entry.message !== "object" || entry.message === null) return;
+		if (!this.entryByMessage.has(entry.message)) this.entryByMessage.set(entry.message, entry);
+	}
+
 	private _buildIndex(): void {
 		this.byId.clear();
+		this.entryByMessage = new WeakMap();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
+			if (entry.type === "message") this._indexMessageEntry(entry);
 			this.leafId = entry.id;
 			if (entry.type === "label") {
 				if (entry.label) {
@@ -1387,6 +1396,7 @@ export class SessionManager {
 	private _appendEntry(entry: SessionEntry): void {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
+		if (entry.type === "message") this._indexMessageEntry(entry);
 		this.leafId = entry.id;
 		this._persist(entry);
 	}
@@ -1711,6 +1721,10 @@ export class SessionManager {
 
 	getEntry(id: string): SessionEntry | undefined {
 		return this.byId.get(id);
+	}
+
+	getMessageEntry(message: AgentMessage): SessionMessageEntry | undefined {
+		return this.entryByMessage.get(message);
 	}
 
 	getChildren(parentId: string): SessionEntry[] {

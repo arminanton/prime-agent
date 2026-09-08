@@ -1,0 +1,3 @@
+- Fixed large recursive sessions exhausting worker memory by passivating safe child runtimes under pressure and bounding retained kernel diagnostics.
+- Added automatic recovery for crashed resident workers using fresh client context without replaying uncertain operations.
+- Fixed automatic compaction to honor provider prompt limits before requests overflow.

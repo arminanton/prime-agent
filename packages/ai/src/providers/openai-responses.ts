@@ -22,7 +22,11 @@ import {
 	streamFailureFromStopReason,
 } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
-import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import {
+	buildCopilotDynamicHeaders,
+	hasCopilotVisionInput,
+	sanitizeCopilotModelHeaders,
+} from "./github-copilot-headers.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
 
@@ -177,12 +181,16 @@ function createClient(
 	}
 
 	const compat = getCompat(model);
-	const headers = { ...model.headers };
+	const headers =
+		model.provider === "github-copilot"
+			? sanitizeCopilotModelHeaders(model.headers, model.api)
+			: { ...model.headers };
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
 			messages: context.messages,
 			hasImages,
+			api: model.api,
 			sessionId,
 			isStreaming: true,
 		});
@@ -231,6 +239,9 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		store: false,
 	};
 
+	// `long_context` is a client-side catalog/session tier in Copilot CLI
+	// 1.0.84-1. Paired captures found no inference body or header field for it.
+
 	if (options?.maxTokens) {
 		params.max_output_tokens = options?.maxTokens;
 	}
@@ -248,6 +259,10 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertResponsesTools(context.tools);
+		if (model.provider === "github-copilot") {
+			// Copilot CLI 1.0.84-1 opts into parallel calls when tools exist.
+			params.parallel_tool_calls = true;
+		}
 	}
 
 	if (model.reasoning) {
@@ -255,15 +270,12 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 			const effort = options?.reasoningEffort
 				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
 				: "medium";
-			// Copilot performs reasoning without a summary request but then
-			// returns only the opaque encrypted handle, so the visible text
-			// never arrives. Requesting "detailed" is what makes the reasoning
-			// readable, and it surfaces measurably more text than "auto". Direct
-			// OpenAI keeps "auto".
-			const defaultSummary = model.provider === "github-copilot" ? "detailed" : "auto";
+			// Copilot CLI 1.0.84-1 uses the Responses API default summary
+			// mode explicitly. Keep caller overrides for providers that support
+			// concise or detailed summaries.
 			params.reasoning = {
 				effort: effort as NonNullable<typeof params.reasoning>["effort"],
-				summary: options?.reasoningSummary || defaultSummary,
+				summary: options?.reasoningSummary || "auto",
 			};
 			params.include = ["reasoning.encrypted_content"];
 		} else if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null) {

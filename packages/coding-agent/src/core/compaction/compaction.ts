@@ -200,6 +200,10 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 	};
 }
 
+export function resolveModelInputTokenLimit(model: { contextWindow: number; maxInputTokens?: number }): number {
+	return Math.min(model.contextWindow, model.maxInputTokens ?? model.contextWindow);
+}
+
 /**
  * Check if compaction should trigger based on context usage.
  */

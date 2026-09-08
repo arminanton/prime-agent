@@ -16,10 +16,10 @@ import {
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { copilotPinIdentity, hasCopilotPin, resolvePinnedCopilotToken } from "./copilot-credentials.js";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
+import { copilotPinIdentity, hasCopilotPin, resolvePinnedCopilotToken } from "./copilot-credentials.js";
 import {
 	clearPrimeCliCredentials,
 	getPrimeCliConfigPath,

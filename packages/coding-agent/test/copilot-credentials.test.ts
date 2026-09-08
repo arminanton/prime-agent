@@ -156,13 +156,34 @@ describe("copilot api-mode routing from supported_endpoints", () => {
 });
 
 describe("fetchCopilotCatalogInfo", () => {
-	function mockModelsResponse(models: Array<{ id: string; supported_endpoints?: string[] }>): typeof fetch {
+	function mockModelsResponse(
+		models: Array<{
+			id: string;
+			supported_endpoints?: string[];
+			policy?: { state: "enabled" | "disabled" | "unconfigured" };
+		}>,
+	): typeof fetch {
 		return (async () =>
 			new Response(JSON.stringify({ data: models }), {
 				status: 200,
 				headers: { "content-type": "application/json" },
 			})) as unknown as typeof fetch;
 	}
+
+	it("uses the per-plan API host embedded in a stored OAuth token", async () => {
+		let requestedUrl = "";
+		await fetchCopilotCatalogInfo("tid=test;proxy-ep=proxy.business.githubcopilot.com;", {
+			fetchFn: (async (input: string | URL | Request) => {
+				requestedUrl = String(input);
+				return new Response(JSON.stringify({ data: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}) as typeof fetch,
+		});
+
+		expect(requestedUrl).toBe("https://api.business.githubcopilot.com/models");
+	});
 
 	it("returns entitled ids and per-model api routing from supported_endpoints", async () => {
 		const info = await fetchCopilotCatalogInfo("gho_test", {
@@ -175,6 +196,7 @@ describe("fetchCopilotCatalogInfo", () => {
 				{ id: "gpt-5.5", supported_endpoints: ["/responses", "ws:/responses"] },
 			]),
 		});
+		expect(info.catalogAvailable).toBe(true);
 		expect([...info.ids].sort()).toEqual([
 			"claude-opus-4.8",
 			"gemini-3.5-flash",
@@ -189,11 +211,27 @@ describe("fetchCopilotCatalogInfo", () => {
 		expect(info.apiById.get("gpt-5.5")).toBe("openai-responses");
 	});
 
+	it("excludes models whose live policy is disabled or unconfigured", async () => {
+		const info = await fetchCopilotCatalogInfo("gho_test", {
+			baseUrl: "https://api.githubcopilot.com",
+			fetchFn: mockModelsResponse([
+				{ id: "enabled", policy: { state: "enabled" }, supported_endpoints: ["/responses"] },
+				{ id: "unconfigured", policy: { state: "unconfigured" }, supported_endpoints: ["/responses"] },
+				{ id: "disabled", policy: { state: "disabled" }, supported_endpoints: ["/responses"] },
+			]),
+		});
+
+		expect(info.catalogAvailable).toBe(true);
+		expect([...info.ids]).toEqual(["enabled"]);
+		expect([...info.apiById.keys()]).toEqual(["enabled"]);
+	});
+
 	it("returns empty structures on a non-200 (caller keeps the full catalog)", async () => {
 		const info = await fetchCopilotCatalogInfo("gho_test", {
 			baseUrl: "https://api.githubcopilot.com",
 			fetchFn: (async () => new Response("nope", { status: 403 })) as unknown as typeof fetch,
 		});
+		expect(info.catalogAvailable).toBe(false);
 		expect(info.ids.size).toBe(0);
 		expect(info.apiById.size).toBe(0);
 	});

@@ -457,6 +457,8 @@ export interface Model<TApi extends Api> {
 		cacheWrite: number; // $/million tokens
 	};
 	contextWindow: number;
+	/** Maximum prompt/input tokens accepted by the provider when lower than the total context window. */
+	maxInputTokens?: number;
 	maxTokens: number;
 	/** Flagship model surfaced above non-featured models of the same provider in pickers. */
 	featured?: boolean;

@@ -36,7 +36,11 @@ import { headersToRecord } from "../utils/headers.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
-import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import {
+	buildCopilotDynamicHeaders,
+	hasCopilotVisionInput,
+	sanitizeCopilotModelHeaders,
+} from "./github-copilot-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -526,12 +530,16 @@ function createClient(
 		apiKey = process.env.OPENAI_API_KEY;
 	}
 
-	const headers = { ...model.headers };
+	const headers =
+		model.provider === "github-copilot"
+			? sanitizeCopilotModelHeaders(model.headers, model.api)
+			: { ...model.headers };
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
 			messages: context.messages,
 			hasImages,
+			api: model.api,
 			sessionId,
 			isStreaming: true,
 		});
@@ -638,11 +646,16 @@ function buildParams(
 		// readable. These models do not take an explicit effort scale
 		// (supportsReasoningEffort is false), so honor a requested effort when
 		// the catalog maps it and otherwise fall back to medium. Skipped when the
-		// caller explicitly disables reasoning.
-		const effort = options?.reasoningEffort
-			? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
-			: "medium";
-		(params as any).reasoning = { effort, summary: "detailed" };
+		// caller explicitly disables reasoning. A null catalog mapping is an
+		// explicit rejection, so omit effort instead of sending an unsupported
+		// Prime level. Without a request, use medium only when the catalog allows it.
+		const requestedEffort = options?.reasoningEffort;
+		const mappedEffort = requestedEffort ? model.thinkingLevelMap?.[requestedEffort] : model.thinkingLevelMap?.medium;
+		const effort = requestedEffort ? (mappedEffort === undefined ? requestedEffort : mappedEffort) : mappedEffort;
+		(params as any).reasoning = {
+			...(effort ? { effort } : {}),
+			summary: "detailed",
+		};
 	} else if (compat.thinkingFormat === "zai" && model.reasoning) {
 		(params as any).enable_thinking = !!options?.reasoningEffort;
 	} else if (compat.thinkingFormat === "qwen" && model.reasoning) {

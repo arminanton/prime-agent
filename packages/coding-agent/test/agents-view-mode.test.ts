@@ -272,6 +272,8 @@ describe("AgentsViewMode", () => {
 			supportsExtensionUi: false,
 			recoverDaemon: self.options.recoverDaemon,
 			reconnectTimeoutMs: 1234,
+			sendClientEnv: true,
+			residentSessionRecoveryConfig: { telemetryDisabled: true },
 			telemetryDisabled: true,
 		});
 		expect(modeMocks.connectionPrompt).toHaveBeenCalledWith("private prompt", {

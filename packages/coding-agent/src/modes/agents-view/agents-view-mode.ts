@@ -31,6 +31,7 @@ import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
 import {
 	collectDaemonClientEnv,
+	collectDaemonLaunchEnv,
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonResponse,
@@ -337,6 +338,8 @@ async function openAgentsViewSession(
 				closeClientOnDispose: true,
 				recoverDaemon: options.recoverDaemon,
 				reconnectTimeoutMs: options.reconnectTimeoutMs,
+				sendClientEnv: true,
+				residentSessionRecoveryConfig: createAgentsViewResumeConfig(options.config),
 				telemetryDisabled: options.config.telemetryDisabled,
 			});
 			return { connection, summary };
@@ -360,6 +363,8 @@ async function openAgentsViewSession(
 			closeClientOnDispose: true,
 			recoverDaemon: options.recoverDaemon,
 			reconnectTimeoutMs: options.reconnectTimeoutMs,
+			sendClientEnv: true,
+			residentSessionRecoveryConfig: createAgentsViewResumeConfig(options.config),
 			telemetryDisabled: options.config.telemetryDisabled,
 		});
 		return { connection, summary: resumed.summary, cwdFallbackNotice: resumed.cwdFallbackNotice };
@@ -387,6 +392,9 @@ async function resumeSavedAgentsViewSession(
 		type: "create",
 		config: createAgentsViewResumeConfig(config, overrideCwd),
 		sessionPath: summary.sessionFile,
+		env: collectDaemonClientEnv(),
+		launchEnv: collectDaemonLaunchEnv(),
+		lifecycle: "resident",
 	});
 	const createdSummary = expectSessionSummary(requireDaemonData(response));
 	return {
@@ -2106,6 +2114,8 @@ export class AgentsViewMode implements Component, Focusable {
 				supportsExtensionUi: false,
 				recoverDaemon: this.options.recoverDaemon,
 				reconnectTimeoutMs: this.options.reconnectTimeoutMs,
+				sendClientEnv: true,
+				residentSessionRecoveryConfig: createAgentsViewResumeConfig(this.options.config),
 				telemetryDisabled: true,
 			});
 			try {

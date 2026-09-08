@@ -67,6 +67,7 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.js";
+import { matchesSessionIdSuffix } from "./core/session-id.js";
 import { canonicalSessionPath, SessionAlreadyActiveError } from "./core/session-lease.js";
 import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
@@ -891,6 +892,28 @@ function isUnknownActiveSessionError(message: string): boolean {
 	return message.startsWith("Unknown active session:");
 }
 
+function isFailedSessionWorkerError(message: string): boolean {
+	return message === "Session worker is failed";
+}
+
+function findUniqueDaemonSessionSummary(
+	summaries: readonly SessionSummary[],
+	selector: string,
+): SessionSummary | undefined {
+	const exact = summaries.filter(
+		(summary) =>
+			(summary.activeSessionId ?? summary.id) === selector ||
+			summary.sessionId === selector ||
+			summary.sessionName === selector,
+	);
+	if (exact.length > 0) return exact.length === 1 ? exact[0] : undefined;
+	const suffix = summaries.filter((summary) => {
+		const activeSessionId = summary.activeSessionId ?? summary.id;
+		return matchesSessionIdSuffix(activeSessionId, selector) || matchesSessionIdSuffix(summary.sessionId, selector);
+	});
+	return suffix.length === 1 ? suffix[0] : undefined;
+}
+
 async function findActiveDaemonSessionSummary(
 	socketPath: string,
 	selector: string,
@@ -903,6 +926,10 @@ async function findActiveDaemonSessionSummary(
 		if (!response.success) {
 			if (isUnknownActiveSessionError(response.error)) {
 				return undefined;
+			}
+			if (isFailedSessionWorkerError(response.error)) {
+				const failed = findUniqueDaemonSessionSummary(await listActiveDaemonSessionSummaries(client), selector);
+				if (failed) return failed;
 			}
 			throw new Error(response.error);
 		}
@@ -968,6 +995,7 @@ async function createDaemonClientConnection(options: {
 				sendClientEnv: true,
 				ownedSession: options.clientOwned,
 				ownedSessionRecoveryConfig: options.clientOwned ? options.config : undefined,
+				residentSessionRecoveryConfig: options.clientOwned ? undefined : options.config,
 				supportsExtensionUi: options.supportsExtensionUi,
 				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 				telemetryDisabled: options.config.telemetryDisabled,
@@ -1020,12 +1048,16 @@ async function createDaemonClientConnection(options: {
 	}
 }
 
-async function findAttachedDaemonSessionSummary(
+export async function findAttachedDaemonSessionSummary(
 	client: DaemonClient,
 	activeSessionId: string,
 ): Promise<SessionSummary> {
 	const response = await client.request({ type: "get_state", activeSessionId });
 	if (!response.success) {
+		if (isFailedSessionWorkerError(response.error)) {
+			const failed = findUniqueDaemonSessionSummary(await listActiveDaemonSessionSummaries(client), activeSessionId);
+			if (failed) return failed;
+		}
 		throw new Error(response.error);
 	}
 	if (!isDaemonSessionSummary(response.data)) {

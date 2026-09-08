@@ -33,6 +33,7 @@ function makeFakeEndpoint(hello: unknown = HELLO) {
 			supportsServerCapability: (capability: string) =>
 				Array.isArray((hello as { serverCapabilities?: string[] })?.serverCapabilities) &&
 				(hello as { serverCapabilities: string[] }).serverCapabilities.includes(capability),
+			waitForHello: async () => hello,
 			onMessage: () => () => {},
 			onClose: () => () => {},
 			request: async (command: { type: string }): Promise<DaemonResponse> => {

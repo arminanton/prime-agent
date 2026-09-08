@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { AnthropicMessagesCompat, Api, Context, Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
 import { getApiProvider } from "@earendil-works/pi-ai";
 import { getOAuthProvider, registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry, type ProviderConfigInput } from "../src/core/model-registry.js";
 
@@ -21,6 +21,8 @@ describe("ModelRegistry", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
 		}
@@ -83,6 +85,80 @@ describe("ModelRegistry", () => {
 	const emptyContext: Context = {
 		messages: [],
 	};
+
+	test("offers legacy Copilot candidates only after stored OAuth live entitlement confirms them", async () => {
+		vi.stubEnv("COPILOT_GH_USER", "");
+		vi.stubEnv("COPILOT_GH_HOST", "");
+		authStorage.set("github-copilot", {
+			type: "oauth",
+			refresh: "stored-refresh-token",
+			access: "tid=test;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com;",
+			expires: Date.now() + 60_000,
+		});
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		expect(registry.find("github-copilot", "gemini-3.1-pro-preview")).toBeUndefined();
+		expect(registry.find("google", "gemini-2.5-pro")).toBeDefined();
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(
+				async () =>
+					new Response(
+						JSON.stringify({
+							data: [
+								{
+									id: "gemini-3.1-pro-preview",
+									policy: { state: "enabled" },
+									supported_endpoints: ["/chat/completions"],
+								},
+								{ id: "gemini-3-pro-preview", policy: { state: "unconfigured" } },
+							],
+						}),
+						{ status: 200, headers: { "content-type": "application/json" } },
+					),
+			),
+		);
+
+		await registry.refreshAvailableModels();
+
+		expect(registry.find("github-copilot", "gemini-3.1-pro-preview")).toBeDefined();
+		expect(registry.find("github-copilot", "gemini-3-pro-preview")).toBeUndefined();
+
+		authStorage.set("github-copilot", {
+			type: "oauth",
+			refresh: "other-refresh-token",
+			access: "tid=other;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com;",
+			expires: Date.now() + 60_000,
+		});
+		const otherAccount = ModelRegistry.create(authStorage, modelsJsonPath);
+		expect(otherAccount.find("github-copilot", "gpt-5.6-sol")).toBeDefined();
+		expect(otherAccount.find("github-copilot", "gemini-3.1-pro-preview")).toBeUndefined();
+	});
+
+	test("treats a valid live catalog with only blocked policies as known empty", async () => {
+		vi.stubEnv("COPILOT_GH_USER", "");
+		vi.stubEnv("COPILOT_GH_HOST", "");
+		authStorage.set("github-copilot", {
+			type: "oauth",
+			refresh: "stored-refresh-token",
+			access: "tid=test;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com;",
+			expires: Date.now() + 60_000,
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(
+				async () =>
+					new Response(JSON.stringify({ data: [{ id: "gpt-5.6-sol", policy: { state: "unconfigured" } }] }), {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					}),
+			),
+		);
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+
+		await registry.refreshAvailableModels();
+
+		expect(getModelsForProvider(registry, "github-copilot")).toEqual([]);
+	});
 
 	describe("baseUrl override (no custom models)", () => {
 		test("overriding baseUrl keeps all built-in models", () => {
@@ -498,6 +574,52 @@ describe("ModelRegistry", () => {
 			expect(compat?.supportsLongCacheRetention).toBe(false);
 		});
 
+		test("custom models preserve a separate prompt token limit", () => {
+			writeRawModelsJson({
+				demo: {
+					baseUrl: "https://example.com",
+					apiKey: "DEMO_KEY",
+					api: "openai-responses",
+					models: [
+						{
+							id: "prompt-capped-model",
+							reasoning: true,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 1_050_000,
+							maxInputTokens: 922_000,
+							maxTokens: 128_000,
+						},
+					],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+
+			expect(registry.find("demo", "prompt-capped-model")?.maxInputTokens).toBe(922_000);
+		});
+
+		test("rejects a prompt token limit above the total context window", () => {
+			writeRawModelsJson({
+				demo: {
+					baseUrl: "https://example.com",
+					apiKey: "DEMO_KEY",
+					api: "openai-responses",
+					models: [
+						{
+							id: "invalid-prompt-cap",
+							contextWindow: 128_000,
+							maxInputTokens: 200_000,
+							maxTokens: 8_000,
+						},
+					],
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			expect(registry.getError()).toContain("invalid maxInputTokens");
+		});
+
 		test("model-level baseUrl overrides provider-level baseUrl for custom models", () => {
 			writeRawModelsJson({
 				"opencode-go": {
@@ -623,6 +745,23 @@ describe("ModelRegistry", () => {
 
 			const opus = models.find((m) => m.id === "anthropic/claude-opus-4");
 			expect(opus?.name).not.toBe("Custom Sonnet Name");
+		});
+
+		test("model override can set a separate prompt token limit", () => {
+			writeRawModelsJson({
+				openrouter: {
+					modelOverrides: {
+						"anthropic/claude-sonnet-4": {
+							maxInputTokens: 100_000,
+						},
+					},
+				},
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const model = registry.find("openrouter", "anthropic/claude-sonnet-4");
+
+			expect(model?.maxInputTokens).toBe(100_000);
 		});
 
 		test("model override with compat.openRouterRouting", () => {
@@ -885,6 +1024,29 @@ describe("ModelRegistry", () => {
 				],
 			});
 			expect(registry.getProviderDisplayName("oauth-provider")).toBe("OAuth Provider");
+		});
+
+		test("registered provider models preserve a separate prompt token limit", () => {
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			registry.registerProvider("prompt-capped-provider", {
+				baseUrl: "https://provider.test/v1",
+				apiKey: "TEST_KEY",
+				api: "openai-responses",
+				models: [
+					{
+						id: "prompt-capped-model",
+						name: "Prompt Capped Model",
+						reasoning: true,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 1_050_000,
+						maxInputTokens: 922_000,
+						maxTokens: 128_000,
+					},
+				],
+			});
+
+			expect(registry.find("prompt-capped-provider", "prompt-capped-model")?.maxInputTokens).toBe(922_000);
 		});
 
 		test("failed registerProvider does not persist invalid streamSimple config", () => {

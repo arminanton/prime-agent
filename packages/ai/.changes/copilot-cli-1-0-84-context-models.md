@@ -1,0 +1,1 @@
+- Fixed GitHub Copilot CLI request identity, prompt-limit handling, API routing, and current model catalog parity.

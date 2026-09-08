@@ -102,6 +102,7 @@ import {
 	estimateContextTokens,
 	generateBranchSummary,
 	prepareCompaction,
+	resolveModelInputTokenLimit,
 	serializeConversation,
 	shouldCompact,
 } from "./compaction/index.js";
@@ -2738,7 +2739,7 @@ export class AgentSession {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const contextWindow = this.model ? resolveModelInputTokenLimit(this.model) : 0;
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
 		if (compactionTimestamp !== undefined && context.message.timestamp <= compactionTimestamp) {
@@ -8471,7 +8472,7 @@ export class AgentSession {
 		}
 
 		const settings = this.settingsManager.getCompactionSettings();
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const contextWindow = this.model ? resolveModelInputTokenLimit(this.model) : 0;
 
 		// Skip overflow check if the message came from a different model.
 		// This handles the case where user switched from a smaller-context model (e.g. opus)
@@ -9447,9 +9448,7 @@ export class AgentSession {
 	}
 
 	private _findAssistantEntryForMessage(message: AssistantMessage): SessionMessageEntry | undefined {
-		return this.sessionManager
-			.getEntries()
-			.find((entry): entry is SessionMessageEntry => entry.type === "message" && entry.message === message);
+		return this.sessionManager.getMessageEntry(message);
 	}
 
 	private _createRlmSubagentRuntimeOptions(options: {
@@ -9988,6 +9987,22 @@ export class AgentSession {
 				run.deletionCleanupFailed = false;
 				run.deletionReservation = createAgentMessageDeferred();
 			}
+			const liveSession = run.session;
+			if (run.status === "error" && !liveSession && run.settled) {
+				try {
+					await this._deleteRlmSubagentSession(childId);
+				} catch (error) {
+					if (this._disposed || this._disposing) {
+						this._removeRlmSubagentTracking(childId, run);
+					}
+					throw error;
+				}
+				this._emitRlmSubagentRemoval(subagent);
+				this._deletedRlmChildIds.add(childId);
+				this._removeRlmSubagentTracking(childId, run);
+				return { subagent };
+			}
+
 			// The detached task remains the sole lifecycle owner. Mark deletion before
 			// cancellation so its catch/finally path cannot race a normal release or
 			// terminal notice against the physical delete.
@@ -9996,12 +10011,6 @@ export class AgentSession {
 				run.deletionNeedsCompletionNotice = true;
 			} else {
 				this._emitRlmSubagentRemoval(subagent);
-			}
-			const liveSession = run.session;
-			if (run.status === "error" && !liveSession && run.settled) {
-				this._deletedRlmChildIds.add(childId);
-				this._removeRlmSubagentTracking(childId, run);
-				return { subagent };
 			}
 			if (liveSession && run.settled) {
 				run.deletionRunFinished = true;
@@ -10714,6 +10723,8 @@ export class AgentSession {
 							subagentOptions,
 							run.status === "cancelled" ? "cancelled" : "error",
 						);
+						// The host released the failed runtime; keep only the lightweight error row.
+						if (!run.detachedDeletion && run.status === "error") run.session = undefined;
 						if (run.status === "cancelled" && !this._disposed && !this._disposing) {
 							this._deletedRlmChildIds.add(run.id);
 							this._removeRlmSubagentTracking(run.id);
@@ -10796,7 +10807,7 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error" || !message.errorMessage) return false;
 
-		const contextWindow = this.model?.contextWindow ?? 0;
+		const contextWindow = this.model ? resolveModelInputTokenLimit(this.model) : 0;
 		if (isContextOverflow(message, contextWindow)) return false;
 
 		if (this._isFauxProviderQueueExhausted(message)) {
@@ -11722,7 +11733,7 @@ export class AgentSession {
 		const model = this.model;
 		if (!model) return undefined;
 
-		const contextWindow = model.contextWindow ?? 0;
+		const contextWindow = resolveModelInputTokenLimit(model);
 		if (contextWindow <= 0) return undefined;
 
 		// After compaction, the last assistant usage reflects pre-compaction context size.
@@ -11769,7 +11780,10 @@ export class AgentSession {
 	}
 
 	private _contextWindowResolver(): ContextWindowResolver {
-		return (provider, modelId) => this._modelRegistry.find(provider, modelId)?.contextWindow;
+		return (provider, modelId) => {
+			const model = this._modelRegistry.find(provider, modelId);
+			return model ? resolveModelInputTokenLimit(model) : undefined;
+		};
 	}
 
 	/**

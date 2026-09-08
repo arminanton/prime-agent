@@ -47,6 +47,7 @@ class FakeDaemonClient {
 	resetTransportCount = 0;
 	reconnectError: Error | undefined;
 	attachFailures = 0;
+	residentWorkerFailed = false;
 	connectionStateGate: Promise<void> | undefined;
 	connectionStateFactory: ((activeSessionId: string) => AgentConnectionState) | undefined;
 	rlmChildren: AgentConnectionRlmChildAgentSnapshot[] = [];
@@ -111,6 +112,14 @@ class FakeDaemonClient {
 					this.attachFailures--;
 					throw new Error("attach failed");
 				}
+				if (this.residentWorkerFailed) {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Session worker is failed",
+					};
+				}
 				if (command.activeSessionId === "active-restored" && this.restoredAttachGate) {
 					await this.restoredAttachGate;
 					this.restoredAttachCompleted++;
@@ -131,6 +140,9 @@ class FakeDaemonClient {
 						this.attachResultFactory?.(command) ??
 						createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12),
 				};
+			case "retry_worker":
+				this.residentWorkerFailed = false;
+				return { type: "response", command: command.type, success: true };
 			case "get_queue":
 				return {
 					type: "response",
@@ -1280,6 +1292,178 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	});
 
+	it("recovers a confirmed-dead resident during cold initial attach", async () => {
+		const supervisor = new FakeDaemonClient();
+		supervisor.serverCapabilities.add("resident_worker_recovery_context");
+		supervisor.updateRestartSessions = [
+			{
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionId: "session-current",
+				sessionFile: "/tmp/session-current.jsonl",
+				workerState: "failed",
+			},
+		];
+		supervisor.residentWorkerFailed = true;
+
+		const connection = await DaemonAgentConnection.attach(asDaemonClient(supervisor), "active-1", {
+			residentSessionRecoveryConfig: { cwd: "/tmp/project" },
+		});
+
+		expect(supervisor.requests.map((request) => request.type)).toEqual(["attach", "list", "retry_worker", "attach"]);
+		expect(supervisor.requests.filter((request) => request.type === "retry_worker")).toHaveLength(1);
+		await connection.dispose();
+	});
+
+	it("recovers again when the supervisor reports a later worker loss", async () => {
+		const client = new FakeDaemonClient();
+		client.serverCapabilities.add("resident_worker_recovery_context");
+		const connection = new DaemonAgentConnection(asDaemonClient(client), "active-1", {
+			recoverDaemon: async () => {},
+			residentSessionRecoveryConfig: { cwd: "/tmp/project" },
+		});
+		await connection.attach();
+		client.updateRestartSessions = [
+			{
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionId: "session-current",
+				sessionFile: "/tmp/session-current.jsonl",
+				workerState: "failed",
+			},
+		];
+		client.residentWorkerFailed = true;
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		client.emitMessage({ type: "session_worker_recovering", activeSessionId: "active-1" });
+
+		await vi.waitFor(() => expect(events.filter((event) => event.type === "session_resynced")).toHaveLength(1));
+		expect(client.requests.filter((request) => request.type === "retry_worker")).toHaveLength(1);
+
+		client.residentWorkerFailed = true;
+		client.emitMessage({ type: "session_worker_recovering", activeSessionId: "active-1" });
+		await vi.waitFor(() => expect(events.filter((event) => event.type === "session_resynced")).toHaveLength(2));
+		expect(client.requests.filter((request) => request.type === "retry_worker")).toHaveLength(2);
+		expect(events.some((event) => event.type === "closed")).toBe(false);
+		await connection.dispose();
+	});
+
+	it("recovers a failed resident worker once with fresh transient context", async () => {
+		const supervisor = new FakeDaemonClient();
+		supervisor.serverCapabilities.add("resident_worker_recovery_context");
+		const closeListeners = new Set<(error: Error) => void>();
+		let directConnected = true;
+		const direct = {
+			get isConnected() {
+				return directConnected;
+			},
+			hello: supervisor.hello,
+			supportsServerCapability: (capability: string) => supervisor.supportsServerCapability(capability),
+			onMessage: () => () => {},
+			onClose: (listener: (error: Error) => void) => {
+				closeListeners.add(listener);
+				return () => closeListeners.delete(listener);
+			},
+			request: async (command: Extract<DaemonCommand, { type: "attach" }>) => ({
+				type: "response" as const,
+				command: "attach" as const,
+				success: true as const,
+				data: createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12),
+			}),
+			close: () => {
+				directConnected = false;
+			},
+		} as unknown as DaemonWorkerClient;
+		const routed = new DaemonRoutedClient(asDaemonClient(supervisor), direct);
+		const connection = await DaemonAgentConnection.attach(routed, "active-1", {
+			recoverDaemon: async () => {},
+			sendClientEnv: true,
+			residentSessionRecoveryConfig: { cwd: "/tmp/project" },
+		});
+		supervisor.updateRestartSessions = [
+			{
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionId: "session-current",
+				sessionFile: "/tmp/session-current.jsonl",
+				workerState: "failed",
+			},
+		];
+		supervisor.residentWorkerFailed = true;
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		directConnected = false;
+		for (const listener of closeListeners) listener(new Error("resident worker socket closed"));
+
+		await vi.waitFor(() => expect(events.some((event) => event.type === "session_resynced")).toBe(true));
+		expect(events.some((event) => event.type === "closed")).toBe(false);
+		const retries = supervisor.requests.filter(
+			(request): request is Extract<DaemonCommand, { type: "retry_worker" }> => request.type === "retry_worker",
+		);
+		expect(retries).toHaveLength(1);
+		expect(retries[0]).toMatchObject({
+			activeSessionId: "active-1",
+			recoveryContext: {
+				config: { cwd: "/tmp/project" },
+				launchEnv: expect.any(Object),
+			},
+		});
+		expect(supervisor.requests.map((request) => request.type)).toEqual(["attach", "list", "retry_worker", "attach"]);
+		await connection.dispose();
+	});
+
+	it("does not send resident recovery context to an older daemon", async () => {
+		const supervisor = new FakeDaemonClient();
+		const closeListeners = new Set<(error: Error) => void>();
+		let directConnected = true;
+		const direct = {
+			get isConnected() {
+				return directConnected;
+			},
+			hello: supervisor.hello,
+			supportsServerCapability: (capability: string) => supervisor.supportsServerCapability(capability),
+			onMessage: () => () => {},
+			onClose: (listener: (error: Error) => void) => {
+				closeListeners.add(listener);
+				return () => closeListeners.delete(listener);
+			},
+			request: async (command: Extract<DaemonCommand, { type: "attach" }>) => ({
+				type: "response" as const,
+				command: "attach" as const,
+				success: true as const,
+				data: createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12),
+			}),
+			close: () => {
+				directConnected = false;
+			},
+		} as unknown as DaemonWorkerClient;
+		const routed = new DaemonRoutedClient(asDaemonClient(supervisor), direct);
+		const connection = await DaemonAgentConnection.attach(routed, "active-1", {
+			recoverDaemon: async () => {},
+			reconnectTimeoutMs: 50,
+			residentSessionRecoveryConfig: { cwd: "/tmp/project" },
+		});
+		supervisor.residentWorkerFailed = true;
+		const closed = new Promise<AgentConnectionEvent>((resolve) => {
+			connection.subscribe((event) => {
+				if (event.type === "closed") resolve(event);
+			});
+		});
+
+		directConnected = false;
+		for (const listener of closeListeners) listener(new Error("resident worker socket closed"));
+
+		await expect(closed).resolves.toMatchObject({ type: "closed" });
+		expect(supervisor.requests.some((request) => request.type === "retry_worker")).toBe(false);
+		await connection.dispose();
+	});
+
 	it("keeps a shutdown during initial direct attach terminal instead of respawning the daemon", async () => {
 		const supervisor = new FakeDaemonClient();
 		const recoverDaemon = vi.fn(async () => {});
@@ -1461,6 +1645,22 @@ describe("DaemonAgentConnection", () => {
 			type: "attach",
 			activeSessionId: "active-1",
 			telemetryDisabled: true,
+		});
+	});
+
+	it("pre-advertises resident recovery notifications for an owned session that can be promoted", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("resident_worker_recovery_context");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+			ownedSessionRecoveryConfig: { cwd: "/tmp/fresh-owner" },
+		});
+
+		await connection.attach();
+
+		expect(fakeClient.requests[0]).toMatchObject({
+			type: "attach",
+			capabilities: expect.arrayContaining(["resident_worker_recovery_notifications"]),
 		});
 	});
 

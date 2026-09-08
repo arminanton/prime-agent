@@ -89,6 +89,56 @@ describe("openai-responses provider defaults", () => {
 		expect(capturedPayload).not.toMatchObject({
 			reasoning: expect.anything(),
 		});
+		expect(capturedPayload).not.toHaveProperty("parallel_tool_calls");
+	});
+
+	it("matches the official Copilot Responses reasoning and parallel-tool defaults", async () => {
+		const model = getModel("github-copilot", "gpt-5.5");
+		let capturedPayload: Record<string, unknown> | undefined;
+
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response("data: [DONE]\n\n", {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			}),
+		);
+
+		const stream = streamOpenAIResponses(
+			model,
+			{
+				systemPrompt: "sys",
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+				tools: [
+					{
+						name: "echo",
+						description: "Echo text",
+						parameters: {
+							type: "object",
+							properties: { text: { type: "string" } },
+							required: ["text"],
+						},
+					},
+				],
+			},
+			{
+				apiKey: "test-key",
+				reasoningEffort: "medium",
+				onPayload: (payload) => {
+					capturedPayload = payload as Record<string, unknown>;
+				},
+			},
+		);
+
+		for await (const event of stream) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		expect(capturedPayload).toMatchObject({
+			reasoning: { effort: "medium", summary: "auto" },
+			include: ["reasoning.encrypted_content"],
+			parallel_tool_calls: true,
+		});
+		expect(capturedPayload).not.toHaveProperty("long_context");
 	});
 
 	it("never sends service_tier for Copilot (the provider rejects it with 400)", async () => {

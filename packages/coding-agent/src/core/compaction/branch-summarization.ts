@@ -15,7 +15,7 @@ import {
 	createCustomMessage,
 } from "../messages.js";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.js";
-import { estimateTokens } from "./compaction.js";
+import { estimateTokens, resolveModelInputTokenLimit } from "./compaction.js";
 import {
 	computeFileLists,
 	createFileOps,
@@ -250,7 +250,7 @@ export async function generateBranchSummary(
 	options: GenerateBranchSummaryOptions,
 ): Promise<BranchSummaryResult> {
 	const { model, apiKey, headers, signal, customInstructions, replaceInstructions, reserveTokens = 16384 } = options;
-	const contextWindow = model.contextWindow || 128000;
+	const contextWindow = resolveModelInputTokenLimit(model) || 128000;
 	const tokenBudget = contextWindow - reserveTokens;
 
 	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);

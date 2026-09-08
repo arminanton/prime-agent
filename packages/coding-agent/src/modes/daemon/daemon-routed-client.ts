@@ -10,6 +10,7 @@ import {
 	getDaemonSocketCloseReason,
 } from "./daemon-client.js";
 import {
+	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonPeerTransportTicket,
@@ -213,19 +214,27 @@ export async function createDaemonSessionTransport(
 	activeSessionId: string,
 	directDisabled: boolean,
 ): Promise<DaemonTransportClient> {
-	if (
-		directDisabled ||
-		supervisor instanceof DaemonRoutedClient ||
-		!supervisor.supportsServerCapability("direct_peer_transport")
-	) {
+	if (directDisabled || supervisor instanceof DaemonRoutedClient) return supervisor;
+	try {
+		await supervisor.waitForHello(3000);
+	} catch {
 		return supervisor;
 	}
+	if (!supervisor.supportsServerCapability("direct_peer_transport")) return supervisor;
 	let direct: DaemonWorkerClient | undefined;
 	try {
 		// recoverable:false — this caller owns the fallback; a parked ticket request would pend the attach forever.
-		const response = await supervisor.request({ type: "get_direct_worker_transport", activeSessionId }, 5000, {
-			recoverable: false,
-		});
+		const response = await supervisor.request(
+			{
+				type: "get_direct_worker_transport",
+				activeSessionId,
+				capabilities: supervisor.supportsServerCapability("resident_worker_recovery_context")
+					? DAEMON_SUPPORTED_CLIENT_CAPABILITIES
+					: undefined,
+			},
+			5000,
+			{ recoverable: false },
+		);
 		if (!response.success) return supervisor;
 		const ticket = readSessionTransportTicket(response.data);
 		if (!ticket || ticket.activeSessionId !== activeSessionId || Date.parse(ticket.expiresAt) <= Date.now()) {

@@ -1,47 +1,28 @@
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import type { Message } from "../types.js";
+import type { Api, Message } from "../types.js";
 
 /**
  * GitHub Copilot request identity.
  *
- * These headers reproduce the identity the official `@github/copilot` CLI puts
- * on the wire for every inference call (MITM-captured across `/responses`,
- * `/chat/completions`, and `/v1/messages`). We match the CLI 1:1 rather than
- * sending a minimal subset: an incomplete header fingerprint is itself a
- * flagging signal, so parity is the anti-block posture.
- *
- * The single most important value is `Copilot-Integration-Id`. It (not the
- * User-Agent, not any `X-Copilot-Agent-Slug`) is what the GitHub backend keys
- * the visible model catalog and per-model limits off of. `copilot-developer-cli`
- * is the identity that exposes the full catalog (gemini-3.x, gpt-5.x with the
- * full reasoning-effort range, claude-opus with low..max) when the request
- * carries a valid GitHub bearer token. The previous `vscode-chat` identity
- * served a strictly smaller catalog.
- *
- * Every value here can be overridden through an environment variable so an
- * install that needs a different fingerprint can supply one without a rebuild.
+ * The ordinary first-turn fields below were captured from the official
+ * `@github/copilot` CLI 1.0.84-1 across `/responses`, `/chat/completions`, and
+ * `/v1/messages`. Conditional fields found in the executable but not observed
+ * on those requests are documented separately and are not synthesized.
  */
 
-// Latest released @github/copilot CLI version. Used for the User-Agent and
-// Editor-Version we present. Kept as a static fallback; the real CLI updates
-// this whenever the user updates their install.
-const COPILOT_CLI_VERSION_FALLBACK = "1.0.81-6";
+// Package version embedded in the authoritative executable and used for its
+// User-Agent and Editor-Version. COPILOT_CLI_VERSION changes CLI behavior but
+// does not change this package identity on the wire.
+export const COPILOT_CLI_VERSION_FALLBACK = "1.0.84-1";
 
-// X-GitHub-Api-Version literal the CLI's Rust core carries in capi_client.rs.
-// As of CLI 1.0.81-6 the per-model catalog limits are byte-identical across
-// recent api-version values (the long-context tier is now selected server-side
-// by token count), so this is an identity-parity value, not a tier lever.
+// Exact API version captured on 1.0.84-1 catalog and inference requests.
+// Context tier selection changes client-side limits, not this header.
 const COPILOT_API_VERSION_FALLBACK = "2026-08-01";
 
-// The integration id that unlocks the full premium catalog. Override with
-// COPILOT_INTEGRATION_ID for an account that needs a different integrator.
+// The CLI integration id. The official executable reads this override name.
 const COPILOT_INTEGRATION_ID_DEFAULT = "copilot-developer-cli";
 
-// Fixed literal the CLI sends in every request (this is NOT the Openai-Intent
-// value, which is conversation-agent / conversation-user depending on turn).
+// Fixed interaction type. X-Initiator, rather than Openai-Intent, identifies
+// whether the current turn was initiated by the user or agent.
 const COPILOT_INTERACTION_TYPE = "conversation-user";
 
 // Harness id the CLI carries on every inference call.
@@ -53,20 +34,35 @@ const COPILOT_HARNESS_ID = "copilot-sdk";
 const COPILOT_INTENT_DEFAULT = "conversation-agent";
 
 function env(name: string): string {
+	if (typeof process === "undefined") return "";
 	const value = process.env[name];
 	return typeof value === "string" ? value.trim() : "";
 }
 
 export function copilotIntegrationId(): string {
-	return env("COPILOT_INTEGRATION_ID") || COPILOT_INTEGRATION_ID_DEFAULT;
+	return env("GITHUB_COPILOT_INTEGRATION_ID") || COPILOT_INTEGRATION_ID_DEFAULT;
 }
 
 export function copilotCliVersion(): string {
-	return env("COPILOT_CLI_VERSION") || COPILOT_CLI_VERSION_FALLBACK;
+	return COPILOT_CLI_VERSION_FALLBACK;
 }
 
 export function copilotApiVersion(): string {
 	return env("COPILOT_API_VERSION") || COPILOT_API_VERSION_FALLBACK;
+}
+
+/** Remove stale static headers before overlaying the current CLI identity. */
+export function sanitizeCopilotModelHeaders(
+	headers: Record<string, string> | undefined,
+	api: Api,
+): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(headers ?? {}).filter(([name]) => {
+			const normalized = name.toLowerCase();
+			if (normalized === "editor-plugin-version") return false;
+			return api !== "anthropic-messages" || normalized !== "openai-intent";
+		}),
+	);
 }
 
 /**
@@ -84,66 +80,81 @@ function nodeVersion(): string {
 	return "";
 }
 
-/**
- * TERM_PROGRAM token for the User-Agent. A real value is the most authentic;
- * fall back to "vscode" (a valid, common Copilot CLI host) rather than the
- * CLI's literal "unknown" fallback, which reads as a non-interactive/bot signal.
- */
+/** TERM_PROGRAM token for the User-Agent, including the CLI's `unknown` fallback. */
 function termProgram(): string {
-	return env("COPILOT_TERM_PROGRAM") || env("TERM_PROGRAM") || "vscode";
+	return env("COPILOT_TERM_PROGRAM") || env("TERM_PROGRAM") || "unknown";
 }
 
 /**
- * User-Agent presented to api.githubcopilot.com. Reproduces the CLI's builder:
- *   copilot/<ver> (<platform> <node-version>) term/<TERM_PROGRAM>
- * Falls back to the honest short core `copilot/<ver>` if the node runtime cannot
- * be resolved, rather than inventing a runtime string.
+ * Control-plane User-Agent captured from the CLI. Inference adds the
+ * `client/github/cli` suffix below.
  */
-export function copilotUserAgent(): string {
+export function copilotControlPlaneUserAgent(): string {
 	const version = copilotCliVersion();
 	const platform = nodePlatform();
 	const node = nodeVersion();
 	const term = termProgram();
-	if (node) {
-		return `copilot/${version} (${platform} ${node}) term/${term}`;
-	}
+	if (node) return `copilot/${version} (${platform} ${node}) term/${term}`;
 	return `copilot/${version}`;
 }
 
+export function copilotUserAgent(): string {
+	return `${copilotControlPlaneUserAgent()} client/github/cli`;
+}
+
 /**
- * Stable per-install device id. Persisted so it is identical across calls and
- * process restarts, exactly like the CLI's X-Client-Machine-Id. Stored under
- * the prime config dir; a generated-but-unpersisted value is used if the disk
- * is not writable.
+ * Generate request correlation ids without importing Node built-ins so the
+ * provider remains usable from the browser entry point.
+ */
+function randomId(): string {
+	if (typeof globalThis.crypto?.randomUUID === "function") {
+		return globalThis.crypto.randomUUID();
+	}
+
+	const bytes = new Uint8Array(16);
+	if (typeof globalThis.crypto?.getRandomValues === "function") {
+		globalThis.crypto.getRandomValues(bytes);
+	} else {
+		for (let index = 0; index < bytes.length; index++) {
+			bytes[index] = Math.floor(Math.random() * 256);
+		}
+	}
+	bytes[6] = (bytes[6] & 0x0f) | 0x40;
+	bytes[8] = (bytes[8] & 0x3f) | 0x80;
+	const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+	return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+}
+
+/**
+ * Stable request identity. Browsers persist it in local storage. Node callers
+ * can provide COPILOT_MACHINE_ID for cross-process stability; otherwise it is
+ * stable for the life of the process.
  */
 let machineIdMemo: string | undefined;
+const COPILOT_MACHINE_ID_STORAGE_KEY = "prime.copilot.machine-id";
 
 function copilotMachineId(): string {
 	const override = env("COPILOT_MACHINE_ID");
 	if (override) return override;
 	if (machineIdMemo) return machineIdMemo;
 
-	const path = join(homedir(), ".prime", "copilot_machine_id");
 	try {
-		if (existsSync(path)) {
-			const existing = readFileSync(path, "utf-8").trim();
-			if (existing) {
-				machineIdMemo = existing;
-				return existing;
-			}
+		const existing = globalThis.localStorage?.getItem(COPILOT_MACHINE_ID_STORAGE_KEY)?.trim();
+		if (existing) {
+			machineIdMemo = existing;
+			return existing;
 		}
 	} catch {
-		// fall through to generate
+		// local storage can be unavailable or blocked
 	}
 
-	const generated = randomUUID();
-	try {
-		mkdirSync(join(homedir(), ".prime"), { recursive: true });
-		writeFileSync(path, generated);
-	} catch {
-		// non-fatal: use the in-memory value for this process
-	}
+	const generated = randomId();
 	machineIdMemo = generated;
+	try {
+		globalThis.localStorage?.setItem(COPILOT_MACHINE_ID_STORAGE_KEY, generated);
+	} catch {
+		// process-local stability is sufficient when storage is unavailable
+	}
 	return generated;
 }
 
@@ -167,18 +178,29 @@ export function hasCopilotVisionInput(messages: Message[]): boolean {
 /**
  * Build the full per-request Copilot identity header set.
  *
- * These are merged LAST over any static `model.headers` in every provider
- * (openai-responses, openai-completions, anthropic), so this is the effective
- * identity on the wire and the single source of truth for it.
+ * Provider callers remove obsolete static identity fields and then overlay
+ * this set. Explicit per-request headers can still override it by design.
  *
  * @param params.messages    - the conversation, used to infer initiator + vision
  * @param params.hasImages   - whether the turn carries image input
  * @param params.sessionId   - stable per-conversation id (maps to X-Client-Session-Id)
  * @param params.isStreaming - whether this is a streamed request (adds the SDK marker)
+ *
+ * The 1.0.84-1 binary also contains conditional candidates
+ * `X-Parent-Agent-Id`, `X-GitHub-User`, `X-GitHub-Actor-Type`, `Request-HMAC`,
+ * `X-Copilot-API-Exp-Assignment-Context`, `X-Copilot-Service-Request-Id`,
+ * `X-GitHub-Copilot-Request-TE`, and `Copilot-Subsystem-Id`. Ordinary
+ * first-turn captures did not send them. The assignment-context and service
+ * request id were observed as response headers, so we do not synthesize any of
+ * these request headers. The same rule applies to the candidate body fields
+ * `previous_response_id`, `prompt_cache_options`, `cache_ttl_seconds`, and
+ * `service_tier`. `long_context` is a client-side catalog/session tier and was
+ * not observed as an inference header or body field.
  */
 export function buildCopilotDynamicHeaders(params: {
 	messages: Message[];
 	hasImages: boolean;
+	api?: Api;
 	sessionId?: string;
 	isStreaming?: boolean;
 }): Record<string, string> {
@@ -189,17 +211,20 @@ export function buildCopilotDynamicHeaders(params: {
 		"Copilot-Integration-Id": copilotIntegrationId(),
 		"Editor-Version": `copilot/${copilotCliVersion()}`,
 		"X-GitHub-Api-Version": copilotApiVersion(),
-		"Openai-Intent": COPILOT_INTENT_DEFAULT,
 		"X-Initiator": initiator,
 		"X-Interaction-Type": COPILOT_INTERACTION_TYPE,
 		"Copilot-Harness-Id": COPILOT_HARNESS_ID,
 		"X-Client-Machine-Id": copilotMachineId(),
-		"X-Interaction-Id": randomUUID(),
-		"X-Client-Session-Id": params.sessionId || randomUUID(),
-		"X-Agent-Task-Id": randomUUID(),
+		"X-Interaction-Id": randomId(),
+		"X-Client-Session-Id": params.sessionId || randomId(),
+		"X-Agent-Task-Id": randomId(),
 		"X-GitHub-Repository-Nwo": "__no_repository__",
 		"X-GitHub-Repository-Host": "__no_repository__",
 	};
+
+	if (params.api !== "anthropic-messages") {
+		headers["Openai-Intent"] = COPILOT_INTENT_DEFAULT;
+	}
 
 	if (params.isStreaming !== false) {
 		// OpenAI SDK (stainless) signature the CLI carries on streamed turns.

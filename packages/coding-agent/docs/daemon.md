@@ -35,7 +35,8 @@ Normal interactive sessions use resident workers:
 - Worker descriptors, authentication tokens, active-session IDs, session paths, and recovery journals are written with owner-only permissions under the agent directory.
 - Workers monitor the public supervisor socket. If it disappears, one worker acquires an atomic launch lease and starts a replacement supervisor.
 - A replacement supervisor adopts live workers and their active-session IDs.
-- A worker crash affects one root tree. Recovery retries after 250 ms, 1 second, and 5 seconds; three failures mark that root failed.
+- A worker crash affects one root tree. Recovery retries after 250 ms, 1 second, and 5 seconds. If the process is confirmed dead and an attached client can provide fresh transient runtime context, the supervisor relaunches it without replaying uncertain work. Otherwise the root is marked failed.
+- Workers sample V8 heap pressure every 15 seconds. At 70% heap use or more than 32 resident sessions, they passivate safe, unpinned child runtimes early. At 85% heap use, new child admission pauses until memory is reclaimed. Passivation keeps transcripts on disk and hydrates them again on demand.
 - `prime-agent shutdown` stops the supervisor and all workers; `--force` also terminates unresponsive worker process groups and tracked children.
 
 There is no fixed session, worker, client, or workload cap in this layer.
@@ -73,7 +74,7 @@ Due ticks are claimed and advanced before prompt delivery. A crash therefore doe
 
 Resident workers keep scheduling across supervisor replacement. Worker recovery marks uncertain claims interrupted, keeps the advanced schedule, and resumes future ticks only. The supervisor routes schedule commands and merges worker summaries for global listing.
 
-## Public Daemon Protocol v4
+## Public Daemon Protocol v7
 
 The public local socket is JSONL-framed. The current protocol provides:
 

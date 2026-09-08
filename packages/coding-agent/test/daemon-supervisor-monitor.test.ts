@@ -17,11 +17,12 @@ import {
 	createDaemonCommandEnvelope,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
+	type DaemonCommand,
 	success,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSocketPathLease } from "../src/modes/daemon/daemon-socket.js";
-import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { DaemonSupervisor, SUPERVISOR_SERVER_CAPABILITIES } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	DaemonWorkerAuthenticationError,
 	DaemonWorkerClient,
@@ -305,6 +306,10 @@ function createHarness(canConnect: () => Promise<boolean>): SupervisorMonitorHar
 }
 
 describe("daemon worker supervisor monitoring", () => {
+	it("advertises resident worker recovery only from the supervisor", () => {
+		expect(SUPERVISOR_SERVER_CAPABILITIES).toContain("resident_worker_recovery_context");
+	});
+
 	afterEach(async () => {
 		for (const { child } of workerLaunchTestState.spawned) {
 			if (child.exitCode === null && child.signalCode === null) {
@@ -848,9 +853,15 @@ describe("daemon worker supervisor monitoring", () => {
 		let persistenceCalls = 0;
 		const existing = createExistingLaunchWorker(root, descriptorDir);
 		const previousDescriptor = existing.descriptor;
+		const transientCreateCommand = {
+			type: "create" as const,
+			config: { cwd: root, agentDir: root, apiKey: "fresh-runtime-secret" },
+		};
+		Object.assign(existing, { transientCreateCommand, launchEnv: { PATH: "/fresh/bin" } });
 		const workers = new Map<string, object>([[existing.descriptor.workerId, existing]]);
 		const deferWorkerRecovery = vi.fn();
 		const connectWorker = vi.fn(async () => {
+			expect((existing as { transientCreateCommand?: unknown }).transientCreateCommand).toBe(transientCreateCommand);
 			await waitForFile(markerPath);
 			throw cancellation;
 		});
@@ -1477,6 +1488,31 @@ describe("daemon worker supervisor monitoring", () => {
 		},
 	);
 
+	it("notifies only recovery-capable control clients when a worker disconnects", () => {
+		const worker = {
+			summaries: new Map([
+				["active-1", { id: "active-1", activeSessionId: "active-1", sessionId: "session-1" } as SessionSummary],
+			]),
+		};
+		const capable = { capabilities: new Set(["resident_worker_recovery_notifications"]) };
+		const legacy = { capabilities: new Set<string>() };
+		const write = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients: new Set([capable, legacy]),
+			write,
+		}) as {
+			notifyWorkerRecovering(target: typeof worker): void;
+		};
+
+		supervisor.notifyWorkerRecovering(worker);
+
+		expect(write).toHaveBeenCalledOnce();
+		expect(write).toHaveBeenCalledWith(capable, {
+			type: "session_worker_recovering",
+			activeSessionId: "active-1",
+		});
+	});
+
 	it("clears an intentional-stop tombstone before retrying a worker", async () => {
 		type RetryWorker = {
 			descriptor: {
@@ -1538,6 +1574,140 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(persistWorker).toHaveBeenCalledOnce();
 		expect(recoverWorker).toHaveBeenCalledWith(worker);
 		expect(persistWorker.mock.invocationCallOrder[0]).toBeLessThan(recoverWorker.mock.invocationCallOrder[0]!);
+	});
+
+	it("uses transient client context to recover a confirmed-dead failed resident", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "failed-resident",
+				pid: 42,
+				processStartId: "proc:old",
+				rootActiveSessionId: "active-1",
+				rootSessionId: "session-1",
+				lifecycle: "failed" as const,
+				consecutiveFailures: 1,
+				createCommand: { type: "create" as const, sessionPath: "/tmp/session.jsonl" },
+				telemetryDisabled: true,
+			},
+			client: undefined,
+			intentionalStop: false,
+			stopRevision: 0,
+			summaries: new Map<string, SessionSummary>(),
+			launchEnv: undefined as Record<string, string> | undefined,
+			transientCreateCommand: undefined as Record<string, unknown> | undefined,
+		};
+		const recoverWorker = vi.fn(async () => {
+			expect(worker.launchEnv).toEqual({ PATH: "/fresh/bin", SECRET_TOKEN: "secret-runtime" });
+			expect(worker.transientCreateCommand).toMatchObject({
+				type: "create",
+				sessionPath: "/tmp/session.jsonl",
+				config: { cwd: "/tmp/fresh", telemetryDisabled: true },
+				env: { HERDR_PANE_ID: "pane-1" },
+				lifecycle: "resident",
+			});
+			worker.descriptor.lifecycle = "ready" as never;
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			workerStopCounts: new Map(),
+			processIdentity: vi.fn(() => "gone"),
+			persistWorker: vi.fn(),
+			recoverWorker,
+			assertWorkerAccessibleToClient: vi.fn(),
+		}) as {
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+
+		await supervisor.handleCommand({} as DaemonSocketClient, {
+			type: "retry_worker",
+			activeSessionId: "active-1",
+			recoveryContext: {
+				config: { cwd: "/tmp/fresh" },
+				env: { HERDR_PANE_ID: "pane-1", NOT_ALLOWED: "ignored-later-by-worker" },
+				launchEnv: { PATH: "/fresh/bin", SECRET_TOKEN: "secret-runtime" },
+			},
+		});
+
+		expect(recoverWorker).toHaveBeenCalledWith(worker);
+		expect(worker.launchEnv).toBeUndefined();
+		expect(worker.transientCreateCommand).toBeUndefined();
+		expect(JSON.stringify(worker.descriptor)).not.toContain("secret-runtime");
+	});
+
+	it("clears transient recovery secrets when worker persistence fails", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "failed-persist",
+				pid: 42,
+				processStartId: "proc:old",
+				rootActiveSessionId: "active-persist",
+				rootSessionId: "session-persist",
+				lifecycle: "failed" as "failed" | "recovering" | "ready",
+				consecutiveFailures: 1,
+				lastError: "previous failure",
+				createCommand: { type: "create" as const, sessionPath: "/tmp/persist.jsonl" },
+			},
+			client: undefined,
+			intentionalStop: false,
+			deferredRecoveryRounds: 4,
+			stopRevision: 0,
+			summaries: new Map<string, SessionSummary>(),
+			launchEnv: undefined as Record<string, string> | undefined,
+			transientCreateCommand: undefined as Record<string, unknown> | undefined,
+		};
+		const recoverWorker = vi.fn(async () => {
+			worker.descriptor.lifecycle = "ready";
+		});
+		const persistWorker = vi
+			.fn(() => {})
+			.mockImplementationOnce(() => {
+				throw new Error("disk full");
+			});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			workerStopCounts: new Map(),
+			processIdentity: vi.fn(() => "gone"),
+			persistWorker,
+			recoverWorker,
+			assertWorkerAccessibleToClient: vi.fn(),
+		}) as {
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.handleCommand({} as DaemonSocketClient, {
+				type: "retry_worker",
+				activeSessionId: "active-persist",
+				recoveryContext: {
+					config: { cwd: "/tmp/fresh", apiKey: "secret-api-key" },
+					launchEnv: { SECRET_TOKEN: "secret-runtime" },
+				},
+			}),
+		).rejects.toThrow("disk full");
+		expect(recoverWorker).not.toHaveBeenCalled();
+		expect(worker.descriptor).toMatchObject({
+			lifecycle: "failed",
+			consecutiveFailures: 1,
+			lastError: "previous failure",
+		});
+		expect(worker.intentionalStop).toBe(false);
+		expect(worker.deferredRecoveryRounds).toBe(4);
+		expect(worker.launchEnv).toBeUndefined();
+		expect(worker.transientCreateCommand).toBeUndefined();
+		expect(JSON.stringify(worker.descriptor)).not.toContain("secret-");
+
+		await supervisor.handleCommand({} as DaemonSocketClient, {
+			type: "retry_worker",
+			activeSessionId: "active-persist",
+			recoveryContext: {
+				config: { cwd: "/tmp/fresh" },
+				launchEnv: { PATH: "/fresh/bin" },
+			},
+		});
+		expect(recoverWorker).toHaveBeenCalledOnce();
+		expect(worker.descriptor.lifecycle).toBe("ready");
+		expect(worker.launchEnv).toBeUndefined();
+		expect(worker.transientCreateCommand).toBeUndefined();
 	});
 
 	it("rejects retry while the worker is actively stopping", async () => {

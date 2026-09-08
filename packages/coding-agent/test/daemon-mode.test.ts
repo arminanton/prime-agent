@@ -5782,6 +5782,37 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("publishes passive hydration before running memory-pressure admission", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-hydration-pressure-order.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const parent = makeState("resident-parent", "root");
+		const hydrated = makeState("hydrated-child", parent.activeSessionId);
+		const passiveEntry = {
+			childId: "child-1",
+			sessionFile: "/tmp/passive-child.jsonl",
+			sessionDir: "/tmp/passive-child",
+		};
+		const sessionKey = resolve(passiveEntry.sessionFile);
+		const internals = daemon as unknown as {
+			openingSessions: Map<string, Promise<ActiveSessionState>>;
+			assertWorkerMemoryForSubagentAdmission: ReturnType<typeof vi.fn>;
+			rehydrateCompletedRlmSubagentOnce: ReturnType<typeof vi.fn>;
+			rehydrateCompletedRlmSubagent(
+				parentState: ActiveSessionState,
+				entry: typeof passiveEntry,
+			): Promise<ActiveSessionState>;
+		};
+		internals.assertWorkerMemoryForSubagentAdmission = vi.fn(async () => {
+			expect(internals.openingSessions.has(sessionKey)).toBe(true);
+		});
+		internals.rehydrateCompletedRlmSubagentOnce = vi.fn(async () => hydrated);
+
+		await expect(internals.rehydrateCompletedRlmSubagent(parent, passiveEntry)).resolves.toBe(hydrated);
+		expect(internals.openingSessions.has(sessionKey)).toBe(false);
+	});
+
 	it("rehydrates a passivated parent before publishing its racing child", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-parent-passivation-race-"));
 		let releaseParentDispose!: () => void;
@@ -6044,6 +6075,114 @@ describe("daemon mode helpers", () => {
 		expect(internals.passivateSession.mock.calls.map((call) => call[0])).toEqual([oldestLeaf, nextLeaf]);
 		expect(internals.passivateSession).not.toHaveBeenCalledWith(nonLeaf, expect.anything(), expect.anything());
 		expect(internals.passivateSession).not.toHaveBeenCalledWith(queuedLeaf, expect.anything(), expect.anything());
+	});
+
+	it("passes recent safe leaf children to passivation under memory pressure", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-pressure-passivation.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const root = makeState("root");
+		const recentLeaf = makeState("recent-leaf", "root");
+		const activeLeaf = makeState("active-leaf", "root");
+		const nonLeaf = makeState("non-leaf", "root");
+		const nested = makeState("nested", "non-leaf");
+		const states = [root, recentLeaf, activeLeaf, nonLeaf, nested];
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			listPassiveRlmSubagents: ReturnType<typeof vi.fn>;
+			sessionPassivationSnapshot: ReturnType<typeof vi.fn>;
+			passivateSession: ReturnType<typeof vi.fn>;
+			passivateIdleChildren(
+				threshold: number,
+				now: number,
+				limit: number,
+				options?: { memoryPressure?: boolean },
+			): Promise<number>;
+		};
+		for (const state of states) internals.sessions.set(state.activeSessionId, state);
+		internals.listPassiveRlmSubagents = vi.fn(async () => []);
+		internals.sessionPassivationSnapshot = vi.fn(async (state: ActiveSessionState) => ({
+			isSessionActive: state === activeLeaf,
+			attachedClients: 0,
+			hasRegisteredHeartbeat: false,
+			hasRegisteredCronJob: false,
+			lastActivityAt: Date.parse("2036-08-01T11:59:59Z"),
+			hasParent: state !== root,
+			hasNonPassiveDescendants: state === nonLeaf,
+			isHydrating: false,
+		}));
+		internals.passivateSession = vi.fn(async () => true);
+
+		await expect(
+			internals.passivateIdleChildren(90, Date.parse("2036-08-01T12:00:00Z"), 8, {
+				memoryPressure: true,
+			}),
+		).resolves.toBe(2);
+		expect(internals.passivateSession.mock.calls.map((call) => call[0])).toEqual([recentLeaf, nested]);
+		expect(internals.passivateSession).not.toHaveBeenCalledWith(activeLeaf, expect.anything(), expect.anything());
+		expect(internals.passivateSession).not.toHaveBeenCalledWith(nonLeaf, expect.anything(), expect.anything());
+	});
+
+	it("runs an aggressive child sweep when heap pressure crosses the high watermark", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-memory-guard.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			readWorkerMemorySnapshot: ReturnType<typeof vi.fn>;
+			passivateIdleChildren: ReturnType<typeof vi.fn>;
+			log: ReturnType<typeof vi.fn>;
+			runWorkerMemoryPressureCheck(trigger: string): Promise<{ passivated: number }>;
+		};
+		internals.sessions.set("root", makeState("root"));
+		internals.readWorkerMemorySnapshot = vi.fn(() => ({
+			heapUsedBytes: 3 * 1024 * 1024 * 1024,
+			heapLimitBytes: 4 * 1024 * 1024 * 1024,
+			rssBytes: 3.5 * 1024 * 1024 * 1024,
+		}));
+		internals.passivateIdleChildren = vi.fn(async () => 3);
+		internals.log = vi.fn();
+
+		await expect(internals.runWorkerMemoryPressureCheck("test")).resolves.toMatchObject({ passivated: 3 });
+		expect(internals.passivateIdleChildren).toHaveBeenCalledWith(1, expect.any(Number), 8, {
+			memoryPressure: true,
+		});
+		expect(internals.log).toHaveBeenCalledWith(expect.stringContaining("worker memory guard trigger=test"));
+	});
+
+	it("blocks new subagents when critical heap pressure remains after reclamation", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-critical-memory-guard.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const critical = {
+			heapUsedBytes: 3.8 * 1024 * 1024 * 1024,
+			heapLimitBytes: 4 * 1024 * 1024 * 1024,
+			rssBytes: 4 * 1024 * 1024 * 1024,
+		};
+		const internals = daemon as unknown as {
+			runWorkerMemoryPressureCheck: ReturnType<typeof vi.fn>;
+			assertWorkerMemoryForSubagentAdmission(): Promise<void>;
+		};
+		internals.runWorkerMemoryPressureCheck = vi.fn(async () => ({
+			before: critical,
+			after: critical,
+			plan: {
+				level: "critical",
+				heapRatio: 0.95,
+				residentSessionExcess: 0,
+				shouldPassivate: true,
+				passivationLimit: 32,
+				blockNewSubagents: true,
+			},
+			passivated: 0,
+		}));
+
+		await expect(internals.assertWorkerMemoryForSubagentAdmission()).rejects.toThrow(
+			/worker heap pressure is critical/i,
+		);
 	});
 
 	it("passivates an idle leaf and makes list, attach, and message use the normal passive wake path", async () => {

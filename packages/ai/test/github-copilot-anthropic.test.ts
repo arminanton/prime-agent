@@ -70,17 +70,16 @@ describe("Copilot Claude via Anthropic Messages", () => {
 		expect(opts.authToken).toBe("tid_copilot_session_test_token");
 		const headers = opts.defaultHeaders as Record<string, string>;
 
-		// Identity matches the official @github/copilot CLI. The
-		// copilot-developer-cli integration id is what unlocks the full premium
-		// model catalog; the User-Agent and Editor-Version present as the CLI.
-		expect(headers["User-Agent"]).toContain("copilot/");
+		// Identity matches the official @github/copilot CLI 1.0.84-1.
+		expect(headers["User-Agent"]).toMatch(/^copilot\/1\.0\.84-1 .* client\/github\/cli$/);
 		expect(headers["Copilot-Integration-Id"]).toBe("copilot-developer-cli");
-		expect(headers["Editor-Version"]).toContain("copilot/");
-		expect(headers["X-GitHub-Api-Version"]).toBeTruthy();
+		expect(headers["Editor-Version"]).toBe("copilot/1.0.84-1");
+		expect(headers["Editor-Plugin-Version"]).toBeUndefined();
+		expect(headers["X-GitHub-Api-Version"]).toBe("2026-08-01");
 
-		// Agentic turn attribution + fixed CLI literals.
+		// Anthropic uses the common attribution headers but not Openai-Intent.
 		expect(headers["X-Initiator"]).toBe("user");
-		expect(headers["Openai-Intent"]).toBe("conversation-agent");
+		expect(headers["Openai-Intent"]).toBeUndefined();
 		expect(headers["X-Interaction-Type"]).toBe("conversation-user");
 		expect(headers["Copilot-Harness-Id"]).toBe("copilot-sdk");
 

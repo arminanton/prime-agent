@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -36,6 +36,89 @@ describe("ReplKernelManager startup", () => {
 		} finally {
 			errorSpy.mockRestore();
 			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+		}
+	});
+
+	it("bounds the in-memory kernel stderr tail", () => {
+		const manager = new ReplKernelManager({ cwd: tempDir });
+		const internals = manager as unknown as {
+			appendKernelStderrText: (text: string) => void;
+			kernelStderr: string;
+		};
+
+		internals.appendKernelStderrText(`discarded marker${"x".repeat(8 * 1024)}`);
+		internals.appendKernelStderrText("retained marker");
+
+		expect(internals.kernelStderr).toHaveLength(8 * 1024);
+		expect(internals.kernelStderr).not.toContain("discarded marker");
+		expect(internals.kernelStderr).toMatch(/retained marker$/);
+	});
+
+	it("lands the exact kernel stderr bytes in the log file", async () => {
+		const python = join(tempDir, "python");
+		writeExecutable(
+			python,
+			[
+				"#!/bin/sh",
+				"printf 'progress 1\\rprogress 2\\rcaf\\303' >&2",
+				"sleep 0.2",
+				"printf '\\251\\n' >&2",
+				'printf "final stderr line" >&2',
+				"exit 42",
+				"",
+			].join("\n"),
+		);
+		const stderrLogPath = join(tempDir, "kernel-stderr.log");
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const manager = new ReplKernelManager({ python, cwd: tempDir, stderrLogPath });
+
+		try {
+			await expect(manager.execute("print(1)")).rejects.toThrow(
+				/Kernel exited before ready[\s\S]*café[\s\S]*final stderr line/,
+			);
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+			const expected = Buffer.from("progress 1\rprogress 2\rcafé\nfinal stderr line", "utf8");
+			expect(readFileSync(stderrLogPath).equals(expected)).toBe(true);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("reads only the bounded tail of an oversized stderr log", () => {
+		const stderrLogPath = join(tempDir, "kernel-stderr.log");
+		writeFileSync(
+			stderrLogPath,
+			Buffer.concat([
+				Buffer.from("discarded marker"),
+				Buffer.alloc(6 * 1024 * 1024, "x"),
+				Buffer.from("retained marker"),
+			]),
+		);
+		const manager = new ReplKernelManager({ cwd: tempDir, stderrLogPath });
+		const tail = (manager as unknown as { stderrTail(): string }).stderrTail();
+
+		expect(tail).toHaveLength(1024);
+		expect(tail).not.toContain("discarded marker");
+		expect(tail).toMatch(/retained marker$/);
+	});
+
+	it("rotates an oversized stderr log at spawn", async () => {
+		const python = join(tempDir, "python");
+		writeExecutable(python, ["#!/bin/sh", 'echo "fresh incarnation" >&2', "exit 42", ""].join("\n"));
+		const stderrLogPath = join(tempDir, "kernel-stderr.log");
+		const previous = Buffer.alloc(5 * 1024 * 1024 + 1, "x");
+		writeFileSync(stderrLogPath, previous);
+		writeFileSync(`${stderrLogPath}.old`, "stale rotated stderr");
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const manager = new ReplKernelManager({ python, cwd: tempDir, stderrLogPath });
+
+		try {
+			await expect(manager.execute("print(1)")).rejects.toThrow(/Kernel exited before ready/);
+			await manager.shutdown({ snapshot: true, drainHostRequests: true });
+			expect(statSync(`${stderrLogPath}.old`).size).toBe(previous.length);
+			expect(readFileSync(stderrLogPath, "utf8")).toBe("fresh incarnation\n");
+		} finally {
+			errorSpy.mockRestore();
 		}
 	});
 

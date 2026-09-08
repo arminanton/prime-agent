@@ -168,10 +168,11 @@ const structuredLog = getLogger("coding-agent.daemon-supervisor");
 const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const ROSTER_WATCHDOG_INTERVAL_MS = 15_000;
 const ROSTER_STALE_AFTER_MS = 3 * ROSTER_HEARTBEAT_INTERVAL_MS;
-const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
+export const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	"agent_roster",
 	"direct_peer_transport",
+	"resident_worker_recovery_context",
 ];
 const PEER_TRANSPORT_GRANT_TTL_MS = 10_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -1749,6 +1750,9 @@ export class DaemonSupervisor {
 				return success(command.id, command.type, { peers });
 			}
 			case "get_direct_worker_transport": {
+				if (command.capabilities) {
+					client.capabilities = normalizeCapabilities(command.capabilities, client.supportsExtensionUi);
+				}
 				const match = await this.findWorkerForClient(client, command.activeSessionId);
 				if (match.worker.descriptor.ownerClientId !== undefined) {
 					throw new Error("Direct transport is unavailable for client-owned workers");
@@ -1997,19 +2001,70 @@ export class DaemonSupervisor {
 				if ((this.workerStopCounts?.get(worker) ?? 0) > 0) {
 					throw new Error("Session worker is stopping; retry after it finishes");
 				}
-				worker.intentionalStop = false;
-				worker.descriptor.stopRequestedAt = undefined;
-				worker.descriptor.archiveOnStop = undefined;
-				worker.descriptor.lifecycle = "recovering";
-				worker.descriptor.consecutiveFailures = 0;
-				worker.deferredRecoveryRounds = 0;
-				this.persistWorker(worker);
-				await this.recoverWorker(worker);
-				if (this.workers.get(worker.descriptor.workerId)?.descriptor.lifecycle !== "ready") {
-					throw new Error(worker.descriptor.lastError ?? "Session worker recovery failed");
+				const recoveryContext = command.recoveryContext;
+				if (recoveryContext) {
+					if (worker.descriptor.ownerClientId) {
+						throw new Error("Resident recovery context cannot recover a client-owned worker");
+					}
+					if (worker.descriptor.lifecycle !== "failed" || worker.client) {
+						throw new Error(
+							`Session worker is ${this.effectiveWorkerState(worker)}; fresh recovery is not allowed`,
+						);
+					}
+					if (worker.intentionalStop || worker.descriptor.stopRequestedAt !== undefined) {
+						throw new Error("Session worker is stopping; fresh recovery is not allowed");
+					}
+					const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+					if (identity !== "gone" && identity !== "replaced") {
+						throw new Error(
+							`Session worker process is ${identity}; fresh recovery requires a confirmed-dead worker`,
+						);
+					}
+					worker.launchEnv = recoveryContext.launchEnv;
+					worker.transientCreateCommand = {
+						...worker.descriptor.createCommand,
+						config: {
+							...recoveryContext.config,
+							...(worker.descriptor.telemetryDisabled === true ? { telemetryDisabled: true } : {}),
+						},
+						env: recoveryContext.env,
+						launchEnv: recoveryContext.launchEnv,
+						lifecycle: "resident",
+					};
 				}
-				const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
-				return success(command.id, command.type, summary ? this.publicSummary(worker, summary) : undefined);
+				try {
+					const previousDescriptor = worker.descriptor;
+					const previousIntentionalStop = worker.intentionalStop;
+					const previousDeferredRecoveryRounds = worker.deferredRecoveryRounds;
+					worker.intentionalStop = false;
+					worker.descriptor = {
+						...previousDescriptor,
+						stopRequestedAt: undefined,
+						archiveOnStop: undefined,
+						lifecycle: "recovering",
+						consecutiveFailures: 0,
+					};
+					worker.deferredRecoveryRounds = 0;
+					try {
+						this.persistWorker(worker);
+					} catch (error) {
+						worker.descriptor = previousDescriptor;
+						worker.intentionalStop = previousIntentionalStop;
+						worker.deferredRecoveryRounds = previousDeferredRecoveryRounds;
+						throw error;
+					}
+					await this.recoverWorker(worker);
+					if (this.workers.get(worker.descriptor.workerId)?.descriptor.lifecycle !== "ready") {
+						throw new Error(worker.descriptor.lastError ?? "Session worker recovery failed");
+					}
+					const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
+					return success(command.id, command.type, summary ? this.publicSummary(worker, summary) : undefined);
+				} finally {
+					if (recoveryContext) {
+						worker.launchEnv = undefined;
+						worker.transientCreateCommand = undefined;
+					}
+				}
 			}
 			case "restart":
 				setImmediate(() => void this.shutdown(0, false, true, false, "update"));
@@ -2955,7 +3010,7 @@ export class DaemonSupervisor {
 			await this.assertRecoveryAllowed();
 			worker.descriptor = descriptor;
 			worker.launchEnv = launchEnv;
-			worker.transientCreateCommand = descriptor.ownerClientId ? createCommand : undefined;
+			worker.transientCreateCommand = descriptor.ownerClientId ? createCommand : existing?.transientCreateCommand;
 			descriptorAssigned = true;
 			this.persistWorker(worker);
 			worker.intentionalStop = false;
@@ -3315,6 +3370,7 @@ export class DaemonSupervisor {
 			return;
 		}
 		this.markWorkerRosterEntries(worker, "recovering");
+		this.notifyWorkerRecovering(worker);
 		try {
 			await this.assertRecoveryAllowed();
 		} catch (recoveryError) {
@@ -3647,7 +3703,7 @@ export class DaemonSupervisor {
 							`Cannot safely replace live session worker ${worker.descriptor.workerId} without a verified process identity`,
 						);
 					}
-					const recoveryCommand = worker.descriptor.ownerClientId ? worker.transientCreateCommand : undefined;
+					const recoveryCommand = worker.transientCreateCommand;
 					if (!recoveryCommand || !worker.launchEnv) {
 						await this.recoverUncertainWorkerOperations(worker);
 						worker.descriptor.lifecycle = "failed";
@@ -4227,6 +4283,19 @@ export class DaemonSupervisor {
 			const existing = this.roster().get(entry.agentId);
 			if (existing?.workerId !== undefined && existing.workerId !== worker.descriptor.workerId) continue;
 			this.writeRosterEntry(entry, worker);
+		}
+	}
+
+	private notifyWorkerRecovering(worker: ResidentWorker): void {
+		if (!this.clients) return;
+		const activeSessionIds = worker.summaries
+			? [...worker.summaries.values()].map((summary) => summary.activeSessionId ?? summary.id)
+			: [worker.descriptor.rootActiveSessionId];
+		for (const activeSessionId of activeSessionIds) {
+			for (const client of this.clients) {
+				if (!client.capabilities.has("resident_worker_recovery_notifications")) continue;
+				this.write(client, { type: "session_worker_recovering", activeSessionId });
+			}
 		}
 	}
 

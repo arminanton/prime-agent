@@ -186,7 +186,7 @@ describe("daemon protocol helpers", () => {
 		).toEqual([{ minProtocol: 7, minSchemaRevision: 14 }, { minProtocol: 7 }]);
 	});
 
-	it("capability-gates authoritative rosters and transient owned-session recovery context", () => {
+	it("capability-gates authoritative rosters and transient worker recovery context", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.get_rlm_children).toEqual({
 			minProtocol: 7,
 			minSchemaRevision: 17,
@@ -202,6 +202,22 @@ describe("daemon protocol helpers", () => {
 			{ minProtocol: 7, minSchemaRevision: 17, capability: "owned_session_recovery_context" },
 			{ minProtocol: 7 },
 		]);
+		expect(
+			getDaemonCommandCompatibilities({
+				type: "retry_worker",
+				activeSessionId: "active-1",
+				recoveryContext: {
+					config: { cwd: "/tmp/fresh-resident" },
+					launchEnv: { PATH: "/usr/bin" },
+				},
+			}),
+		).toEqual([
+			{ minProtocol: 7, minSchemaRevision: 26, capability: "resident_worker_recovery_context" },
+			{ minProtocol: 7 },
+		]);
+		expect(getDaemonCommandCompatibilities({ type: "retry_worker", activeSessionId: "active-1" })).toEqual([
+			{ minProtocol: 7 },
+		]);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
 			expect.arrayContaining([
 				"authoritative_child_roster",
@@ -209,6 +225,23 @@ describe("daemon protocol helpers", () => {
 				"rlm_quiescence_barrier",
 			]),
 		);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("resident_worker_recovery_notifications");
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain("resident_worker_recovery_context");
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_worker_recovering).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 26,
+			capability: "resident_worker_recovery_notifications",
+		});
+		expect(
+			getDaemonCommandCompatibilities({
+				type: "get_direct_worker_transport",
+				activeSessionId: "active-1",
+				capabilities: ["resident_worker_recovery_notifications"],
+			}),
+		).toEqual([
+			{ minProtocol: 7, minSchemaRevision: 26, capability: "resident_worker_recovery_context" },
+			DAEMON_COMMAND_COMPATIBILITY.get_direct_worker_transport,
+		]);
 	});
 
 	it("gates the opt-in RLM quiescence wire field", () => {

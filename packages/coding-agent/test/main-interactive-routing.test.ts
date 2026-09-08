@@ -9,6 +9,7 @@ import {
 	type DaemonInteractiveSessionManagerDecision,
 	daemonServerDefaultSessionConfig,
 	findActiveDaemonSessionSummaryForSessionFile,
+	findAttachedDaemonSessionSummary,
 	type InteractiveDaemonStartupDecision,
 	isClientOwnedDaemonSession,
 	parseAgentsViewCommand,
@@ -268,6 +269,28 @@ describe("daemon-backed interactive session manager routing", () => {
 				"/tmp/project/../project/session.jsonl",
 			),
 		).toBe(activeSummary);
+	});
+
+	test("falls back to the roster when an explicit attach targets a failed worker", async () => {
+		const failed = makeSessionSummary({
+			id: "abcdef123456",
+			activeSessionId: "abcdef123456",
+			sessionId: "01a080b8-717e-73d9-8289-5c2dfc091b95",
+			workerState: "failed",
+		});
+		const requests: string[] = [];
+		const client = {
+			request: async (command: { type: string }) => {
+				requests.push(command.type);
+				if (command.type === "get_state") {
+					return { type: "response", command: "get_state", success: false, error: "Session worker is failed" };
+				}
+				return { type: "response", command: "list", success: true, data: { sessions: [failed] } };
+			},
+		};
+
+		await expect(findAttachedDaemonSessionSummary(client as never, "123456")).resolves.toBe(failed);
+		expect(requests).toEqual(["get_state", "list"]);
 	});
 
 	test("finds an active daemon session through a symlinked resume path", () => {

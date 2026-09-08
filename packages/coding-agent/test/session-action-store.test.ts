@@ -5,6 +5,7 @@ import {
 	ActionStore,
 	canEvictWorker,
 	canPassivateSession,
+	canPassivateSessionUnderMemoryPressure,
 	canSelectSessionAction,
 	type DeliveryPolicy,
 	type RuntimeActivity,
@@ -320,6 +321,21 @@ describe("child passivation capability", () => {
 		["child without activity time", { lastActivityAt: Number.NaN }],
 	])("rejects a %s", (_name, override) => {
 		expect(canPassivateSession({ ...idleChild, ...override }, 90, now)).toBe(false);
+	});
+
+	it("ignores only the idle-age threshold under memory pressure", () => {
+		expect(canPassivateSessionUnderMemoryPressure({ ...idleChild, lastActivityAt: now })).toBe(true);
+		for (const override of [
+			{ hasParent: false },
+			{ hasNonPassiveDescendants: true },
+			{ isHydrating: true },
+			{ isSessionActive: true },
+			{ attachedClients: 1 },
+			{ hasRegisteredHeartbeat: true },
+			{ hasRegisteredCronJob: true },
+		]) {
+			expect(canPassivateSessionUnderMemoryPressure({ ...idleChild, ...override })).toBe(false);
+		}
 	});
 
 	it("shares the whole-tree off and invalid threshold behavior", () => {

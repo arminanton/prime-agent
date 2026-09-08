@@ -93,6 +93,7 @@ import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../cor
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
 	canPassivateSession,
+	canPassivateSessionUnderMemoryPressure,
 	type IdleEvictionMinutes,
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
@@ -227,6 +228,13 @@ import {
 	SNAPSHOT_TARGET_CHUNK_BYTES,
 	type SnapshotTranscriptChunkSource,
 } from "./snapshot-transcript-cache.js";
+import {
+	createWorkerMemoryReliefPlan,
+	readWorkerMemorySnapshot as readProcessWorkerMemorySnapshot,
+	WORKER_MEMORY_CHECK_INTERVAL_MS,
+	type WorkerMemoryReliefPlan,
+	type WorkerMemorySnapshot,
+} from "./worker-memory-pressure.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
 export interface DaemonModeOptions {
@@ -457,6 +465,17 @@ type PassiveRlmSubagent = PassiveRlmRoot & {
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
 
+interface WorkerMemoryPressureCheckResult {
+	before: WorkerMemorySnapshot;
+	after: WorkerMemorySnapshot;
+	plan: WorkerMemoryReliefPlan;
+	passivated: number;
+}
+
+function memoryMiB(bytes: number): number {
+	return Math.round(bytes / (1024 * 1024));
+}
+
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
 	const daemon = new AgentDaemon(socketPath, options);
@@ -575,6 +594,9 @@ export class AgentDaemon {
 	};
 	private rosterFlushScheduled = false;
 	private rosterHeartbeatTimer?: ReturnType<typeof setInterval>;
+	private workerMemoryTimer?: ReturnType<typeof setInterval>;
+	private workerMemoryPressureCheck?: Promise<WorkerMemoryPressureCheckResult>;
+	private lastWorkerMemoryLogAt = 0;
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
 	/** In-flight admission spawn appends, awaited (and consumed) by createRlmSubagentRuntime. */
 	private readonly pendingRlmSpawnAppends = new Map<string, Promise<void>>();
@@ -618,6 +640,64 @@ export class AgentDaemon {
 		console.error(message);
 		structuredLog.warn(message, { socketPath: this.socketPath });
 		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] ${message}`);
+	}
+
+	private readWorkerMemorySnapshot(): WorkerMemorySnapshot {
+		return readProcessWorkerMemorySnapshot();
+	}
+
+	private startWorkerMemoryGuard(): void {
+		if (!this.options.worker || this.workerMemoryTimer) return;
+		this.workerMemoryTimer = setInterval(() => {
+			void this.runWorkerMemoryPressureCheck("interval").catch((error: unknown) => {
+				this.log(`worker memory guard failed: ${error instanceof Error ? error.message : String(error)}`);
+			});
+		}, WORKER_MEMORY_CHECK_INTERVAL_MS);
+		this.workerMemoryTimer.unref();
+	}
+
+	private stopWorkerMemoryGuard(): void {
+		if (!this.workerMemoryTimer) return;
+		clearInterval(this.workerMemoryTimer);
+		this.workerMemoryTimer = undefined;
+	}
+
+	private async runWorkerMemoryPressureCheck(trigger: string): Promise<WorkerMemoryPressureCheckResult> {
+		if (this.workerMemoryPressureCheck) return this.workerMemoryPressureCheck;
+		const check = (async (): Promise<WorkerMemoryPressureCheckResult> => {
+			const before = this.readWorkerMemorySnapshot();
+			const plan = createWorkerMemoryReliefPlan(before, this.sessions.size);
+			let passivated = 0;
+			if (!this.shuttingDown && this.updateRestart === undefined && plan.shouldPassivate) {
+				passivated = await this.passivateIdleChildren(1, Date.now(), plan.passivationLimit, {
+					memoryPressure: true,
+				});
+			}
+			const after = this.readWorkerMemorySnapshot();
+			const now = Date.now();
+			if (plan.shouldPassivate && (passivated > 0 || now - this.lastWorkerMemoryLogAt >= 60_000)) {
+				this.lastWorkerMemoryLogAt = now;
+				this.log(
+					`worker memory guard trigger=${trigger} level=${plan.level} heapUsedMiB=${memoryMiB(before.heapUsedBytes)} heapLimitMiB=${memoryMiB(before.heapLimitBytes)} rssMiB=${memoryMiB(before.rssBytes)} residentSessions=${this.sessions.size} passivated=${passivated}`,
+				);
+			}
+			return { before, after, plan, passivated };
+		})();
+		this.workerMemoryPressureCheck = check;
+		try {
+			return await check;
+		} finally {
+			if (this.workerMemoryPressureCheck === check) this.workerMemoryPressureCheck = undefined;
+		}
+	}
+
+	private async assertWorkerMemoryForSubagentAdmission(): Promise<void> {
+		const result = await this.runWorkerMemoryPressureCheck("rlm_spawn");
+		const remaining = createWorkerMemoryReliefPlan(result.after, this.sessions.size);
+		if (!remaining.blockNewSubagents) return;
+		throw new Error(
+			`Worker heap pressure is critical (${Math.round(remaining.heapRatio * 100)}% of the V8 heap limit). Wait for existing subagents to finish or delete completed subagents before spawning more.`,
+		);
 	}
 
 	// A crash thrown outside a command handler would otherwise vanish with the
@@ -689,6 +769,7 @@ export class AgentDaemon {
 				ROSTER_HEARTBEAT_INTERVAL_MS,
 			);
 			this.rosterHeartbeatTimer.unref();
+			this.startWorkerMemoryGuard();
 		}
 		this.startSupervisorMonitor();
 	}
@@ -2327,7 +2408,10 @@ export class AgentDaemon {
 
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
 		return {
-			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
+			createRlmSubagentRuntime: async (options) => {
+				await this.assertWorkerMemoryForSubagentAdmission();
+				return this.createRlmSubagentRuntime(parentState, options);
+			},
 			completeRlmSubagentRuntime: (childId, session) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
@@ -2337,23 +2421,34 @@ export class AgentDaemon {
 						candidate.runtime.session === session,
 				);
 				if (!state?.runtime.session.sessionFile) return false;
-				if (state.runtime.metadata.rehydratedCompleted) return true;
 				const metadata = state.runtime.metadata;
 				const model = session.model;
-				return this.recordRlmSubagentState(parentState, {
-					childId,
-					sessionName: session.sessionName ?? childId,
-					sessionDir: metadata.sessionDir ?? dirname(state.runtime.session.sessionFile),
-					sessionFile: state.runtime.session.sessionFile,
-					rlmDepth: session.rlmDepth,
-					rlmMaxDepth: session.rlmMaxDepth,
-					rlmParentNodeId: metadata.rlmParentNodeId,
-					prompt: metadata.prompt && metadata.prompt.length <= 4096 ? metadata.prompt : undefined,
-					spawnCode: metadata.spawnCode,
-					...(model ? { model: { provider: model.provider, modelId: model.id } } : {}),
-					status: "completed",
-					createdAt: metadata.createdAt,
-				});
+				const recorded =
+					metadata.rehydratedCompleted ||
+					this.recordRlmSubagentState(parentState, {
+						childId,
+						sessionName: session.sessionName ?? childId,
+						sessionDir: metadata.sessionDir ?? dirname(state.runtime.session.sessionFile),
+						sessionFile: state.runtime.session.sessionFile,
+						rlmDepth: session.rlmDepth,
+						rlmMaxDepth: session.rlmMaxDepth,
+						rlmParentNodeId: metadata.rlmParentNodeId,
+						prompt: metadata.prompt && metadata.prompt.length <= 4096 ? metadata.prompt : undefined,
+						spawnCode: metadata.spawnCode,
+						...(model ? { model: { provider: model.provider, modelId: model.id } } : {}),
+						status: "completed",
+						createdAt: metadata.createdAt,
+					});
+				if (recorded) {
+					setImmediate(() => {
+						void this.runWorkerMemoryPressureCheck("child_complete").catch((error: unknown) => {
+							this.log(
+								`worker memory guard failed after child completion: ${error instanceof Error ? error.message : String(error)}`,
+							);
+						});
+					});
+				}
+				return recorded;
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				// Persist the deletion boundary first, but never let a registry failure
@@ -2663,6 +2758,7 @@ export class AgentDaemon {
 		idleEvictionMinutes: IdleEvictionMinutes,
 		now: number,
 		selectedSnapshot?: SessionPassivationSnapshot,
+		options: { memoryPressure?: boolean } = {},
 	): Promise<boolean> {
 		const sessionFile = state.runtime.session.sessionFile;
 		const metadata = state.runtime.metadata;
@@ -2678,18 +2774,25 @@ export class AgentDaemon {
 			return false;
 		}
 		const snapshot = selectedSnapshot ?? (await this.sessionPassivationSnapshot(state));
-		if (!canPassivateSession(snapshot, idleEvictionMinutes, now)) return false;
+		const canPassivate = options.memoryPressure
+			? canPassivateSessionUnderMemoryPressure(snapshot)
+			: canPassivateSession(snapshot, idleEvictionMinutes, now);
+		if (!canPassivate) return false;
 
 		// Publish the durable identity before running the close so opens and lazy
 		// hydration can join throughout closeSessionOnce, including after sessions.delete.
 		const passivation = Promise.resolve().then(async () => {
 			// Fence against touches and state changes after candidate selection. This
 			// snapshot is intentionally fresh rather than reusing the sweep snapshot.
+			const freshSnapshot = await this.sessionPassivationSnapshot(state);
+			const stillPassivatable = options.memoryPressure
+				? canPassivateSessionUnderMemoryPressure(freshSnapshot)
+				: canPassivateSession(freshSnapshot, idleEvictionMinutes, now);
 			if (
 				this.shuttingDown ||
 				this.updateRestart !== undefined ||
 				this.sessions.get(state.activeSessionId) !== state ||
-				!canPassivateSession(await this.sessionPassivationSnapshot(state), idleEvictionMinutes, now)
+				!stillPassivatable
 			) {
 				return;
 			}
@@ -2716,7 +2819,7 @@ export class AgentDaemon {
 			}
 			unsubscribeChild();
 			this.log(
-				`Passivated idle child sessionId=${state.runtime.session.sessionId} name=${JSON.stringify(state.runtime.session.sessionName ?? "")} idleMinutes=${idleMinutes}`,
+				`Passivated ${options.memoryPressure ? "memory-pressure" : "idle"} child sessionId=${state.runtime.session.sessionId} name=${JSON.stringify(state.runtime.session.sessionName ?? "")} idleMinutes=${idleMinutes}`,
 			);
 		});
 		this.passivatingSessions.set(sessionKey, passivation);
@@ -2734,6 +2837,7 @@ export class AgentDaemon {
 		idleEvictionMinutes: IdleEvictionMinutes,
 		now: number,
 		limit: number,
+		options: { memoryPressure?: boolean } = {},
 	): Promise<number> {
 		if (this.shuttingDown || this.updateRestart !== undefined || limit <= 0) return 0;
 		const states = [...this.sessions.values()];
@@ -2745,11 +2849,24 @@ export class AgentDaemon {
 			})),
 		);
 		const candidates = snapshots
-			.filter(({ snapshot }) => canPassivateSession(snapshot, idleEvictionMinutes, now))
+			.filter(({ snapshot }) =>
+				options.memoryPressure
+					? canPassivateSessionUnderMemoryPressure(snapshot)
+					: canPassivateSession(snapshot, idleEvictionMinutes, now),
+			)
 			.sort((left, right) => left.snapshot.lastActivityAt - right.snapshot.lastActivityAt)
 			.slice(0, limit);
+		if (options.memoryPressure) {
+			let passivated = 0;
+			for (const { state, snapshot } of candidates) {
+				if (await this.passivateSession(state, idleEvictionMinutes, now, snapshot, options)) passivated++;
+			}
+			return passivated;
+		}
 		const results = await Promise.all(
-			candidates.map(({ state, snapshot }) => this.passivateSession(state, idleEvictionMinutes, now, snapshot)),
+			candidates.map(({ state, snapshot }) =>
+				this.passivateSession(state, idleEvictionMinutes, now, snapshot, options),
+			),
 		);
 		return results.filter(Boolean).length;
 	}
@@ -2855,12 +2972,16 @@ export class AgentDaemon {
 		if (existing?.runtime.metadata.kind === "subagent" && existing.runtime.metadata.rlmChildId === entry.childId) {
 			return this.waitForBoundSession(existing);
 		}
-		const hydration = (async () => {
+		// Publish before the pressure check starts. The opening path pins every
+		// passive ancestor so reclamation cannot close the parent needed to bind
+		// this nested child and force an endless rehydrate/passivate loop.
+		const hydration = Promise.resolve().then(async () => {
+			await this.assertWorkerMemoryForSubagentAdmission();
 			if (existing) {
 				await this.closeSession(existing, "replaced");
 			}
 			return this.rehydrateCompletedRlmSubagentOnce(parentState, entry, restoreActiveSessionId, clientEnv);
-		})();
+		});
 		// Explicit opens and all lazy triggers share this path-keyed publication,
 		// so no caller can acquire a second lease/runtime while hydration binds.
 		this.openingSessions.set(sessionKey, hydration);
@@ -7292,6 +7413,7 @@ export class AgentDaemon {
 			clearInterval(this.rosterHeartbeatTimer);
 			this.rosterHeartbeatTimer = undefined;
 		}
+		this.stopWorkerMemoryGuard();
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
 		const closingReason = this.getShutdownClosingReason();
 		for (const client of this.clients) {

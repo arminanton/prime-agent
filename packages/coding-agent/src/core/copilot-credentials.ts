@@ -25,13 +25,8 @@
  *                         (also selects the enterprise Copilot domain)
  */
 
+import { copilotApiVersion, copilotCliVersion, copilotIntegrationId, copilotUserAgent } from "@earendil-works/pi-ai";
 import { spawnSync } from "child_process";
-import {
-	copilotApiVersion,
-	copilotCliVersion,
-	copilotIntegrationId,
-	copilotUserAgent,
-} from "@earendil-works/pi-ai";
 
 const COPILOT_PIN_TOKEN_ENV = "COPILOT_GITHUB_TOKEN";
 const COPILOT_GH_USER_ENV = "COPILOT_GH_USER";
@@ -185,13 +180,22 @@ export function resolvePinnedCopilotToken(): string | undefined {
  * endpoints fixes both classes at the source.
  */
 export interface CopilotCatalogInfo {
-	/** Model ids the account is entitled to. Empty on failure (caller keeps full catalog). */
+	/** Whether /models returned a valid catalog, including a valid catalog with zero usable models. */
+	catalogAvailable: boolean;
+	/** Model ids the account can use after live policy filtering. */
 	ids: Set<string>;
 	/** id -> api mode derived from supported_endpoints. Only ids with a clear signal are present. */
 	apiById: Map<string, CopilotApiMode>;
 }
 
 export type CopilotApiMode = "anthropic-messages" | "openai-responses" | "openai-completions";
+
+function copilotCatalogBaseUrl(token: string): string {
+	const pinned = copilotPinnedBaseUrl();
+	if (pinned) return pinned;
+	const proxyHost = token.match(/(?:^|;)proxy-ep=([^;]+)/)?.[1];
+	return proxyHost ? `https://${proxyHost.replace(/^proxy\./, "api.")}` : "https://api.githubcopilot.com";
+}
 
 /**
  * Map a model's `supported_endpoints` to the api mode prime should use.
@@ -228,8 +232,8 @@ export async function fetchCopilotCatalogInfo(
 	token: string,
 	options?: { baseUrl?: string; timeoutMs?: number; fetchFn?: typeof fetch },
 ): Promise<CopilotCatalogInfo> {
-	const empty: CopilotCatalogInfo = { ids: new Set(), apiById: new Map() };
-	const base = options?.baseUrl ?? copilotPinnedBaseUrl() ?? "https://api.githubcopilot.com";
+	const empty: CopilotCatalogInfo = { catalogAvailable: false, ids: new Set(), apiById: new Map() };
+	const base = options?.baseUrl ?? copilotCatalogBaseUrl(token);
 	const fetchFn = options?.fetchFn ?? fetch;
 	const timeoutMs = options?.timeoutMs ?? 6000;
 	try {
@@ -256,6 +260,15 @@ export async function fetchCopilotCatalogInfo(
 			if (!entry || typeof entry !== "object" || !("id" in entry) || typeof entry.id !== "string") {
 				continue;
 			}
+			const policy = (entry as { policy?: unknown }).policy;
+			if (
+				policy &&
+				typeof policy === "object" &&
+				"state" in policy &&
+				(policy.state === "unconfigured" || policy.state === "disabled")
+			) {
+				continue;
+			}
 			ids.add(entry.id);
 			const endpoints = (entry as { supported_endpoints?: unknown }).supported_endpoints;
 			if (Array.isArray(endpoints)) {
@@ -265,7 +278,7 @@ export async function fetchCopilotCatalogInfo(
 				}
 			}
 		}
-		return { ids, apiById };
+		return { catalogAvailable: true, ids, apiById };
 	} catch {
 		return empty;
 	}

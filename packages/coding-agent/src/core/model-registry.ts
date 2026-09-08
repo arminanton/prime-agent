@@ -29,6 +29,7 @@ import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
+import { type CopilotApiMode, copilotPinnedBaseUrl, fetchCopilotCatalogInfo } from "./copilot-credentials.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
 	fetchAuthorizedPrivatePrimeInferenceModelIds,
@@ -41,13 +42,6 @@ import {
 	resolveConfigValueUncached,
 	resolveHeadersOrThrow,
 } from "./resolve-config-value.js";
-import {
-	type CopilotApiMode,
-	copilotPinIdentity,
-	copilotPinnedBaseUrl,
-	fetchCopilotCatalogInfo,
-	resolvePinnedCopilotToken,
-} from "./copilot-credentials.js";
 
 // Built-in providers that ship in the shared pi-ai catalog but are turned off
 // in prime-agent. Filtered out of the model list so they never appear in the
@@ -173,6 +167,7 @@ const ModelDefinitionSchema = Type.Object({
 		}),
 	),
 	contextWindow: Type.Optional(Type.Number()),
+	maxInputTokens: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
@@ -192,6 +187,7 @@ const ModelOverrideSchema = Type.Object({
 		}),
 	),
 	contextWindow: Type.Optional(Type.Number()),
+	maxInputTokens: Type.Optional(Type.Number()),
 	maxTokens: Type.Optional(Type.Number()),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),
@@ -347,7 +343,14 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 	}
 	if (override.input !== undefined) result.input = override.input as ("text" | "image")[];
 	if (override.contextWindow !== undefined) result.contextWindow = override.contextWindow;
+	if (override.maxInputTokens !== undefined) result.maxInputTokens = override.maxInputTokens;
 	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
+	if (
+		result.maxInputTokens !== undefined &&
+		(result.maxInputTokens <= 0 || result.maxInputTokens > result.contextWindow)
+	) {
+		throw new Error(`Model ${model.provider}/${model.id}: invalid maxInputTokens`);
+	}
 
 	if (override.cost) {
 		result.cost = {
@@ -437,6 +440,14 @@ const PRIVATE_PRIME_BACKGROUND_REFRESH_TIMEOUT_MS = 3_000;
 const COPILOT_ENTITLEMENT_CACHE_FILE = "copilot-entitled-models.json";
 const COPILOT_ENTITLEMENT_CACHE_TTL_MS = 10 * 60_000;
 
+// Retain metadata for legacy CLI candidates so they become usable again if the
+// live catalog restores them, but never offer them without live entitlement.
+const COPILOT_LIVE_CATALOG_REQUIRED_MODEL_IDS: ReadonlySet<string> = new Set([
+	"gemini-2.5-pro",
+	"gemini-3-pro-preview",
+	"gemini-3.1-pro-preview",
+]);
+
 interface CopilotEntitlementCache {
 	fingerprint: string;
 	modelIds: string[];
@@ -470,6 +481,17 @@ function apiByIdToRecord(map: Map<string, CopilotApiMode>): Record<string, strin
 		record[id] = api;
 	}
 	return record;
+}
+
+function copilotEntitlementFingerprint(sourceToken: AuthSourceToken | undefined): string | undefined {
+	if (!sourceToken) return undefined;
+	return createHash("sha256")
+		.update(sourceToken.source)
+		.update("\0")
+		.update(sourceToken.identityFingerprint)
+		.update("\0")
+		.update(sourceToken.valueFingerprint)
+		.digest("hex");
 }
 
 interface PrivatePrimeAuthorizationCache {
@@ -507,11 +529,11 @@ export class ModelRegistry {
 	// loaded synchronously from the on-disk cache and refreshed asynchronously.
 	// Empty set means "unknown / not yet fetched" -> do not filter (show full catalog).
 	private copilotEntitledModelIds = new Set<string>();
+	private copilotEntitlementKnown = false;
 	// Per-model api mode derived from the account's live supported_endpoints,
 	// used to correct routing for models prime's name-heuristics misroute
 	// (grok, mai-code/oswe -> /responses). Empty means "use the baked api".
 	private copilotApiById = new Map<string, CopilotApiMode>();
-	private copilotEntitlementFingerprint: string | undefined;
 	private backgroundCopilotEntitlement: { fingerprint: string; promise: Promise<void> } | undefined;
 	private loadError: string | undefined = undefined;
 
@@ -638,12 +660,16 @@ export class ModelRegistry {
 				const copilotBaseUrl = provider === "github-copilot" ? copilotPinnedBaseUrl() : undefined;
 
 				// Filter Copilot to the account's live entitlements when known, so
-				// an unentitled model can never be selected (which would 400). An
-				// empty set means "unknown / not fetched yet" -> keep the full
-				// catalog rather than hiding everything.
+				// an unentitled model can never be selected (which would 400). Before
+				// the first successful fetch, keep the normal fallback catalog while
+				// withholding candidates known to require positive live entitlement.
 				const entitled = provider === "github-copilot" ? this.copilotEntitledModelIds : undefined;
-				const scopedModels =
-					entitled && entitled.size > 0 ? models.filter((m) => entitled.has(m.id)) : models;
+				const entitlementKnown = provider === "github-copilot" && this.copilotEntitlementKnown;
+				const scopedModels = entitlementKnown
+					? models.filter((model) => entitled?.has(model.id))
+					: provider === "github-copilot"
+						? models.filter((model) => !COPILOT_LIVE_CATALOG_REQUIRED_MODEL_IDS.has(model.id))
+						: models;
 
 				return scopedModels.map((m) => {
 					let model = m;
@@ -806,6 +832,12 @@ export class ModelRegistry {
 				if (!modelDef.id) throw new Error(`Provider ${providerName}: model missing "id"`);
 				if (modelDef.contextWindow !== undefined && modelDef.contextWindow <= 0)
 					throw new Error(`Provider ${providerName}, model ${modelDef.id}: invalid contextWindow`);
+				if (
+					modelDef.maxInputTokens !== undefined &&
+					(modelDef.maxInputTokens <= 0 || modelDef.maxInputTokens > (modelDef.contextWindow ?? 128000))
+				) {
+					throw new Error(`Provider ${providerName}, model ${modelDef.id}: invalid maxInputTokens`);
+				}
 				if (modelDef.maxTokens !== undefined && modelDef.maxTokens <= 0)
 					throw new Error(`Provider ${providerName}, model ${modelDef.id}: invalid maxTokens`);
 			}
@@ -855,6 +887,7 @@ export class ModelRegistry {
 					input: (modelDef.input ?? ["text"]) as ("text" | "image")[],
 					cost: modelDef.cost ?? defaultCost,
 					contextWindow: modelDef.contextWindow ?? 128000,
+					maxInputTokens: modelDef.maxInputTokens,
 					maxTokens: modelDef.maxTokens ?? 16384,
 					headers: undefined,
 					compat,
@@ -947,20 +980,22 @@ export class ModelRegistry {
 
 	/**
 	 * Synchronously seed the entitlement set from the on-disk cache, keyed by the
-	 * active Copilot identity (pinned user/host or explicit token). A cache from a
-	 * different identity is ignored so switching accounts never shows stale
-	 * entitlements. Missing/mismatched cache leaves the set empty -> full catalog.
+	 * active Copilot auth source and credential value. A cache from a different
+	 * identity is ignored so switching accounts never shows stale entitlements.
+	 * Missing or mismatched cache leaves entitlement state unknown.
 	 */
 	private loadCopilotEntitlementFromCache(): void {
-		const fingerprint = copilotPinIdentity();
-		this.copilotEntitlementFingerprint = fingerprint;
+		const fingerprint = copilotEntitlementFingerprint(this.authStorage.getCurrentAuthSourceToken("github-copilot"));
 		const cached = this.readCopilotEntitlementCache();
 		if (cached && cached.fingerprint === fingerprint) {
 			this.copilotEntitledModelIds = new Set(cached.modelIds);
 			this.copilotApiById = apiByIdFromRecord(cached.apiById);
+			this.copilotEntitlementKnown = true;
+			this.copilotEntitlementKnown = true;
 		} else {
 			this.copilotEntitledModelIds = new Set();
 			this.copilotApiById = new Map();
+			this.copilotEntitlementKnown = false;
 		}
 	}
 
@@ -981,17 +1016,18 @@ export class ModelRegistry {
 		if (!this.copilotEntitlementCachePath()) {
 			return;
 		}
-		const token = resolvePinnedCopilotToken();
-		if (!token) {
-			// No resolvable Copilot token (provider not in use) — nothing to scope.
+		const auth = await this.authStorage.getApiKeyWithSourceToken("github-copilot", { includeFallback: false });
+		const token = auth.apiKey;
+		const fingerprint = copilotEntitlementFingerprint(auth.sourceToken);
+		if (!token || !fingerprint) {
+			// Copilot is not configured, or its credential source cannot be safely
+			// identified for an account-scoped cache.
 			return;
 		}
-		const fingerprint = copilotPinIdentity();
 		const cached = this.readCopilotEntitlementCache();
 		if (cached && cached.fingerprint === fingerprint) {
 			this.copilotEntitledModelIds = new Set(cached.modelIds);
 			this.copilotApiById = apiByIdFromRecord(cached.apiById);
-			this.copilotEntitlementFingerprint = fingerprint;
 			const fresh = Date.now() - cached.refreshedAt < COPILOT_ENTITLEMENT_CACHE_TTL_MS;
 			if (fresh) {
 				return;
@@ -1006,14 +1042,10 @@ export class ModelRegistry {
 		} catch {
 			return;
 		}
-		if (info.ids.size === 0) {
-			// Empty means the fetch failed or returned nothing usable; do not hide
-			// the catalog. Leave whatever we already had (cache seed or empty).
-			return;
-		}
+		if (!info.catalogAvailable) return;
 		this.copilotEntitledModelIds = info.ids;
 		this.copilotApiById = info.apiById;
-		this.copilotEntitlementFingerprint = fingerprint;
+		this.copilotEntitlementKnown = true;
 		this.writeCopilotEntitlementCache({
 			fingerprint,
 			modelIds: [...info.ids],
@@ -1029,12 +1061,15 @@ export class ModelRegistry {
 		const run = async () => {
 			try {
 				const info = await fetchCopilotCatalogInfo(token);
-				if (info.ids.size === 0 || copilotPinIdentity() !== fingerprint) {
+				const currentFingerprint = copilotEntitlementFingerprint(
+					this.authStorage.getCurrentAuthSourceToken("github-copilot"),
+				);
+				if (!info.catalogAvailable || currentFingerprint !== fingerprint) {
 					return;
 				}
 				this.copilotEntitledModelIds = info.ids;
 				this.copilotApiById = info.apiById;
-				this.copilotEntitlementFingerprint = fingerprint;
+				this.copilotEntitlementKnown = true;
 				this.writeCopilotEntitlementCache({
 					fingerprint,
 					modelIds: [...info.ids],
@@ -1814,6 +1849,7 @@ export class ModelRegistry {
 					input: modelDef.input as ("text" | "image")[],
 					cost: modelDef.cost,
 					contextWindow: modelDef.contextWindow,
+					maxInputTokens: modelDef.maxInputTokens,
 					maxTokens: modelDef.maxTokens,
 					headers: undefined,
 					compat: modelDef.compat,
@@ -1860,6 +1896,7 @@ export interface ProviderConfigInput {
 		input: ("text" | "image")[];
 		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		contextWindow: number;
+		maxInputTokens?: number;
 		maxTokens: number;
 		headers?: Record<string, string>;
 		compat?: Model<Api>["compat"];

@@ -43,7 +43,11 @@ import {
 } from "../utils/stream-failure.js";
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
-import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import {
+	buildCopilotDynamicHeaders,
+	hasCopilotVisionInput,
+	sanitizeCopilotModelHeaders,
+} from "./github-copilot-headers.js";
 import { adjustMaxTokensForThinking, buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -493,6 +497,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					copilotDynamicHeaders = buildCopilotDynamicHeaders({
 						messages: context.messages,
 						hasImages,
+						api: model.api,
 						sessionId: options?.sessionId,
 						isStreaming: true,
 					});
@@ -896,7 +901,7 @@ function createClient(
 					"anthropic-dangerous-direct-browser-access": "true",
 					...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
 				},
-				model.headers,
+				sanitizeCopilotModelHeaders(model.headers, model.api),
 				dynamicHeaders,
 				optionsHeaders,
 			),

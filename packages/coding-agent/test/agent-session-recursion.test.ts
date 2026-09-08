@@ -1474,15 +1474,16 @@ describe("AgentSession rlm recursion", () => {
 		});
 	});
 
-	it("releases a hosted child when its initial task fails", async () => {
+	it("releases a hosted errored child without retaining its session and keeps the error row deletable", async () => {
 		const child = createSession({ rlmSessionDir: join(tempDir, "host-error-child") });
 		vi.spyOn(child, "promptAndWait").mockRejectedValue(new Error("child prompt failed"));
 		const releaseRlmSubagentRuntime = vi.fn(async () => {});
+		const deleteRlmSubagentRuntime = vi.fn(async () => {});
 		const root = createSession({
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child }),
 				releaseRlmSubagentRuntime,
-				deleteRlmSubagentRuntime: async () => {},
+				deleteRlmSubagentRuntime,
 			},
 		});
 
@@ -1494,6 +1495,49 @@ describe("AgentSession rlm recursion", () => {
 				"error",
 			);
 		});
+		await root.waitForRlmQuiescence();
+
+		expect(root.getRlmChildSession(spawned.rlm_child_id)).toBeUndefined();
+		expect(await root.listRlmSubagents()).toEqual({
+			subagents: [
+				expect.objectContaining({
+					rlm_child_id: spawned.rlm_child_id,
+					status: "error",
+				}),
+			],
+		});
+
+		await expect(root.deleteRlmSubagent(spawned.rlm_child_id)).resolves.toMatchObject({
+			subagent: { rlm_child_id: spawned.rlm_child_id },
+		});
+		expect(deleteRlmSubagentRuntime).toHaveBeenCalledWith(spawned.rlm_child_id, undefined);
+		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
+	});
+
+	it("keeps a released errored child available when durable deletion fails", async () => {
+		const child = createSession({ rlmSessionDir: join(tempDir, "host-error-delete-retry-child") });
+		vi.spyOn(child, "promptAndWait").mockRejectedValue(new Error("child prompt failed"));
+		const deleteRlmSubagentRuntime = vi.fn(async () => {}).mockRejectedValueOnce(new Error("durable delete failed"));
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: child }),
+				releaseRlmSubagentRuntime: async () => {},
+				deleteRlmSubagentRuntime,
+			},
+		});
+
+		const spawned = await root.runRlmChild("fail hosted child");
+		await root.waitForRlmQuiescence();
+
+		await expect(root.deleteRlmSubagent(spawned.rlm_child_id)).rejects.toThrow("durable delete failed");
+		expect(await root.listRlmSubagents()).toEqual({
+			subagents: [expect.objectContaining({ rlm_child_id: spawned.rlm_child_id, status: "error" })],
+		});
+		await expect(root.deleteRlmSubagent(spawned.rlm_child_id)).resolves.toMatchObject({
+			subagent: { rlm_child_id: spawned.rlm_child_id },
+		});
+		expect(deleteRlmSubagentRuntime).toHaveBeenCalledTimes(2);
+		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
 	});
 
 	it("strong quiescence waits for a gated child bash activity change", async () => {
@@ -1913,7 +1957,9 @@ describe("AgentSession rlm recursion", () => {
 		const root = createSession({
 			subagentRuntimeHost: {
 				createRlmSubagentRuntime: async () => ({ session: child }),
-				releaseRlmSubagentRuntime: async () => {},
+				releaseRlmSubagentRuntime: async () => {
+					throw new Error("initial host release failed");
+				},
 				deleteRlmSubagentRuntime,
 			},
 		});
@@ -2462,23 +2508,30 @@ describe("AgentSession rlm recursion", () => {
 		expect(attribution.aggregateUsage.cost.total).toBe(10);
 	});
 
-	it("attributes every tool-loop turn in the admitted task to spawn usage", async () => {
+	it("attributes every tool-loop turn without scanning all session entries", async () => {
+		const firstResponse = deferred<void>();
+		const toolCompletion = deferred<void>();
+		let childStreamStarted = false;
 		const tool = {
 			name: "echo",
 			description: "Echo a value",
 			label: "echo",
 			parameters: Type.Object({ value: Type.String() }),
-			execute: async (_toolCallId: string, params: { value: string }) => ({
-				content: [{ type: "text" as const, text: params.value }],
-				details: {},
-			}),
+			execute: async (_toolCallId: string, params: { value: string }) => {
+				await toolCompletion.promise;
+				return {
+					content: [{ type: "text" as const, text: params.value }],
+					details: {},
+				};
+			},
 		};
 		const root = createSession({
 			customTools: [tool],
 			streamFn: (_model, context) => {
 				const toolResultCount = context.messages.filter((message) => message.role === "toolResult").length;
 				const stream = createAssistantMessageEventStream();
-				queueMicrotask(() => {
+				childStreamStarted = true;
+				void firstResponse.promise.then(() => {
 					const message =
 						toolResultCount === 0
 							? {
@@ -2503,13 +2556,23 @@ describe("AgentSession rlm recursion", () => {
 		root.sessionManager.appendMessage(parentAssistant);
 
 		await root.runRlmChild("use a tool");
-		await vi.waitFor(() => {
-			const attributions = root.sessionManager
-				.getEntries()
-				.filter((entry) => entry.type === "child_usage_attributed");
-			expect(attributions).toHaveLength(2);
-			expect(attributions.map((entry) => entry.origin)).toEqual(["spawn_task", "spawn_task"]);
-		});
+		await waitFor(() => childStreamStarted);
+		const getEntries = vi.spyOn(root.sessionManager, "getEntries");
+		firstResponse.resolve();
+		await waitFor(
+			() => root.sessionManager.getBranch().filter((entry) => entry.type === "child_usage_attributed").length === 1,
+		);
+		const scansDuringChildTurn = getEntries.mock.calls.length;
+		getEntries.mockRestore();
+		toolCompletion.resolve();
+
+		await waitFor(
+			() => root.sessionManager.getBranch().filter((entry) => entry.type === "child_usage_attributed").length === 2,
+		);
+		expect(scansDuringChildTurn).toBe(0);
+		const attributions = root.sessionManager.getEntries().filter((entry) => entry.type === "child_usage_attributed");
+		expect(attributions).toHaveLength(2);
+		expect(attributions.map((entry) => entry.origin)).toEqual(["spawn_task", "spawn_task"]);
 	});
 
 	it("gets and persists per-chat max-depth changes without transcript messages", async () => {

@@ -70,8 +70,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds capability-gated direct worker peer transport discovery.
-export const DAEMON_SCHEMA_REVISION = 25;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-25-585ef1102921";
+// Revision 26 lets an attached resident client provide transient context for failed-worker recovery.
+export const DAEMON_SCHEMA_REVISION = 26;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-fb17baab29ad";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -89,7 +90,8 @@ export type DaemonClientCapability =
 	| "extension_ui"
 	| "slim_attach"
 	| "chunked_snapshot"
-	| "client_owned_sessions";
+	| "client_owned_sessions"
+	| "resident_worker_recovery_notifications";
 export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
 export interface DaemonPromptAdmissionCancellationResult {
 	status: DaemonPromptAdmissionCancellationStatus;
@@ -114,6 +116,7 @@ export type DaemonServerCapability =
 	| "queue_message_mutation"
 	| "authoritative_child_roster"
 	| "owned_session_recovery_context"
+	| "resident_worker_recovery_context"
 	| "rlm_quiescence_barrier"
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
@@ -144,6 +147,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"slim_attach",
 	"chunked_snapshot",
 	"client_owned_sessions",
+	"resident_worker_recovery_notifications",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
@@ -215,6 +219,12 @@ export type DaemonSessionLifecycle = "resident" | "client_owned";
 
 export interface DaemonLaunchEnv {
 	launchEnv?: Record<string, string>;
+}
+
+/** Fresh, transient context for recovering a failed resident worker. Never persisted. */
+export interface DaemonResidentWorkerRecoveryContext extends DaemonClientEnv {
+	config: AgentSessionRuntimeConfig;
+	launchEnv: Record<string, string>;
 }
 
 /**
@@ -396,7 +406,12 @@ export type DaemonCommand =
 	  }
 	| DaemonSavedSessionListCommand
 	| { id?: string; type: "list_agent_peers"; workerToken: string }
-	| { id?: string; type: "get_direct_worker_transport"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "get_direct_worker_transport";
+			activeSessionId: string;
+			capabilities?: readonly DaemonClientCapability[];
+	  }
 	| { id?: string; type: "roster_subscribe" }
 	| { id?: string; type: "roster_unsubscribe" }
 	| ({
@@ -675,7 +690,12 @@ export type DaemonCommand =
 	  }
 	| { id?: string; type: "ack_result"; commandId: string }
 	| { id?: string; type: "prepare_update_restart" }
-	| { id?: string; type: "retry_worker"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "retry_worker";
+			activeSessionId: string;
+			recoveryContext?: DaemonResidentWorkerRecoveryContext;
+	  }
 	| { id?: string; type: "restart" }
 	| { id?: string; type: "shutdown"; force?: boolean };
 
@@ -723,6 +743,11 @@ const OWNED_SESSION_RECOVERY_CONTEXT = {
 	minProtocol: 7,
 	minSchemaRevision: 17,
 	capability: "owned_session_recovery_context",
+} as const;
+const RESIDENT_WORKER_RECOVERY_CONTEXT = {
+	minProtocol: 7,
+	minSchemaRevision: 26,
+	capability: "resident_worker_recovery_context",
 } as const;
 const RLM_QUIESCENCE_BARRIER_COMMAND = {
 	minProtocol: 7,
@@ -977,6 +1002,15 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 	if ((command.type === "attach" || command.type === "reattach") && command.recoveryConfig !== undefined) {
 		requirements.push(OWNED_SESSION_RECOVERY_CONTEXT);
 	}
+	if (command.type === "retry_worker" && command.recoveryContext !== undefined) {
+		requirements.push(RESIDENT_WORKER_RECOVERY_CONTEXT);
+	}
+	if (
+		command.type === "get_direct_worker_transport" &&
+		command.capabilities?.includes("resident_worker_recovery_notifications")
+	) {
+		requirements.push(RESIDENT_WORKER_RECOVERY_CONTEXT);
+	}
 	const carriesTelemetryPolicy =
 		((command.type === "attach" || command.type === "reattach") && command.telemetryDisabled !== undefined) ||
 		(command.type === "create" && command.config?.telemetryDisabled !== undefined);
@@ -1174,6 +1208,7 @@ export type DaemonOutbound =
 			error: string;
 	  }
 	| { type: "session_detached"; activeSessionId: string }
+	| { type: "session_worker_recovering"; activeSessionId: string }
 	| { type: "session_closed"; activeSessionId: string; reason: DaemonSessionClosedReason; meta?: DaemonEventMeta }
 	| {
 			type: "extension_ui_request";
@@ -1211,6 +1246,11 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	session_snapshot_end: LEGACY_DAEMON_COMMAND,
 	session_snapshot_failed: LEGACY_DAEMON_COMMAND,
 	session_detached: LEGACY_DAEMON_COMMAND,
+	session_worker_recovering: {
+		minProtocol: 7,
+		minSchemaRevision: 26,
+		capability: "resident_worker_recovery_notifications",
+	},
 	session_closed: LEGACY_DAEMON_COMMAND,
 	extension_ui_request: LEGACY_DAEMON_COMMAND,
 	extension_error: LEGACY_DAEMON_COMMAND,

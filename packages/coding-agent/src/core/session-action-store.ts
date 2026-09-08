@@ -370,6 +370,15 @@ export interface WorkerEvictionSnapshot {
 	sessions: readonly SessionEvictionSnapshot[];
 }
 
+function isSessionUnpinned(session: SessionEvictionSnapshot): boolean {
+	return (
+		!session.isSessionActive &&
+		session.attachedClients === 0 &&
+		!session.hasRegisteredHeartbeat &&
+		!session.hasRegisteredCronJob
+	);
+}
+
 function isIdleEvictionThresholdMet(
 	session: SessionEvictionSnapshot,
 	idleEvictionMinutes: IdleEvictionMinutes,
@@ -379,13 +388,14 @@ function isIdleEvictionThresholdMet(
 		return false;
 	}
 	return (
-		!session.isSessionActive &&
-		session.attachedClients === 0 &&
-		!session.hasRegisteredHeartbeat &&
-		!session.hasRegisteredCronJob &&
+		isSessionUnpinned(session) &&
 		Number.isFinite(session.lastActivityAt) &&
 		now - session.lastActivityAt >= idleEvictionMinutes * 60_000
 	);
+}
+
+function isPassivatableChild(session: SessionPassivationSnapshot): boolean {
+	return session.hasParent && !session.hasNonPassiveDescendants && !session.isHydrating && isSessionUnpinned(session);
 }
 
 /** Pure per-node residency policy. Roots remain owned by whole-worker eviction. */
@@ -394,12 +404,12 @@ export function canPassivateSession(
 	idleEvictionMinutes: IdleEvictionMinutes,
 	now = Date.now(),
 ): boolean {
-	return (
-		session.hasParent &&
-		!session.hasNonPassiveDescendants &&
-		!session.isHydrating &&
-		isIdleEvictionThresholdMet(session, idleEvictionMinutes, now)
-	);
+	return isPassivatableChild(session) && isIdleEvictionThresholdMet(session, idleEvictionMinutes, now);
+}
+
+/** Emergency memory policy: keep every safety pin while ignoring only elapsed idle time. */
+export function canPassivateSessionUnderMemoryPressure(session: SessionPassivationSnapshot): boolean {
+	return isPassivatableChild(session);
 }
 
 /** Pure whole-tree residency policy. Callers must supply supervisor-owned attachment state. */

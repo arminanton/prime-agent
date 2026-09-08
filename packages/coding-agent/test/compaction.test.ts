@@ -14,6 +14,7 @@ import {
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
+	resolveModelInputTokenLimit,
 	shouldCompact,
 } from "../src/core/compaction/index.js";
 import {
@@ -249,6 +250,16 @@ describe("getLastAssistantUsage", () => {
 	it("should return undefined if no assistant messages", () => {
 		const entries: SessionEntry[] = [createMessageEntry(createUserMessage("Hello"))];
 		expect(getLastAssistantUsage(entries)).toBeUndefined();
+	});
+});
+
+describe("resolveModelInputTokenLimit", () => {
+	it("uses a provider prompt cap when it is lower than the total context window", () => {
+		const inputLimit = resolveModelInputTokenLimit({ contextWindow: 1_050_000, maxInputTokens: 922_000 });
+		expect(inputLimit).toBe(922_000);
+		expect(shouldCompact(920_790, inputLimit, DEFAULT_COMPACTION_SETTINGS)).toBe(true);
+		expect(resolveModelInputTokenLimit({ contextWindow: 200_000 })).toBe(200_000);
+		expect(resolveModelInputTokenLimit({ contextWindow: 128_000, maxInputTokens: 200_000 })).toBe(128_000);
 	});
 });
 

@@ -13,6 +13,7 @@ export {
 	buildCopilotDynamicHeaders,
 	copilotApiVersion,
 	copilotCliVersion,
+	copilotControlPlaneUserAgent,
 	copilotIntegrationId,
 	copilotUserAgent,
 	hasCopilotVisionInput,

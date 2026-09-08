@@ -49,6 +49,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 				expect(init?.headers).toMatchObject({
 					Accept: "application/json",
 					"Content-Type": "application/x-www-form-urlencoded",
+					"User-Agent": expect.stringMatching(/^copilot\/1\.0\.84-1 /),
 				});
 				expect(String(init?.body)).toContain("client_id=");
 				expect(String(init?.body)).toContain("scope=read%3Auser");
@@ -79,13 +80,31 @@ describe("GitHub Copilot OAuth device flow", () => {
 			}
 
 			if (url.includes("/copilot_internal/v2/token")) {
+				expect(init?.headers).toMatchObject({
+					"User-Agent": expect.stringMatching(/^copilot\/1\.0\.84-1 /),
+					"Editor-Version": "copilot/1.0.84-1",
+					"Copilot-Integration-Id": "copilot-developer-cli",
+				});
+				expect(init?.headers).not.toHaveProperty("Editor-Plugin-Version");
 				return jsonResponse({
 					token: "tid=test;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com;",
 					expires_at: 9999999999,
 				});
 			}
 
+			if (url.endsWith("/models")) {
+				return jsonResponse({
+					data: [
+						{ id: "live-enabled", policy: { state: "enabled" } },
+						{ id: "needs/policy", policy: { state: "unconfigured", terms: "https://terms.example/model" } },
+					],
+				});
+			}
+
 			if (url.includes("/models/") && url.endsWith("/policy")) {
+				expect(url).toContain("/models/needs%2Fpolicy/policy");
+				expect(init?.method).toBe("POST");
+				expect(init?.body).toBeUndefined();
 				return new Response("", { status: 200 });
 			}
 
@@ -94,9 +113,13 @@ describe("GitHub Copilot OAuth device flow", () => {
 
 		vi.stubGlobal("fetch", fetchMock);
 
+		const prompts: string[] = [];
 		const loginPromise = loginGitHubCopilot({
 			onAuth: () => {},
-			onPrompt: async () => "",
+			onPrompt: async ({ message }) => {
+				prompts.push(message);
+				return message.startsWith("GitHub Enterprise") ? "" : "yes";
+			},
 			onProgress: () => {},
 		});
 
@@ -120,6 +143,12 @@ describe("GitHub Copilot OAuth device flow", () => {
 
 		await vi.advanceTimersByTimeAsync(1);
 		await loginPromise;
+
+		expect(prompts).toHaveLength(2);
+		expect(prompts[1]).toContain("needs/policy");
+		expect(prompts[1]).toContain("https://terms.example/model");
+		const policyCalls = fetchMock.mock.calls.filter(([input]) => getUrl(input).endsWith("/policy"));
+		expect(policyCalls).toHaveLength(1);
 
 		expect(accessTokenPollTimes).toEqual([
 			startTime.getTime() + 6000,
