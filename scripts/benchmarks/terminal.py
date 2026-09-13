@@ -121,6 +121,14 @@ class Terminal:
         self.display.feed(chunk)
         return True
 
+    def until(self, predicate: Callable[[Display], bool], timeout: float) -> None:
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            if (2026 << 5) not in self.display.screen.mode and predicate(self.display):
+                return
+            self.pump()
+        raise TimeoutError("Timed out waiting for the expected terminal state")
+
     def settle(self, seconds: float) -> None:
         deadline = time.perf_counter() + seconds
         while time.perf_counter() < deadline:
