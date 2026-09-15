@@ -866,6 +866,11 @@ export class DaemonSupervisor {
 			if (adoptionFailed) {
 				throw adoptionFailure;
 			}
+			// Adoption parks a worker whose process is confirmed gone/replaced as "failed".
+			// An unowned one is a stale descriptor: reclaim it here so it does not mask a
+			// scheduled wake or block a fenced update restart. The schedule persists on disk,
+			// so the next due wake re-creates a worker from it.
+			this.reclaimStaleDeadWorkers();
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}
@@ -981,7 +986,9 @@ export class DaemonSupervisor {
 			const visited = new Set([canonicalSessionPath(current.path)]);
 			while (true) {
 				try {
-					if (this.findWorkerBySessionFile(current.path)) return undefined;
+					// Wake-eligibility, not bare ownership: a failed/stopping/dead owner must
+					// not count as coverage, or this root's scheduled wake is silently skipped.
+					if (this.findWakeableWorkerBySessionFile(current.path)) return undefined;
 				} catch {
 					return undefined;
 				}
@@ -5134,6 +5141,79 @@ export class DaemonSupervisor {
 		return matches.values().next().value;
 	}
 
+	/**
+	 * Wake-eligibility (predicate b), a strict subset of ownership (predicate a). A worker
+	 * that OWNS its session path still fails this when it cannot run the schedule: a
+	 * stopping, failed, or process-gone worker must NOT count as coverage, or the scheduled
+	 * wake for its root is silently skipped. starting/recovering workers are mid-launch and
+	 * keep coverage so a wake is not duplicated on top of them.
+	 */
+	private coversScheduledWake(worker: ResidentWorker): boolean {
+		if (this.isWorkerStopping(worker)) return false;
+		if (worker.descriptor.lifecycle === "failed" || worker.descriptor.lifecycle === "stopping") return false;
+		if (
+			worker.descriptor.lifecycle === "ready" &&
+			this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId) === "gone"
+		) {
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Ownership narrowed to wake-eligibility: the session owner counts as coverage for the
+	 * scheduled-wake scan only when it can actually be woken now. A failed or dead owner
+	 * returns undefined so its root becomes wake-eligible again.
+	 */
+	private findWakeableWorkerBySessionFile(sessionFile: string): ResidentWorker | undefined {
+		const owner = this.findWorkerBySessionFile(sessionFile);
+		if (!owner) return undefined;
+		return this.coversScheduledWake(owner) ? owner : undefined;
+	}
+
+	/**
+	 * Reclaimability (predicate c): a stale descriptor that is safe to remove - unowned
+	 * (not client-owned), disconnected, not mid-stop or mid-recovery, and whose process is
+	 * CONFIRMED gone or replaced. Fail-closed: a still-current or unverifiable ("unknown")
+	 * identity is a live-but-unreachable worker and is never reclaimed here.
+	 */
+	private isReclaimableDeadDescriptor(worker: ResidentWorker): boolean {
+		// Only a terminal "failed" descriptor is reclaimed. A starting/recovering/ready
+		// worker is mid-launch or actively managed, so removing it here would race the
+		// recovery machinery; those paths keep their own fail-closed handling.
+		if (worker.descriptor.lifecycle !== "failed") return false;
+		if (worker.client !== undefined) return false;
+		if (worker.recovery !== undefined) return false;
+		if (worker.descriptor.ownerClientId !== undefined) return false;
+		if (this.isWorkerStopping(worker)) return false;
+		if ((this.workerStopCounts?.get(worker) ?? 0) !== 0) return false;
+		const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+		return identity === "gone" || identity === "replaced";
+	}
+
+	/** Remove a worker registration + roster rows + on-disk descriptor (the reclaim path). */
+	private removeStaleWorkerDescriptor(worker: ResidentWorker): void {
+		this.workers.delete(worker.descriptor.workerId);
+		this.flipWorkerRosterEntriesInactive(worker);
+		this.deleteWorkerDescriptor(worker);
+	}
+
+	/**
+	 * Remove every confirmed-dead, unowned stale descriptor (predicate c). A
+	 * live-but-unreachable worker is left registered (fail-closed) so callers that require
+	 * it can still fail on it. Returns the removed workers.
+	 */
+	private reclaimStaleDeadWorkers(): ResidentWorker[] {
+		const removed: ResidentWorker[] = [];
+		for (const worker of [...this.workers.values()]) {
+			if (!this.isReclaimableDeadDescriptor(worker)) continue;
+			this.removeStaleWorkerDescriptor(worker);
+			this.log(`Removed stale descriptor for confirmed-dead worker ${worker.descriptor.workerId}`);
+			removed.push(worker);
+		}
+		return removed;
+	}
+
 	private async forwardToWorker(
 		worker: ResidentWorker,
 		command: DaemonCommand,
@@ -6413,6 +6493,10 @@ export class DaemonSupervisor {
 	}
 
 	private async prepareUpdateRestartFenced(deadline: number): Promise<DaemonUpdateRestartManifest> {
+		// Reclaim confirmed-dead, unowned stale descriptors first so they cannot block the
+		// fenced restart (they otherwise force a cold restart). A live-but-unreachable
+		// worker is left in place and still blocks below (fail-closed).
+		this.reclaimStaleDeadWorkers();
 		const residents = [...this.workers.values()];
 		const unavailable = residents.find(
 			(worker) =>
