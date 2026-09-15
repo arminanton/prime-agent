@@ -6,7 +6,7 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
@@ -346,6 +346,68 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<StaleDa
 	return (await shutdownConnectedDaemonAndWait(client, socketPath, 5000, hello)) ? "stopped" : "busy";
 }
 
+export interface DaemonLaunchInvocation {
+	command: string;
+	args: string[];
+	scoped: boolean;
+	warning?: string;
+}
+
+function findExecutableOnPath(name: string): string | undefined {
+	const pathValue = process.env.PATH;
+	if (!pathValue) return undefined;
+	for (const dir of pathValue.split(":")) {
+		if (!dir) continue;
+		try {
+			if (statSync(join(dir, name)).isFile()) return join(dir, name);
+		} catch {
+			// Not on this PATH entry; keep looking.
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Optionally wrap the daemon launch in a dedicated systemd --user transient scope so the
+ * supervisor, all workers, kernels, and uv helpers inherit one cgroup with a hard memory +
+ * swap cap (Delegate=yes) that a shell-driven restart cannot drop back into the SSH login
+ * scope. Opt-in and reversible via PRIME_AGENT_DAEMON_SCOPE=1; if systemd-run is missing it
+ * falls back to the unscoped launch with a warning. Never applied unless the env asks for it.
+ */
+export function buildDaemonScopeInvocation(command: string, args: readonly string[]): DaemonLaunchInvocation {
+	if (process.env.PRIME_AGENT_DAEMON_SCOPE !== "1") {
+		return { command, args: [...args], scoped: false };
+	}
+	const systemdRun = findExecutableOnPath("systemd-run");
+	if (!systemdRun) {
+		return {
+			command,
+			args: [...args],
+			scoped: false,
+			warning:
+				"PRIME_AGENT_DAEMON_SCOPE=1 but systemd-run was not found on PATH; launching the daemon unscoped.",
+		};
+	}
+	const memoryMax = process.env.PRIME_AGENT_DAEMON_SCOPE_MEMORY_MAX ?? "46G";
+	const memorySwapMax = process.env.PRIME_AGENT_DAEMON_SCOPE_MEMORY_SWAP_MAX ?? "6G";
+	const scopeArgs = [
+		"--user",
+		"--scope",
+		"--collect",
+		"--unit=prime-agent-daemon",
+		"-p",
+		`MemoryMax=${memoryMax}`,
+		"-p",
+		`MemorySwapMax=${memorySwapMax}`,
+		"-p",
+		"Delegate=yes",
+		"--",
+		command,
+		...args,
+	];
+	return { command: systemdRun, args: scopeArgs, scoped: true };
+}
+
 async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promise<void> {
 	const probeStartedAt = Date.now();
 	let probe = await probeDaemonVersion(socketPath);
@@ -394,19 +456,28 @@ Then retry the original command.`,
 	delete env[SESSION_LEASE_OWNER_ID_ENV];
 
 	const logOffset = currentDaemonLogSize(socketPath);
-	const child = spawnHidden(
-		process.execPath,
-		[...process.execArgv, entrypoint, "--mode", "daemon", "--daemon-socket", socketPath],
-		{
-			cwd: spawnCwd ?? process.cwd(),
-			detached: true,
-			env,
-			// A pipe would tie the daemon's stderr to this short-lived CLI
-			// (EPIPE once it exits); crash details come from the daemon log,
-			// which the supervisor writes to before rethrowing startup errors.
-			stdio: "ignore",
-		},
-	);
+	const invocation = buildDaemonScopeInvocation(process.execPath, [
+		...process.execArgv,
+		entrypoint,
+		"--mode",
+		"daemon",
+		"--daemon-socket",
+		socketPath,
+	]);
+	if (invocation.warning) {
+		logDaemonLaunch(invocation.warning);
+	} else if (invocation.scoped) {
+		logDaemonLaunch(`launching daemon in a systemd --user scope via ${invocation.command}`);
+	}
+	const child = spawnHidden(invocation.command, invocation.args, {
+		cwd: spawnCwd ?? process.cwd(),
+		detached: true,
+		env,
+		// A pipe would tie the daemon's stderr to this short-lived CLI
+		// (EPIPE once it exits); crash details come from the daemon log,
+		// which the supervisor writes to before rethrowing startup errors.
+		stdio: "ignore",
+	});
 	let childFailure:
 		| { type: "error"; error: Error }
 		| { type: "exit"; code: number | null; signal: NodeJS.Signals | null }

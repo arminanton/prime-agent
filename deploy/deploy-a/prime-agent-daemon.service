@@ -1,0 +1,32 @@
+# Prime Agent daemon systemd --user unit TEMPLATE (Deploy A). NOT installed by the fix
+# branch. This is an ALTERNATIVE to the launcher's transient `systemd-run --user --scope`
+# (PRIME_AGENT_DAEMON_SCOPE=1) for hosts that prefer a persistent unit. Install to
+# ~/.config/systemd/user/prime-agent-daemon.service, then `systemctl --user daemon-reload`.
+# Do NOT enable it live without following DEPLOY-A-RUNBOOK.md under a health gate.
+#
+# Host facts (2026-09-15): OL 8.10, systemd 239 (no OOMPolicy=, no systemd-oomd, no
+# /proc/pressure), swap 64G (32G zram + 32G swapfile). Today the daemon runs in the SSH
+# login scope (session-3.scope) under user-400.slice with MemoryHigh=50G (SOFT throttle),
+# MemoryMax=infinity: over the cap the kernel throttles instead of killing = the freeze.
+[Unit]
+Description=Prime Agent daemon (memory-bounded scope)
+After=default.target
+
+[Service]
+Type=simple
+# Point at the real prod launcher + socket.
+ExecStart=/usr/bin/env prime-agent --mode daemon --daemon-socket %h/.prime/agent/daemon.sock
+EnvironmentFile=%h/.config/prime-agent/prime-agent-daemon.env
+Restart=no
+
+# Start HIGH (above measured legit steady state), ratchet down later. MemorySwapMax bounds
+# swap thrash. memory.oom.group=0 so the kernel OOM killer takes the single largest process
+# (a worker/kernel) rather than the whole daemon; pair with the Deploy B crash-loop breaker.
+MemoryAccounting=yes
+MemoryMax=46G
+MemorySwapMax=6G
+MemoryOOMGroup=no
+Delegate=yes
+
+[Install]
+WantedBy=default.target
