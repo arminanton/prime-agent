@@ -92,15 +92,24 @@ Tests: test/daemon-mode*.test.ts (add cases) or a focused unit around the probe/
 ======================================================================
 A.5  Lazy kernel prewarm (single biggest probability reducer)
 ======================================================================
-File: packages/coding-agent/src/core/agent-session.ts (~AS:10254-10262 hasSnapshot -> prewarm()).
-Problem: hydrating a snapshot-bearing session EAGERLY starts a Python kernel and restores the pickle, on
-heartbeat fire, agent message to a passive child (M:6374-6382), parent access, and wake. This is the memory
-generator that turns any wave into GB of kernel state.
-Change: gate eager prewarm behind (a) an env/config switch AND (b) interactive/attached sessions only;
-for daemon-hydrated (non-attached) sessions, DEFER kernel start until the first actual ipython use (restore
-the snapshot lazily on first kernel need). Do not change interactive behavior.
+File: packages/coding-agent/src/core/agent-session.ts (_shouldEagerPrewarmKernel + the prewarm gate).
+SCOPE (narrowed): this defers kernel prewarm for PASSIVE daemon-hydrated CHILDREN only. Roots still prewarm
+eagerly on wake/heartbeat (they run through main.ts with prewarmIpythonKernel), and an interactive
+ATTACHED/resumed child now also eager-starts (it lost that before). Deferring a woken ROOT'S prewarm needs a
+daemon attach-vs-wake signal and is Deploy B; a heartbeat root usually calls ipython in its first turn
+anyway, so root deferral mostly reorders load rather than removing kernels.
+Problem: hydrating a snapshot-bearing PASSIVE child EAGERLY starts a Python kernel and restores the pickle,
+on agent message to a passive child, observe/collect, and parent access. A wave of such hydrations is the
+memory generator that turns any wave into GB of kernel state.
+Change: the prewarm gate honors the caller's prewarmIpythonKernel request directly. An interactive frontend
+(main.ts) sets it for a root OR an attached/resumed child, so both eager-start. A daemon passive hydration or
+a fresh subagent spawn (createRlmSubagentRuntime / getOrHydrateBoundSessionState) does NOT set it, so those
+DEFER kernel start until the first actual ipython use (the snapshot restores lazily on first kernel need).
+PRIME_AGENT_EAGER_KERNEL_PREWARM_ON_HYDRATE=1 restores eager on-hydrate prewarm for a snapshot-bearing
+passive session.
 Acceptance: a daemon hydration of a passive snapshot-bearing child does NOT spawn a Python kernel until a
-Python tool is used; interactive attach still prewarms. Tests: test around the hydration path / repl-manager.
+Python tool is used, then exactly one start/restore; an interactive/attached session still prewarms. Tests:
+test/agent-session-lazy-prewarm.test.ts (gate decision + a real provisioner integration test).
 
 ======================================================================
 A.1  Host + launcher scope (config + launcher; NOT applied live here)

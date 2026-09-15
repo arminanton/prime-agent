@@ -26,7 +26,8 @@ What Deploy A changes (build phase, this branch):
   timeout and a live-owner check, so a transient probe never spawns a second daemon.
 - A.5 (agent-session.ts): a passive daemon-hydrated CHILD session defers its kernel start to
   first ipython use instead of eagerly loading GB of kernel state on every hydration. Roots
-  still prewarm.
+  still prewarm, and an interactive attached/resumed child also eager-starts; deferring a woken
+  ROOT'S prewarm is Deploy B.
 - A.1 (cli/daemon-launch.ts + these deploy/ artifacts): an opt-in launcher cgroup scope under a
   capped parent slice, plus the host config templates below. NONE of the host config is applied
   by this branch.
