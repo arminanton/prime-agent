@@ -771,8 +771,12 @@ export function createDefaultRuntimeFactory(
 			sessionManager,
 			sessionStartEvent,
 			...resolvedSessionOptions,
-			// Main agents boot their kernel in the background at session creation;
-			// subagent sessions (rlmDepth > 0) keep the lazy first-call start.
+			// Request prewarm for every session; AgentSession._shouldEagerPrewarmKernel applies the
+			// Deploy A depth gate, so a root boots its kernel in the background at session creation
+			// while a depth>0 child (fresh subagent spawn OR daemon-hosted passive/attached child)
+			// keeps the lazy first-call start. This is set unconditionally (and after the options
+			// spread) on purpose: an attached child paying first-tool latency is the accepted Deploy A
+			// tradeoff, and threading the real attach-vs-passive signal here is Deploy B.
 			prewarmIpythonKernel: true,
 			// Read serializedRefine from the merged runtime config (passed
 			// from the JSON/print client through AgentSessionRuntimeConfig)

@@ -1570,11 +1570,11 @@ export class AgentSession {
 		const resolvedRlmMaxDepth = this._resolveRlmMaxDepth();
 		this._rlmMaxDepth = resolvedRlmMaxDepth.maxDepth;
 		this._rlmMaxDepthSource = resolvedRlmMaxDepth.source;
-		// Honor the caller's prewarm request directly (no depth gate). An interactive frontend
-		// (main.ts) sets it whether the session is a root OR an ATTACHED/resumed depth>0 child, so an
-		// attached child eager-starts its kernel instead of paying first-tool latency. A daemon
-		// PASSIVE hydration or a fresh subagent spawn (createRlmSubagentRuntime / getOrHydrate) does
-		// NOT set it, so those defer their kernel to the first ipython use - the memory-wave mitigation.
+		// The raw prewarm request. The depth gate lives in _shouldEagerPrewarmKernel: in Deploy A a
+		// depth>0 child never eager-prewarms from this request even when the factory sets it true, so
+		// a wave of passive hydrations / fresh subagent spawns does not each spawn a kernel up front
+		// (the memory-wave mitigation). A root (depth 0) prewarms; an attached depth>0 child pays
+		// first-tool latency until the attach-vs-passive signal lands in Deploy B.
 		this._prewarmIpythonKernel = config.prewarmIpythonKernel ?? false;
 		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._serializedRefine = config.serializedRefine ?? false;
@@ -10157,14 +10157,21 @@ export class AgentSession {
 
 	/**
 	 * Whether to start (and snapshot-restore) the Python kernel eagerly at build time.
-	 * An interactive frontend session (prewarmIpythonKernel) always does - a root OR an
-	 * ATTACHED/resumed depth>0 child. A daemon-hydrated PASSIVE session (a woken child/subagent,
-	 * or a fresh subagent spawn) has prewarmIpythonKernel unset, so with a kernel snapshot it
-	 * defers to the first ipython use unless eager on-hydrate prewarm is explicitly enabled, so a
-	 * wave of passive hydrations does not each spawn a kernel up front.
+	 *
+	 * Deploy A: a depth>0 session (ANY daemon-hosted child, fresh or hydrated) NEVER eager-prewarms
+	 * from the factory's prewarmIpythonKernel request. The production factory
+	 * (main.ts createDefaultRuntimeFactory) sets prewarmIpythonKernel:true UNCONDITIONALLY and
+	 * overwrites a false passed via sessionOptions, so this depth gate is the only thing that keeps
+	 * a wave of passive hydrations (woken children/subagents) and fresh subagent spawns from each
+	 * spawning a Python kernel up front - the memory-wave mitigation. The tradeoff: an ATTACHED
+	 * depth>0 child pays first-tool latency in Deploy A; threading the true attach-vs-passive signal
+	 * through the factory is deferred to Deploy B. A root/interactive session (depth 0,
+	 * prewarmIpythonKernel) still prewarms once. The explicit on-hydrate escape hatch
+	 * (eagerKernelPrewarmOnHydrate, off by default) is unchanged and independent of depth.
 	 */
 	private _shouldEagerPrewarmKernel(hasSnapshot: boolean): boolean {
-		return this._prewarmIpythonKernel || (hasSnapshot && eagerKernelPrewarmOnHydrate());
+		const prewarmRequested = this._prewarmIpythonKernel && this._rlmDepth === 0;
+		return prewarmRequested || (hasSnapshot && eagerKernelPrewarmOnHydrate());
 	}
 
 	private _buildRuntime(options: {
