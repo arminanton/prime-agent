@@ -1299,6 +1299,15 @@ function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	parentUsage.totalTokens = parentContextTokens;
 }
 
+// Operator switch to restore eager kernel prewarm on a snapshot-bearing hydration. Off by
+// default so a daemon-hydrated PASSIVE session (a woken child/subagent not configured to
+// prewarm) defers its kernel start until the first actual ipython use, instead of each such
+// hydration spawning a Python kernel and restoring a pickle up front (the memory-wave
+// mitigation). Interactive/main agents (prewarmIpythonKernel) are unaffected.
+function eagerKernelPrewarmOnHydrate(): boolean {
+	return process.env.PRIME_AGENT_EAGER_KERNEL_PREWARM_ON_HYDRATE === "1";
+}
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -10141,6 +10150,17 @@ export class AgentSession {
 		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
 	}
 
+	/**
+	 * Whether to start (and snapshot-restore) the Python kernel eagerly at build time.
+	 * Interactive/main agents (prewarmIpythonKernel, root depth) always do. A passive
+	 * daemon-hydrated session (e.g. a woken child/subagent) with a kernel snapshot defers to
+	 * the first ipython use unless eager on-hydrate prewarm is explicitly enabled, so a wave
+	 * of passive hydrations does not each spawn a kernel up front.
+	 */
+	private _shouldEagerPrewarmKernel(hasSnapshot: boolean): boolean {
+		return this._prewarmIpythonKernel || (hasSnapshot && eagerKernelPrewarmOnHydrate());
+	}
+
 	private _buildRuntime(options: {
 		activeToolNames?: string[];
 		flagValues?: Map<string, boolean | string>;
@@ -10251,13 +10271,15 @@ export class AgentSession {
 			includeAllExtensionTools: options.includeAllExtensionTools,
 		});
 
-		// Prewarm when configured, or whenever we're resuming a session that already
-		// has a kernel snapshot — so its state is revived and the model is told what
-		// came back before the first turn, rather than a turn later when the kernel
-		// would otherwise lazily start on first use.
+		// Prewarm when configured (interactive/main agents), or when resuming a session that
+		// has a kernel snapshot AND eager on-hydrate prewarm is explicitly enabled - so its
+		// state is revived and the model is told what came back before the first turn.
+		// Otherwise a daemon-hydrated passive session DEFERS: the provisioner restores the
+		// snapshot lazily on the first actual ipython use, so a wave of passive hydrations does
+		// not each spawn a Python kernel and restore a pickle up front.
 		const hasSnapshot =
 			!!this._ipythonKernelSnapshotDir && existsSync(snapshotPathIn(this._ipythonKernelSnapshotDir));
-		if ((this._prewarmIpythonKernel || hasSnapshot) && this.getActiveToolNames().includes("ipython")) {
+		if (this._shouldEagerPrewarmKernel(hasSnapshot) && this.getActiveToolNames().includes("ipython")) {
 			this._ipythonKernelProvisioner?.prewarm();
 		}
 
