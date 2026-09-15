@@ -1,32 +1,25 @@
-# Prime Agent daemon systemd --user unit TEMPLATE (Deploy A). NOT installed by the fix
-# branch. This is an ALTERNATIVE to the launcher's transient `systemd-run --user --scope`
-# (PRIME_AGENT_DAEMON_SCOPE=1) for hosts that prefer a persistent unit. Install to
-# ~/.config/systemd/user/prime-agent-daemon.service, then `systemctl --user daemon-reload`.
-# Do NOT enable it live without following DEPLOY-A-RUNBOOK.md under a health gate.
+# Prime Agent daemon systemd --user unit - WITHDRAWN for Deploy A. DO NOT USE.
 #
-# Host facts (2026-09-15): OL 8.10, systemd 239 (no OOMPolicy=, no systemd-oomd, no
-# /proc/pressure), swap 64G (32G zram + 32G swapfile). Today the daemon runs in the SSH
-# login scope (session-3.scope) under user-400.slice with MemoryHigh=50G (SOFT throttle),
-# MemoryMax=infinity: over the cap the kernel throttles instead of killing = the freeze.
-[Unit]
-Description=Prime Agent daemon (memory-bounded scope)
-After=default.target
-
-[Service]
-Type=simple
-# Point at the real prod launcher + socket.
-ExecStart=/usr/bin/env prime-agent --mode daemon --daemon-socket %h/.prime/agent/daemon.sock
-EnvironmentFile=%h/.config/prime-agent/prime-agent-daemon.env
-Restart=no
-
-# Start HIGH (above measured legit steady state), ratchet down later. MemorySwapMax bounds
-# swap thrash. memory.oom.group=0 so the kernel OOM killer takes the single largest process
-# (a worker/kernel) rather than the whole daemon; pair with the Deploy B crash-loop breaker.
-MemoryAccounting=yes
-MemoryMax=46G
-MemorySwapMax=6G
-MemoryOOMGroup=no
-Delegate=yes
-
-[Install]
-WantedBy=default.target
+# This template does NOT fit the daemon's restart model and is kept only to document why the
+# supported path is the launcher transient scope (PRIME_AGENT_DAEMON_SCOPE=1 in
+# cli/daemon-launch.ts) under the capped prime-agent.slice (see prime-agent.slice in this dir).
+#
+# Why a persistent Type=simple unit is wrong here:
+#   1. Self-relaunch update-restart: the OLD supervisor spawns the NEW one and EXITS
+#      (daemon-supervisor.ts). A Type=simple unit's main pid then exits, so systemd marks the
+#      service dead and, with the default KillMode=control-group, KILLS the freshly spawned
+#      successor and every worker/kernel. KillMode=process avoids the kill but the unit still
+#      shows inactive after every update-restart, which is misleading and breaks Restart= logic.
+#   2. MemoryOOMGroup= is systemd 247+ and is silently ignored on this host's systemd 239.
+#   3. After=default.target together with WantedBy=default.target is an ordering cycle for a
+#      user unit.
+#
+# Supported alternative (Deploy A):
+#   - Install prime-agent.slice (capped parent slice) from this directory.
+#   - Set PRIME_AGENT_DAEMON_SCOPE=1 in every launching shell (see prime-agent-daemon.env).
+#   - The launcher wraps each daemon start in an auto-named transient scope under that slice; the
+#     supervisor, workers, kernels, and uv helpers inherit the one capped cgroup, and a shell-
+#     driven or self-relaunch restart re-enters the same slice cap without a unit-name collision.
+#
+# A persistent unit that fits this daemon (a launcher-owned scope, not Type=simple with
+# self-relaunch) is Deploy B work; do not enable a .service for the daemon under Deploy A.

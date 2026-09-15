@@ -1,0 +1,25 @@
+# Prime Agent parent slice (Deploy A). NOT installed by the fix branch. Install to
+# ~/.config/systemd/user/prime-agent.slice then `systemctl --user daemon-reload`. This is the
+# fixed capped PARENT slice that the A.1 launcher scope runs under
+# (systemd-run --user --scope --slice=prime-agent.slice). The caps live HERE, ONCE, so
+# overlapping old and new daemon scopes during a restart share ONE cap and adopted workers in old
+# scopes still count against it. Equivalent runtime form (no file):
+#   systemctl --user set-property prime-agent.slice MemoryAccounting=yes MemoryMax=46G MemorySwapMax=1G
+#
+# Provisional caps (host: 60.4G RAM, 64G swap; ALL PROVISIONAL pending the cutover measurement):
+#   MemoryMax=46G      leaves ~14G for everything else; start HIGH, ratchet down only after
+#                      Deploy B lands the crash-loop breaker and completion-based termination.
+#   MemorySwapMax=1G   swap thrash IS the freeze; keep it tiny so the cgroup OOM killer acts
+#                      decisively at the boundary instead of thrashing 64G of swap (0 is also fine).
+# memory.oom.group is left at its DEFAULT (0): the kernel OOM killer takes the single largest
+# process (a worker or kernel), not the whole daemon tree. MemoryOOMGroup= is systemd 247+ and is
+# ignored on this host's systemd 239, so it is intentionally omitted here; if whole-tree group
+# kill is ever wanted, write memory.oom.group via the cgroup file directly and pair it with the
+# Deploy B crash-loop breaker first.
+[Unit]
+Description=Prime Agent daemon memory-bounded slice
+
+[Slice]
+MemoryAccounting=yes
+MemoryMax=46G
+MemorySwapMax=1G

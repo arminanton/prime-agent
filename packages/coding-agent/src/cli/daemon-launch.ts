@@ -5,7 +5,7 @@
  * the heavy main module graph loads. main.ts reuses the same memoized promise.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, openSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
@@ -358,21 +358,33 @@ function findExecutableOnPath(name: string): string | undefined {
 	if (!pathValue) return undefined;
 	for (const dir of pathValue.split(":")) {
 		if (!dir) continue;
+		const candidate = join(dir, name);
 		try {
-			if (statSync(join(dir, name)).isFile()) return join(dir, name);
+			// Presence is not enough: a non-executable file on PATH would fail at spawn, so
+			// require X_OK here and treat a non-executable hit as "not found" (fall back).
+			if (!statSync(candidate).isFile()) continue;
+			accessSync(candidate, constants.X_OK);
+			return candidate;
 		} catch {
-			// Not on this PATH entry; keep looking.
+			// Not a file here, or not executable; keep looking.
 		}
 	}
 	return undefined;
 }
 
 /**
- * Optionally wrap the daemon launch in a dedicated systemd --user transient scope so the
- * supervisor, all workers, kernels, and uv helpers inherit one cgroup with a hard memory +
- * swap cap (Delegate=yes) that a shell-driven restart cannot drop back into the SSH login
- * scope. Opt-in and reversible via PRIME_AGENT_DAEMON_SCOPE=1; if systemd-run is missing it
- * falls back to the unscoped launch with a warning. Never applied unless the env asks for it.
+ * Optionally wrap the daemon launch in a systemd --user transient scope under a fixed capped
+ * PARENT slice (prime-agent.slice), so the supervisor, all workers, kernels, and uv helpers
+ * inherit one memory-bounded cgroup that a shell-driven restart cannot drop back into the SSH
+ * login scope. The MemoryMax/MemorySwapMax/MemoryOOMGroup caps live on the SLICE (set once by
+ * the deploy, see DEPLOY-A-RUNBOOK.md), not on each scope, so overlapping old and new scopes
+ * during a restart share ONE cap and adopted workers in old scopes still count against it.
+ *
+ * The scope is auto-named (no fixed --unit): a fixed scope name collides on a rapid restart and
+ * when the in-scope update coordinator restarts the successor ("Unit ...scope already exists",
+ * exit 1). Opt-in and reversible via PRIME_AGENT_DAEMON_SCOPE=1; if systemd-run is missing or
+ * not executable it falls back to the unscoped launch with a warning. The parent slice is
+ * overridable via PRIME_AGENT_DAEMON_SLICE for testing. Never applied unless the env asks.
  */
 export function buildDaemonScopeInvocation(command: string, args: readonly string[]): DaemonLaunchInvocation {
 	if (process.env.PRIME_AGENT_DAEMON_SCOPE !== "1") {
@@ -385,26 +397,11 @@ export function buildDaemonScopeInvocation(command: string, args: readonly strin
 			args: [...args],
 			scoped: false,
 			warning:
-				"PRIME_AGENT_DAEMON_SCOPE=1 but systemd-run was not found on PATH; launching the daemon unscoped.",
+				"PRIME_AGENT_DAEMON_SCOPE=1 but an executable systemd-run was not found on PATH; launching the daemon unscoped.",
 		};
 	}
-	const memoryMax = process.env.PRIME_AGENT_DAEMON_SCOPE_MEMORY_MAX ?? "46G";
-	const memorySwapMax = process.env.PRIME_AGENT_DAEMON_SCOPE_MEMORY_SWAP_MAX ?? "6G";
-	const scopeArgs = [
-		"--user",
-		"--scope",
-		"--collect",
-		"--unit=prime-agent-daemon",
-		"-p",
-		`MemoryMax=${memoryMax}`,
-		"-p",
-		`MemorySwapMax=${memorySwapMax}`,
-		"-p",
-		"Delegate=yes",
-		"--",
-		command,
-		...args,
-	];
+	const slice = process.env.PRIME_AGENT_DAEMON_SLICE ?? "prime-agent.slice";
+	const scopeArgs = ["--user", "--scope", `--slice=${slice}`, "--collect", "--", command, ...args];
 	return { command: systemdRun, args: scopeArgs, scoped: true };
 }
 
@@ -455,29 +452,85 @@ Then retry the original command.`,
 	delete env[SESSION_LEASES_ENABLED_ENV];
 	delete env[SESSION_LEASE_OWNER_ID_ENV];
 
-	const logOffset = currentDaemonLogSize(socketPath);
-	const invocation = buildDaemonScopeInvocation(process.execPath, [
-		...process.execArgv,
-		entrypoint,
-		"--mode",
-		"daemon",
-		"--daemon-socket",
-		socketPath,
-	]);
+	const daemonArgs = [...process.execArgv, entrypoint, "--mode", "daemon", "--daemon-socket", socketPath];
+	const invocation = buildDaemonScopeInvocation(process.execPath, daemonArgs);
 	if (invocation.warning) {
 		logDaemonLaunch(invocation.warning);
 	} else if (invocation.scoped) {
 		logDaemonLaunch(`launching daemon in a systemd --user scope via ${invocation.command}`);
 	}
+
+	const attempt = await attemptDaemonLaunch(invocation, socketPath, env, spawnCwd ?? process.cwd());
+	if (attempt.started) {
+		return;
+	}
+
+	// R5: a scoped launch that exits before the socket appears (a scope-unit collision on rapid
+	// restart, an unreachable user bus in a cron/heartbeat context, a rejected property, or a
+	// missing slice) must never lock the user out of the daemon. Retry UNSCOPED exactly once,
+	// loudly: cgroup containment was NOT applied for this launch, so the host cutover gate
+	// (DEPLOY-A-RUNBOOK.md) must verify supervisor+worker+kernel cgroup membership before the
+	// user-400.slice soft cap is removed.
+	if (invocation.scoped) {
+		logDaemonLaunch(
+			`scoped daemon launch failed; retrying UNSCOPED once (cgroup containment NOT applied for this launch). ${attempt.message}`,
+		);
+		const unscoped = await attemptDaemonLaunch(
+			{ command: process.execPath, args: [...daemonArgs], scoped: false },
+			socketPath,
+			env,
+			spawnCwd ?? process.cwd(),
+		);
+		if (unscoped.started) {
+			return;
+		}
+		throw new Error(unscoped.message);
+	}
+
+	throw new Error(attempt.message);
+}
+
+type DaemonLaunchAttempt = { started: true } | { started: false; message: string };
+
+/**
+ * Spawn one detached daemon launch and probe for its socket. Returns started=true once the
+ * socket answers with a current version, or a diagnostic message otherwise. For a scoped launch
+ * systemd-run's own stderr is captured to a sidecar file so a scope-creation failure is logged
+ * instead of discarded (the daemon inside the scope logs via its own writer, so raw stderr is
+ * minimal); the message includes both the daemon log tail and any systemd-run stderr.
+ */
+async function attemptDaemonLaunch(
+	invocation: DaemonLaunchInvocation,
+	socketPath: string,
+	env: NodeJS.ProcessEnv,
+	spawnCwd: string,
+): Promise<DaemonLaunchAttempt> {
+	const logOffset = currentDaemonLogSize(socketPath);
+	const scopeStderrPath = invocation.scoped ? `${getDaemonLogPath(socketPath)}.scope-launch` : undefined;
+	let scopeStderrFd: number | undefined;
+	if (scopeStderrPath) {
+		try {
+			scopeStderrFd = openSync(scopeStderrPath, "w");
+		} catch {
+			scopeStderrFd = undefined;
+		}
+	}
 	const child = spawnHidden(invocation.command, invocation.args, {
-		cwd: spawnCwd ?? process.cwd(),
+		cwd: spawnCwd,
 		detached: true,
 		env,
-		// A pipe would tie the daemon's stderr to this short-lived CLI
-		// (EPIPE once it exits); crash details come from the daemon log,
-		// which the supervisor writes to before rethrowing startup errors.
-		stdio: "ignore",
+		// A pipe would tie the daemon's stderr to this short-lived CLI (EPIPE once it exits);
+		// crash details come from the daemon log. systemd-run's own stderr goes to a sidecar file
+		// so a scope-creation failure is captured; everything else is discarded.
+		stdio: scopeStderrFd !== undefined ? ["ignore", "ignore", scopeStderrFd] : "ignore",
 	});
+	if (scopeStderrFd !== undefined) {
+		try {
+			closeSync(scopeStderrFd);
+		} catch {
+			// The child kept its dup; closing the parent copy is best-effort.
+		}
+	}
 	let childFailure:
 		| { type: "error"; error: Error }
 		| { type: "exit"; code: number | null; signal: NodeJS.Signals | null }
@@ -490,29 +543,46 @@ Then retry the original command.`,
 	});
 	child.unref();
 
-	const throwIfFailed = () => {
-		if (!childFailure) {
-			return;
+	const readScopeStderr = (): string => {
+		if (!scopeStderrPath) return "";
+		try {
+			return readFileSync(scopeStderrPath, "utf8").trim();
+		} catch {
+			return "";
 		}
+	};
+	const cleanupScopeStderr = (): void => {
+		if (!scopeStderrPath) return;
+		try {
+			rmSync(scopeStderrPath, { force: true });
+		} catch {
+			// Best-effort; a leftover sidecar is truncated by the next scoped launch.
+		}
+	};
+	const failureMessage = (): string => {
 		const logTail = readDaemonLogTail(socketPath, logOffset);
+		const scopeErr = readScopeStderr();
+		const scopeDetail = scopeErr ? ` systemd-run stderr: ${scopeErr}` : "";
+		if (!childFailure) {
+			return `Timed out waiting for daemon to start on ${socketPath}.${logTail}${scopeDetail}`;
+		}
 		if (childFailure.type === "error") {
-			throw new Error(`Failed to spawn Prime Agent daemon: ${childFailure.error.message}.${logTail}`);
+			return `Failed to spawn Prime Agent daemon: ${childFailure.error.message}.${logTail}${scopeDetail}`;
 		}
 		const signal = childFailure.signal ? `, signal ${childFailure.signal}` : "";
-		throw new Error(
-			`Prime Agent daemon exited during startup (code ${childFailure.code ?? "unknown"}${signal}).${logTail}`,
-		);
+		return `Prime Agent daemon exited during startup (code ${childFailure.code ?? "unknown"}${signal}).${logTail}${scopeDetail}`;
 	};
 
-	// A child exit is not immediately fatal: it may have lost the socket to a
-	// concurrent launcher whose daemon is still booting. Keep probing for a
-	// short grace window before attributing the failure to the exit.
+	// A child exit is not immediately fatal: it may have lost the socket to a concurrent launcher
+	// whose daemon is still booting. Keep probing for a short grace window before attributing the
+	// failure to the exit.
 	const deadline = Date.now() + DAEMON_STARTUP_TIMEOUT_MS;
 	let exitDeadline: number | undefined;
 	while (Date.now() < Math.min(deadline, exitDeadline ?? Number.POSITIVE_INFINITY)) {
 		const started = await probeDaemonVersion(socketPath);
 		if (started.status === "current") {
-			return;
+			cleanupScopeStderr();
+			return { started: true };
 		}
 		if (childFailure) {
 			exitDeadline ??= Date.now() + DAEMON_STARTUP_EXIT_GRACE_MS;
@@ -520,10 +590,9 @@ Then retry the original command.`,
 		await delay(25);
 	}
 
-	throwIfFailed();
-	throw new Error(
-		`Timed out waiting for daemon to start on ${socketPath}.${readDaemonLogTail(socketPath, logOffset)}`,
-	);
+	const message = failureMessage();
+	cleanupScopeStderr();
+	return { started: false, message };
 }
 
 function currentDaemonLogSize(socketPath: string): number {

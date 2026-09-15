@@ -12,18 +12,24 @@ user-400.slice MemoryHigh=50G SOFT throttle (MemoryMax=infinity) with earlyoom n
 firing. The daemon + kernels ran in the SSH login scope (session-3.scope).
 
 What Deploy A changes (build phase, this branch):
-- A.2 (bootstrap.ts, bootstrap-cli.ts): non-destructive generation venv + backoff so an
-  identity-change rebuild never deletes the working venv and a failing rebuild never
-  cascades. Ported PR #2203 (fail clean on missing runtime source) as the base.
-- A.3 (daemon-supervisor.ts): a failed/dead descriptor no longer masks scheduled wakes,
-  and confirmed-dead unowned descriptors are reclaimed at boot and before a fenced update
-  restart (so the 7 stale descriptors stop forcing cold restarts).
-- A.4 (daemon-mode.ts): the supervisor-replacement probe needs 3 consecutive failures with
-  a 3s timeout and a live-owner check, so a transient probe never spawns a second daemon.
-- A.5 (agent-session.ts): a passive daemon-hydrated session defers its kernel start to
-  first ipython use instead of eagerly loading GB of kernel state on every hydration.
-- A.1 (cli/daemon-launch.ts + these deploy/ artifacts): an opt-in launcher cgroup scope,
-  plus the host config templates below. NONE of the host config is applied by this branch.
+- A.2 (bootstrap.ts, bootstrap-cli.ts, cli/runtime-bootstrap.ts): non-destructive generation
+  venv. Every build lands in a UNIQUE sibling `<base>-<hash>-<nonce>`, validated, then
+  published via a `<base>.current` pointer; no directory the pointer names is ever removed. A
+  same-identity readiness-probe failure (the freeze-day path) fails clean and leaves the live
+  venv intact; a rollback re-publishes an existing generation instead of rebuilding; in-band GC
+  is disabled. Ported PR #2203 (fail clean on missing runtime source) as the base.
+- A.3 (daemon-supervisor.ts): a confirmed-dead descriptor no longer masks scheduled wakes but a
+  failed-but-ALIVE worker stays covered (no head-of-line-blocking recovery ladder); reclaim runs
+  the settling path (orphan-kernel reaping) before deleting a descriptor at boot and before a
+  fenced update restart (so the 7 stale descriptors stop forcing cold restarts).
+- A.4 (daemon-mode.ts): the supervisor-replacement probe needs 3 consecutive failures with a 3s
+  timeout and a live-owner check, so a transient probe never spawns a second daemon.
+- A.5 (agent-session.ts): a passive daemon-hydrated CHILD session defers its kernel start to
+  first ipython use instead of eagerly loading GB of kernel state on every hydration. Roots
+  still prewarm.
+- A.1 (cli/daemon-launch.ts + these deploy/ artifacts): an opt-in launcher cgroup scope under a
+  capped parent slice, plus the host config templates below. NONE of the host config is applied
+  by this branch.
 
 ## 0. Preconditions and health gate
 
@@ -33,34 +39,40 @@ Do NOT start unless ALL hold:
 - The new build passes: from packages/coding-agent, `npm run build` exits 0 and the
   targeted vitest suites pass.
 - You have a matching-version launcher for the CURRENTLY running daemon (needed for step 2).
-- You have a rollback path noted (previous build dir + previous venv generation, section R).
+- You have a rollback path noted (previous build dir + the untouched legacy venv, section R).
 
 ## 1. Prebuild the per-checkout kernel venv (no daemon involved)
 
 Prebuild the venv the new daemon will use, single-threaded, BEFORE any restart, so the
-cutover never triggers an in-band rebuild storm. A.2 builds a versioned generation dir
-`<base>-<identityHash>` and publishes a `<base>.current` pointer; it never touches any
-other venv.
+cutover never triggers an in-band rebuild storm. A.2 builds a unique generation dir
+`<base>-<hash>-<nonce>` and publishes a `<base>.current` pointer; it never touches any other
+venv family. `--prime-agent-bootstrap` now REQUIRES PRIME_AGENT_KERNEL_VENV and rejects a
+conflicting PRIME_AGENT_KERNEL_PYTHON, so a prebuild only ever touches its named family.
 
 ```bash
 cd /path/to/new/checkout/packages/coding-agent
 export PRIME_AGENT_KERNEL_VENV=/home/ndsadmin/.prime/agent/kernel-venv-prod
-export PRIME_AGENT_RUNTIME_SOURCE="$PWD/prime-agent-runtime"   # this checkout's runtime source
-# Deploy-time prebuild: prints the runtime identity + resolved venv + python, exits non-zero
-# on failure (a deploy blocker), and only touches the PRIME_AGENT_KERNEL_VENV family.
-node dist/cli.js --prime-agent-bootstrap    # or: tsx src/core/kernel/bootstrap-cli.ts
+# This checkout's runtime source (repo-root prime-agent-runtime, or its built dist copy). The
+# path MUST resolve; a missing source fails the bootstrap clean (no kernels).
+export PRIME_AGENT_RUNTIME_SOURCE=/mnt/devvm/custom/prime/prime-agent-runtime
+# Deploy-time prebuild via the REAL public flag: prints the runtime identity + resolved venv +
+# python, exits non-zero on failure (a deploy blocker), and only touches the
+# PRIME_AGENT_KERNEL_VENV family.
+node dist/cli.js --prime-agent-bootstrap
 ```
 
-Verify it printed `runtime identity: sha256:...`, `kernel venv: <base>-<hash>`, and
-`kernel python: <base>-<hash>/bin/python`, and exited 0. Confirm `<base>.current` names
-that generation. If it fails, STOP: the daemon must not be restarted onto a missing venv.
+Verify it printed all three lines and exited 0:
+`runtime identity: sha256:...`, `kernel venv: <base>-<hash>-<nonce>`, and
+`kernel python: <base>-<hash>-<nonce>/bin/python`. Confirm `<base>.current` names that
+generation. If it fails, STOP: the daemon must not be restarted onto a missing venv.
 
-## 2. Clear the 7 stale "failed and disconnected" descriptors
+## 2. Clear the stale "failed and disconnected" descriptors
 
-These exist on the running (pre-A.3) daemon and block `prepare_update_restart`. A.3 makes
-them self-clear going forward, but the LIVE daemon still needs them cleared once by hand.
-Use the recover-failed-daemon-worker procedure per stuck session (identity-verified,
-supervisor-controlled, non-destructive). For each stuck workerId's session file:
+These exist on the running (pre-A.3) daemon and block the update-restart fence. A.3 makes them
+self-clear going forward (reclaim at boot and before the fence), but the LIVE pre-A.3 daemon
+still needs them cleared once by hand. Use the recover-failed-daemon-worker procedure per stuck
+session (identity-verified, supervisor-controlled, non-destructive). For each stuck workerId's
+session file:
 
 ```bash
 # kill -0 <pid> must FAIL first (confirm the worker process is gone).
@@ -68,58 +80,89 @@ supervisor-controlled, non-destructive). For each stuck workerId's session file:
   --resume /absolute/path/to/sessions/<id>.jsonl --print < /dev/null
 ```
 
-The `create` reclaims the dead registration before any prompt. Re-run
-`prime-agent daemon prepare-update-restart` (or your update path's dry run) and confirm it
-no longer reports "failed and disconnected".
+The create reclaims the dead registration before any prompt. Then run your NORMAL update path
+(the public update/restart flow, which internally drains and fences) as a dry run or preflight
+and confirm it no longer reports "failed and disconnected". Do NOT rely on any non-public
+prepare command; A.3's reclaim is what clears these going forward.
 
 ## 3. Stage host config (review, then apply deliberately)
 
 Files are in deploy/deploy-a/. Review each, then apply under this health gate. Reversible.
 
-- Env: install deploy/deploy-a/prime-agent-daemon.env to the launcher/unit EnvironmentFile
-  path. Fix the paths for prod. Key values: PRIME_AGENT_DAEMON_SCOPE=1,
-  PRIME_AGENT_DAEMON_SCOPE_MEMORY_MAX=46G, PRIME_AGENT_DAEMON_SCOPE_MEMORY_SWAP_MAX=6G,
-  PRIME_AGENT_MAX_CONCURRENT_KERNEL_BOOTS=2,
+- Env PLACEMENT: install the values from deploy/deploy-a/prime-agent-daemon.env into the LOGIN
+  environment of EVERY shell that may launch the daemon (for example ~/.bash_profile, or the
+  launcher wrapper) - they are read by the launching CLI process, NOT by a unit EnvironmentFile.
+  If only some shells set PRIME_AGENT_DAEMON_SCOPE, a shell-driven ensureDaemonRunning spawn is
+  unscoped. Keep PRIME_AGENT_KERNEL_VENV and PRIME_AGENT_RUNTIME_SOURCE identical in every
+  launching shell (or unset everywhere): collectDaemonLaunchEnv forwards the client env over the
+  supervisor env, so a stray value redirects a worker's venv family. Fix the paths for prod. Key
+  values: PRIME_AGENT_DAEMON_SCOPE=1, PRIME_AGENT_MAX_CONCURRENT_KERNEL_BOOTS=2,
   PRIME_AGENT_INTERNAL_WORKER_SUPERVISOR_LOST_EXIT_MS=86400000, per-checkout
-  PRIME_AGENT_KERNEL_VENV, PRIME_AGENT_RUNTIME_SOURCE.
-- Scope: the launcher scope is opt-in via PRIME_AGENT_DAEMON_SCOPE=1 (systemd-run --user
-  --scope with MemoryMax + MemorySwapMax + Delegate=yes). For a persistent unit instead,
-  use deploy/deploy-a/prime-agent-daemon.service. Start MemoryMax HIGH (46G) and ratchet
-  down only after a week of telemetry and after Deploy B lands the crash-loop breaker.
-- REMOVE or raise the user-400.slice MemoryHigh=50G SOFT throttle (it IS the freeze):
-  `systemctl set-property user-400.slice MemoryHigh=infinity` (or drop the drop-in). The
-  daemon's own scope now provides the hard bound instead.
-- earlyoom: apply deploy/deploy-a/earlyoom.conf (absolute -M/-S for 64G swap, comm-accurate
-  regexes for `prime-agent` and `python`, -g). The shipped --prefer node / --avoid python3
-  match NOTHING of ours (verified), so earlyoom is currently inert. Restart earlyoom after.
-- Telemetry: start deploy/deploy-a/telemetry-sampler.sh pointed at the daemon scope cgroup
-  so you can measure memory.current / memory.swap.current before ratcheting MemoryMax down.
+  PRIME_AGENT_KERNEL_VENV, and a resolvable PRIME_AGENT_RUNTIME_SOURCE.
+- Slice caps: install deploy/deploy-a/prime-agent.slice to ~/.config/systemd/user/ and
+  `systemctl --user daemon-reload`, OR set them at runtime:
+  `systemctl --user set-property prime-agent.slice MemoryAccounting=yes MemoryMax=46G MemorySwapMax=1G`.
+  The caps live on the SLICE, not each scope, so overlapping old and new scopes during a restart
+  share ONE cap. Start MemoryMax HIGH (46G, leaves ~14G) and ratchet down only after a week of
+  telemetry AND after Deploy B lands the crash-loop breaker. Keep MemorySwapMax tiny (1G or 0):
+  swap thrash IS the freeze. Do NOT install prime-agent-daemon.service (WITHDRAWN; it does not
+  fit the self-relaunch update-restart model).
+- Start the scoped daemon and VERIFY containment BEFORE touching the soft cap: with
+  PRIME_AGENT_DAEMON_SCOPE=1 set, start the daemon, then confirm the supervisor, workers, and
+  kernels are all under prime-agent.slice (`systemd-cgls --user`; every prime-agent/python pid is
+  inside a `*.scope` under prime-agent.slice, NOT session-3.scope). Check the client-errors log
+  for a "retrying UNSCOPED" warning: if present, the scoped launch FELL BACK and containment is
+  NOT applied - STOP and fix systemd-run / the slice before continuing. A containment failure
+  BLOCKS the rest of the cutover.
+- ONLY after containment is verified, remove the user-400.slice MemoryHigh=50G SOFT throttle -
+  it IS the freeze, and while it is kept it still throttles the whole user slice (the daemon
+  scope sits under it). It is set in TWO drop-ins on this host
+  (system.control/50-MemoryHigh.conf AND user-400.slice.d/50-memory-soft-cap.conf): remove BOTH
+  as root, then reload and clear the live property:
+  `rm the two drop-in files`, then `systemctl daemon-reload`, then
+  `systemctl set-property user-400.slice MemoryHigh=infinity`. Consider a HARD MemoryMax on
+  user-400.slice as an outer host bound once the per-daemon cap is trusted.
+- earlyoom (HOST BACKUP only; the cgroup MemoryMax is PRIMARY): apply
+  deploy/deploy-a/earlyoom.conf to /etc/default/earlyoom (this host's earlyoom.service uses
+  EnvironmentFile=/etc/default/earlyoom), then restart earlyoom. It uses absolute -M/-S in KiB
+  (with -M above freeze-day MemAvailable), NO inner quotes, and --prefer `python` (a kernel is
+  the right first victim; the `prime-agent` supervisor is avoided so killing it does not orphan
+  every worker). Numbers are PROVISIONAL.
+- Telemetry: start deploy/deploy-a/telemetry-sampler.sh (it auto-discovers the prime-agent.slice
+  cgroup) so you can measure memory.current / memory.swap.current before ratcheting MemoryMax
+  down.
 
 ## 4. Update-restart onto the new build
 
-With the venv prebuilt (1), descriptors cleared (2), and host config staged (3), do the
-normal update-restart to the new build. Because the venv identity already matches the
-prebuilt generation, no in-band rebuild happens.
+With the venv prebuilt (1), descriptors cleared (2), host config staged and containment verified
+(3), do the normal update-restart to the new build. Because the venv identity already matches the
+prebuilt generation, no in-band rebuild happens. The successor re-enters the same
+prime-agent.slice cap (the auto-named scope avoids a unit-name collision on restart).
 
 ## 5. Post-cutover verification (health gate)
 
-- The daemon and its workers/kernels are in the new scope: `systemctl --user status
-  prime-agent-daemon` (unit) or `systemd-cgls` shows them under the scope, NOT session-3.
+- Containment holds: `systemd-cgls --user` shows the supervisor + workers + kernels under a
+  `*.scope` in prime-agent.slice, NOT session-3.scope. No "retrying UNSCOPED" warning in the
+  client-errors log.
 - `prime-agent list` shows the expected sessions; the main conversation resumes.
-- Telemetry lines show scope memory.current well under MemoryMax and swap use flat.
+- Telemetry lines show slice memory.current well under MemoryMax and swap use flat.
 - A test scheduled wake fires (A.3): a session with a due job wakes without a live worker.
 - No new "failed and disconnected" descriptors accumulate.
 
 ## R. Rollback
 
-- Venv: A.2 keeps the previous generation and records it as `previous` in `<base>.current`.
-  To roll back the venv, rewrite `<base>.current` `current` to the previous generation
-  basename (or delete the pointer to fall back to the base path), then restart the daemon.
-  Old generations are retained (GC only removes ones older than the current + previous).
-- Build: restart the daemon from the previous build directory (its launcher), which repoints
-  to its own PRIME_AGENT_KERNEL_VENV generation. Sessions persist on disk and reload.
-- Host config: set PRIME_AGENT_DAEMON_SCOPE=0 (or unset) to drop the scope wrapper; restore
-  the user-400.slice MemoryHigh drop-in; revert the earlyoom drop-in and restart earlyoom.
+- Real rollback = the PREVIOUS BUILD plus PRIME_AGENT_KERNEL_VENV pointed at the untouched legacy
+  `~/.prime/agent/kernel-venv` (the new code never deletes it). Restart the daemon from the
+  previous build directory (its launcher) with PRIME_AGENT_KERNEL_VENV set to the legacy base;
+  sessions persist on disk and reload. Do NOT roll back by editing `<base>.current`: a venv-only
+  pointer edit only makes sense together with a matching build rollback, and a pre-Deploy-A build
+  does not understand the pointer.
+- A within-Deploy-A venv rollback (same new build) can re-publish the previous generation: A.2
+  kept it as `previous` in `<base>.current` and never removed it, so pointing the identity back
+  re-publishes it with zero uv. Prefer the build rollback above for a true revert.
+- Host config: set PRIME_AGENT_DAEMON_SCOPE=0 (or unset) in the launching shells to drop the
+  scope wrapper; restore the two user-400.slice MemoryHigh drop-ins and
+  `systemctl daemon-reload`; revert /etc/default/earlyoom and restart earlyoom.
 
 ## Deploy B follow-ups referenced here
 
@@ -130,5 +173,9 @@ prebuilt generation, no in-band rebuild happens.
   return to a small value).
 - A daemon-supplied attach-vs-wake signal so a passively woken ROOT (not just children) can
   also defer its kernel prewarm (A.5 currently defers passive children only).
+- A generation-agnostic current-owner lookup by socketPath for the supervisor-replacement probe
+  (A.4 guards only workers that have already seen a supervisor claim).
 - In-process telemetry: event-loop lag and collectPassiveScheduledJobs/flushRoster durations
   inside the supervisor (the host sampler here covers memory + process counts only).
+- Family-exact operator/prebuild-time generation GC with a live-reference check (A.2 disables
+  in-band GC; superseded generations accumulate until then).
