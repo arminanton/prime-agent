@@ -104,8 +104,9 @@ const BOOTSTRAP_FAILED_SUFFIX = ".bootstrap-failed";
 const BOOTSTRAP_GENERATION_HASH_LENGTH = 16;
 const BOOTSTRAP_BACKOFF_BASE_MS = 60_000;
 const BOOTSTRAP_BACKOFF_MAX_MS = 30 * 60_000;
-// A superseded generation is GC'd only once it has been idle this long, so a kernel
-// that just launched against it is not pulled out from under mid-import.
+// Opt-in GC skips a superseded generation until its BUILD mtime is at least this old. mtime is
+// not access time (a kernel importing from a generation never refreshes it), so this is a coarse
+// safety margin only, not proof no kernel is mid-import; true live-reference eviction is Deploy B.
 const BOOTSTRAP_GENERATION_GC_GRACE_MS = 60 * 60_000;
 
 let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
@@ -116,6 +117,11 @@ export type KernelBootstrapProgressHandler = (message: string) => void;
 export interface EnsureKernelPythonOptions {
 	pythonSkills?: readonly KernelPythonSkill[];
 	onProgress?: KernelBootstrapProgressHandler;
+	// Force a fresh generation build even when the recorded base already matches. Set ONLY by the
+	// one-shot prebuild (runKernelPrebuild reads PRIME_AGENT_KERNEL_VENV_FORCE_REBUILD). It is
+	// deliberately NOT read from the env here: collectDaemonLaunchEnv forwards the client env to
+	// every daemon-launched session, so an exported var would otherwise rebuild ~320MB on each boot.
+	forceRebuild?: boolean;
 }
 
 interface BootstrapPythonSkill {
@@ -430,10 +436,6 @@ export function bootstrapGenerationHash(runtimeIdentity: string): string {
 	return createHash("sha256").update(identity).digest("hex").slice(0, BOOTSTRAP_GENERATION_HASH_LENGTH);
 }
 
-function generationVenvDir(baseDir: string, generationHash: string): string {
-	return `${baseDir}-${generationHash}`;
-}
-
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -491,6 +493,15 @@ function publishedGenerationDir(baseDir: string): string | null {
 	if (!generationFamilyPattern(baseDir).test(pointer.current)) return null;
 	const dir = path.join(path.dirname(baseDir), pointer.current);
 	return existsSync(dir) ? dir : null;
+}
+
+// Whether the current pointer names the given generation dir as its current or previous
+// generation. The failed-build cleanup uses this as a belt-and-suspenders guard so it can
+// never remove a dir a reader could resolve to, alongside the irreversible-publish flag.
+function pointerReferences(baseDir: string, generationDir: string): boolean {
+	const name = path.basename(generationDir);
+	const pointer = readBootstrapPointer(baseDir);
+	return pointer?.current === name || pointer?.previous === name;
 }
 
 export function getKernelVenvDir(): string {
@@ -1108,8 +1119,13 @@ async function recordBootstrapFailure(baseDir: string, identity: string, error: 
 	writeFileAtomicSync(bootstrapFailedPath(baseDir), `${JSON.stringify(marker)}\n`);
 }
 
+// Best-effort removal of the backoff marker. A stale marker is harmless: it is only consulted
+// before a FULL rebuild (never when the live venv is already ready) and is keyed by identity +
+// expires via nextRetryAt, so a non-ENOENT rm failure (EISDIR/EPERM/EROFS/EIO) must never fail a
+// boot nor, in the publish path, trigger deletion of the just-published generation. rm(force:true)
+// already ignores ENOENT; this additionally swallows the rarer non-ENOENT failures.
 async function clearBootstrapFailure(baseDir: string): Promise<void> {
-	await rm(bootstrapFailedPath(baseDir), { force: true });
+	await rm(bootstrapFailedPath(baseDir), { force: true }).catch(() => undefined);
 }
 
 // A waiter that hits an active backoff fails fast, without running uv, until nextRetryAt.
@@ -1131,7 +1147,11 @@ function bootstrapBackoffError(marker: BootstrapFailureMarker): Error {
 // `<basename>-prod-<hash>` or `<basename>-next`. A per-live-reference eviction check is
 // Deploy B.
 async function gcOldGenerations(baseDir: string): Promise<void> {
+	let releaseLock: (() => Promise<void>) | undefined;
 	try {
+		// Hold the bootstrap lock so a concurrent findReusableGeneration/publishGeneration cannot
+		// promote a deletion candidate to current/previous between the pointer snapshot and the rm.
+		releaseLock = await acquireBootstrapLock(baseDir);
 		const pointer = readBootstrapPointer(baseDir);
 		const keep = new Set<string>();
 		if (pointer?.current && generationFamilyPattern(baseDir).test(pointer.current)) keep.add(pointer.current);
@@ -1144,14 +1164,19 @@ async function gcOldGenerations(baseDir: string): Promise<void> {
 			const dir = path.join(parent, entry.name);
 			try {
 				const info = await stat(dir);
+				// mtime is a generation's BUILD time (imports never refresh it), so this grace is a
+				// coarse safety margin only, not proof no kernel is importing; true live-reference
+				// eviction is Deploy B. The runbook restricts opt-in GC to after a full restart.
 				if (now - info.mtimeMs < BOOTSTRAP_GENERATION_GC_GRACE_MS) continue;
 				await rm(dir, { recursive: true, force: true });
 			} catch {
-				// A generation racing another GC or still in use is left alone.
+				// A generation that vanished mid-scan (racing another GC) or whose rm failed is left alone.
 			}
 		}
 	} catch {
 		// GC must never fail a bootstrap.
+	} finally {
+		await releaseLock?.().catch(() => undefined);
 	}
 }
 
@@ -1247,9 +1272,10 @@ async function ensureKernelPythonUncached(
 	const runtimeIdentity = await hashRuntimeSource(runtimeSourceDir);
 	const baseDir = await resolveWritableKernelVenvDir();
 	const generationHash = bootstrapGenerationHash(runtimeIdentity);
-	// An operator escape hatch: force a fresh generation build even when the recorded base
-	// matches. Always builds into a new unique dir, so it still never removes the live venv.
-	const forceRebuild = process.env.PRIME_AGENT_KERNEL_VENV_FORCE_REBUILD === "1";
+	// An operator escape hatch, wired only through the one-shot prebuild (never the env here, to
+	// avoid a forwarded-env rebuild storm). Always builds into a new unique dir, so it still never
+	// removes the live venv.
+	const forceRebuild = options.forceRebuild === true;
 
 	// The live venv is the published generation, or a legacy venv still sitting at the
 	// base path (pre-generation layout). Reuse it untouched whenever it is already
@@ -1294,7 +1320,8 @@ async function ensureKernelPythonUncached(
 					new Error(
 						`the live kernel venv (${currentDir}) is recorded for the current runtime but failed its readiness probe; ` +
 							"not rebuilding it -- a transient spawn or out-of-memory failure must not tear down a venv other kernels are importing from. " +
-							"Retry once memory frees up, or set PRIME_AGENT_KERNEL_VENV_FORCE_REBUILD=1 to force a fresh generation.",
+							"Retry once memory frees up, or run the prebuild with PRIME_AGENT_KERNEL_VENV_FORCE_REBUILD=1 " +
+							"(prime-agent --prime-agent-bootstrap) to build a fresh generation without touching the live one.",
 					),
 				);
 				await recordBootstrapFailure(baseDir, generationHash, probeError).catch(() => undefined);
@@ -1307,8 +1334,9 @@ async function ensureKernelPythonUncached(
 			// publishing it instead of rebuilding. Never removes the live venv.
 			const reusable = await findReusableGeneration(baseDir, generationHash, currentDir, runtimeIdentity);
 			if (reusable) {
-				await publishGeneration(baseDir, reusable);
 				const reusablePython = kernelVenvPython(reusable);
+				// Sync skills into the reused generation BEFORE publishing it, so a reader that
+				// follows the pointer never observes a briefly-unsynced generation.
 				await syncPythonSkills(
 					await ensureUv(options),
 					reusable,
@@ -1317,6 +1345,8 @@ async function ensureKernelPythonUncached(
 					pythonSkills,
 					options,
 				);
+				await publishGeneration(baseDir, reusable);
+				// Publication succeeded; marker cleanup is best-effort and must never fail the boot.
 				await clearBootstrapFailure(baseDir);
 				return reusablePython;
 			}
@@ -1335,6 +1365,9 @@ async function ensureKernelPythonUncached(
 		// and published; no directory the pointer names is ever removed.
 		const buildDir = newGenerationVenvDir(baseDir, generationHash);
 		const generationPython = kernelVenvPython(buildDir);
+		// Publication is IRREVERSIBLE: once the pointer names this dir, a later failure must never
+		// remove it. `published` gates the failed-partial cleanup in the catch below.
+		let published = false;
 		try {
 			reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
 			await bootstrapVenv(buildDir, runtimeSourceDir, runtimeIdentity, pythonSkills, options);
@@ -1344,16 +1377,27 @@ async function ensureKernelPythonUncached(
 			if (!(await kernelBaseReady(generationPython, buildDir, runtimeIdentity))) {
 				throw new Error(`kernel venv failed its readiness check after bootstrap: ${buildDir}`);
 			}
-			// Atomic publish (single pointer write), then drop the backoff marker.
+			// Mark committed BEFORE the atomic pointer write so that even an error surfaced by
+			// publishGeneration after its rename (a torn write reported once the pointer already
+			// names this dir) cannot reach the cleanup below and delete a published generation.
+			published = true;
 			await publishGeneration(baseDir, buildDir);
-			await clearBootstrapFailure(baseDir);
 		} catch (error) {
-			// The freshly built dir is uniquely ours and was never published, so removing a
-			// failed partial can never disturb a live or previous generation.
-			await rm(buildDir, { recursive: true, force: true }).catch(() => undefined);
+			// Only remove the freshly built dir when it was never published AND no pointer names
+			// it. It is a unique nonce-suffixed sibling, so removing an unpublished partial can
+			// never disturb a live or previous generation.
+			if (!published && !pointerReferences(baseDir, buildDir)) {
+				await rm(buildDir, { recursive: true, force: true }).catch(() => undefined);
+			}
 			await recordBootstrapFailure(baseDir, generationHash, error).catch(() => undefined);
 			throw error;
 		}
+		// Marker cleanup runs AFTER the irreversible publish and is best-effort: a stale marker is
+		// harmless, so a non-ENOENT rm failure must never delete the just-published generation or
+		// loop the boot. (The pre-fix bug had publish + clear inside the try whose catch rm'd
+		// buildDir, so a marker-rm throw deleted the just-published generation = a build-and-delete
+		// boot loop with no backoff.)
+		await clearBootstrapFailure(baseDir);
 		// In-band GC is intentionally NOT run here: a venv dir's mtime is its build time, so it
 		// cannot prove no live kernel still imports from an older generation across a rolling
 		// deploy. Superseded dirs are cleaned by opt-in operator/prebuild-time GC only.
@@ -1417,7 +1461,11 @@ export async function runKernelPrebuild(options: KernelPrebuildOptions = {}): Pr
 	}
 	const identity = await resolveRuntimeIdentity();
 	console.log(`runtime identity: ${identity}`);
-	const python = await ensureKernelPython();
+	// FORCE_REBUILD is honored ONLY here (a one-shot prebuild), never in the runtime ensure path,
+	// so an exported var cannot trigger a per-boot rebuild storm through the forwarded launch env.
+	const forceRebuild = process.env.PRIME_AGENT_KERNEL_VENV_FORCE_REBUILD === "1";
+	if (forceRebuild) console.log("kernel venv force rebuild: building a fresh generation");
+	const python = await ensureKernelPython({ forceRebuild });
 	console.log(`kernel venv: ${getKernelVenvDir()}`);
 	console.log(`kernel python: ${python}`);
 	if (process.env.PRIME_AGENT_KERNEL_VENV_GC === "1") {

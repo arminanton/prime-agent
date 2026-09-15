@@ -76,12 +76,14 @@ The Python side does not call providers or implement an agent loop.
 The kernel is created lazily on first Python REPL use. Python resolution is:
 
 1. `PRIME_AGENT_KERNEL_PYTHON`, when it has a current `prime-agent-runtime`;
-2. `~/.prime/agent/kernel-venv/bin/python`, bootstrapped with `uv`; or
+2. the live generation named by the `~/.prime/agent/kernel-venv.current` pointer (its `bin/python`), bootstrapped with `uv`; or
 3. the XDG data location when `~/.prime` is not writable.
+
+The kernel venv is content-addressed by generation: each build lands in a unique sibling `kernel-venv-<hash>-<nonce>` and is published atomically by writing the `kernel-venv.current` pointer, so a rebuild never removes the live venv and a rollback re-publishes an existing generation instead of rebuilding. `~/.prime/agent/kernel-venv` itself is the base name, not a venv, once the generation layout is in use; a legacy pre-generation venv that still sits directly at that base path is used as-is until the runtime identity changes.
 
 Set `PRIME_AGENT_RUNTIME_SOURCE` to install `prime-agent-runtime` from a local checkout instead of the copy that ships with this install; when it is set it is the only candidate, and a missing source fails the bootstrap cleanly without touching the existing kernel venv.
 
-The managed environment includes Python 3.11, `prime-agent-runtime`, `dill`, and the default Python packages. A bootstrap marker detects stale environments.
+The managed environment includes Python 3.11, `prime-agent-runtime`, `dill`, and the default Python packages. A bootstrap marker detects stale environments. A legacy or pre-generation-format venv has no recorded generation, so the first boot on new code cannot reuse it and does a full (~320MB) `uv` build into a fresh generation; a deploy should prebuild that generation (`prime-agent --prime-agent-bootstrap`, with consistent `PRIME_AGENT_KERNEL_VENV`/`PRIME_AGENT_RUNTIME_SOURCE`) so the first live use is not the one paying that cost.
 
 Startup spawns `python -m rlm.repl` and exchanges newline-delimited JSON over stdio: the runtime announces itself with a single `ready` event, then requests and events flow one JSON object per line (see `prime-agent-runtime/src/rlm/repl.md`).
 

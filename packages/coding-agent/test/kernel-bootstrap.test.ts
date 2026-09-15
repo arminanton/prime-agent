@@ -1,5 +1,15 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +22,7 @@ import {
 	type KernelPythonSkill,
 	kernelVenvPython,
 	resolveRuntimeIdentity,
+	runKernelPrebuild,
 } from "../src/core/kernel/bootstrap.js";
 
 let tempDir = "";
@@ -800,6 +811,117 @@ dependencies = ["httpx"]
 		const pointer = JSON.parse(readFileSync(`${venv}.current`, "utf8"));
 		expect(pointer.current).toBe(basename(genA));
 		expect(pointer.previous).toBe(basename(genB));
+	});
+
+	it("keeps a just-published generation and a valid pointer when post-publish marker cleanup throws", async () => {
+		// Regression for the post-publication deletion / build-and-delete boot loop: publishGeneration
+		// + clearBootstrapFailure used to run inside the try whose catch rm'd the build dir, so a
+		// non-ENOENT marker rm failure deleted the just-published generation and dangled the pointer.
+		installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const runtimeSource = join(tempDir, "runtime-src");
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_RUNTIME_SOURCE = runtimeSource;
+
+		// Build and publish generation A.
+		writeRuntimeSource(runtimeSource, "spawn = 1\n");
+		await ensureKernelPython();
+		const genA = liveGenerationDir();
+		writeFileSync(join(genA, "CANARY"), "A");
+
+		// A runtime change forces a fresh generation B. Inject a post-publish cleanup failure by
+		// making the backoff-marker path a DIRECTORY, so clearBootstrapFailure's rm(force:true, no
+		// recursive) throws EISDIR after the pointer already names the new generation.
+		writeRuntimeSource(runtimeSource, "spawn = 2\n");
+		mkdirSync(`${venv}.bootstrap-failed`);
+
+		// Publication is irreversible, so the boot still succeeds and does NOT delete B.
+		const built = await ensureKernelPython();
+		const genB = liveGenerationDir();
+		expect(genB).not.toBe(genA);
+		expect(built).toBe(join(genB, "bin", "python"));
+
+		// The just-published generation survives with a valid pointer; A survives too.
+		expect(existsSync(join(genB, "bin", "python"))).toBe(true);
+		expect(getKernelVenvDir()).toBe(genB);
+		const pointer = JSON.parse(readFileSync(`${venv}.current`, "utf8"));
+		expect(pointer.current).toBe(basename(genB));
+		expect(existsSync(join(genA, "bin", "python"))).toBe(true);
+		expect(readFileSync(join(genA, "CANARY"), "utf8")).toBe("A");
+	});
+
+	it("runKernelPrebuild builds the named venv family and publishes it", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv-prod");
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await runKernelPrebuild({ requireNamedVenv: true });
+
+		const gen = getKernelVenvDir();
+		expect(gen).toMatch(new RegExp(`^${venv}-[0-9a-f]{16}-[0-9a-f]{32}$`));
+		expect(existsSync(join(gen, "bin", "python"))).toBe(true);
+		expect(readFileSync(logPath, "utf8")).toContain(`venv ${gen} --python 3.11 --seed`);
+		const pointer = JSON.parse(readFileSync(`${venv}.current`, "utf8"));
+		expect(pointer.current).toBe(basename(gen));
+	});
+
+	it("runKernelPrebuild with requireNamedVenv rejects a missing PRIME_AGENT_KERNEL_VENV", async () => {
+		installFakeUv();
+		delete process.env.PRIME_AGENT_KERNEL_VENV;
+
+		await expect(runKernelPrebuild({ requireNamedVenv: true })).rejects.toThrow(
+			/PRIME_AGENT_KERNEL_VENV must be set/,
+		);
+	});
+
+	it("runKernelPrebuild rejects a conflicting PRIME_AGENT_KERNEL_PYTHON override", async () => {
+		installFakeUv();
+		process.env.PRIME_AGENT_KERNEL_VENV = join(tempDir, "kernel-venv-prod");
+		process.env.PRIME_AGENT_KERNEL_PYTHON = join(tempDir, "override-python");
+
+		await expect(runKernelPrebuild({ requireNamedVenv: true })).rejects.toThrow(
+			/PRIME_AGENT_KERNEL_PYTHON conflicts with a kernel prebuild/,
+		);
+	});
+
+	it("opt-in GC removes only superseded same-family generations and keeps current/previous and sibling families", async () => {
+		installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const runtimeSource = join(tempDir, "runtime-src");
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_RUNTIME_SOURCE = runtimeSource;
+
+		// Build A then B, so the pointer keeps current=B, previous=A.
+		writeRuntimeSource(runtimeSource, "spawn = 1\n");
+		await ensureKernelPython();
+		const genA = liveGenerationDir();
+		writeRuntimeSource(runtimeSource, "spawn = 2\n");
+		await ensureKernelPython();
+		const genB = liveGenerationDir();
+		expect(genB).not.toBe(genA);
+
+		// A superseded same-family generation, aged past the GC grace window.
+		const oldGen = `${venv}-${"a".repeat(16)}-${"b".repeat(32)}`;
+		mkdirSync(join(oldGen, "bin"), { recursive: true });
+		writeFileSync(join(oldGen, "CANARY"), "old");
+		const aged = new Date(Date.now() - 2 * 60 * 60_000);
+		utimesSync(oldGen, aged, aged);
+
+		// A sibling family the exact family regex must never touch.
+		const sibling = `${venv}-prod-0123456789abcdef`;
+		mkdirSync(join(sibling, "bin"), { recursive: true });
+		writeFileSync(join(sibling, "CANARY"), "keep");
+		utimesSync(sibling, aged, aged);
+
+		// Re-run the prebuild with opt-in GC. It reuses B (no rebuild) then GC's superseded gens.
+		process.env.PRIME_AGENT_KERNEL_VENV_GC = "1";
+		await runKernelPrebuild({ requireNamedVenv: true });
+
+		// The superseded same-family generation is reclaimed; current/previous and the sibling survive.
+		expect(existsSync(oldGen)).toBe(false);
+		expect(existsSync(join(genA, "bin", "python"))).toBe(true);
+		expect(existsSync(join(genB, "bin", "python"))).toBe(true);
+		expect(readFileSync(join(sibling, "CANARY"), "utf8")).toBe("keep");
 	});
 
 	it("a default-base ensure never touches a sibling venv family", async () => {
