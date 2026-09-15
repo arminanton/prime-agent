@@ -119,37 +119,80 @@ export function resolvedCopilotApiEndpoint(): string | undefined {
  * Resolve and cache the account's Copilot API endpoint for the pinned identity.
  * Returns the endpoint (or undefined when the lookup fails) without throwing.
  */
+const COPILOT_FRONT_DOOR = "https://api.githubcopilot.com";
+
+function isCopilotApiHost(endpoint: string): boolean {
+	return (
+		/^https:\/\/[a-z0-9.-]+\.githubcopilot\.com$/i.test(endpoint) ||
+		/^https:\/\/copilot-api\.[a-z0-9.-]+$/i.test(endpoint)
+	);
+}
+
+/**
+ * Confirm the per-plan endpoint actually serves this token before adopting it. A
+ * raw gho/pat token routed to a per-plan host it does not own is answered with
+ * 421 Misdirected Request (individual plans), so an unprobed adoption would break
+ * every inference call. The shared front door needs no probe: it is the safe
+ * default that already serves raw tokens.
+ */
+async function copilotEndpointServesToken(
+	endpoint: string,
+	token: string,
+	fetchFn: typeof fetch,
+	timeoutMs: number,
+): Promise<boolean> {
+	try {
+		const resp = await fetchFn(`${endpoint}/models`, {
+			headers: { ...buildCopilotCatalogHeaders(), Authorization: `Bearer ${token}` },
+			signal: AbortSignal.timeout(timeoutMs),
+		});
+		return resp.ok;
+	} catch {
+		return false;
+	}
+}
+
 export async function refreshCopilotApiEndpoint(
 	token: string,
 	options?: { fetchFn?: typeof fetch; timeoutMs?: number },
 ): Promise<string | undefined> {
 	const identity = copilotPinIdentity();
-	const cached = resolvedCopilotApiEndpoint();
-	if (cached) return cached;
+	// Respect a memoized decision (adopted endpoint OR a checked "use front door"),
+	// so a failed/absent per-plan host is not re-fetched and re-probed every process.
+	if (resolvedApiEndpoint && resolvedApiEndpoint.identity === identity && resolvedApiEndpoint.expiresAt > Date.now()) {
+		return resolvedApiEndpoint.endpoint;
+	}
 	const host = copilotPinnedHost() || "github.com";
 	const url =
 		host === "github.com"
 			? "https://api.github.com/copilot_internal/user"
 			: `https://api.${host}/copilot_internal/user`;
 	const fetchFn = options?.fetchFn ?? fetch;
+	const timeoutMs = options?.timeoutMs ?? 6000;
+	const memoize = (endpoint: string | undefined): string | undefined => {
+		resolvedApiEndpoint = { identity, endpoint, expiresAt: Date.now() + COPILOT_ENDPOINT_TTL_MS };
+		return endpoint;
+	};
 	try {
 		const resp = await fetchFn(url, {
 			headers: { ...buildCopilotCatalogHeaders(), Authorization: `Bearer ${token}` },
-			signal: AbortSignal.timeout(options?.timeoutMs ?? 6000),
+			signal: AbortSignal.timeout(timeoutMs),
 		});
 		if (!resp.ok) return undefined;
 		const payload = (await resp.json()) as { endpoints?: { api?: unknown } };
 		const endpoint =
 			typeof payload.endpoints?.api === "string" ? payload.endpoints.api.replace(/\/+$/, "") : undefined;
-		const isCopilotHost =
-			endpoint !== undefined &&
-			(/^https:\/\/[a-z0-9.-]+\.githubcopilot\.com$/i.test(endpoint) ||
-				/^https:\/\/copilot-api\.[a-z0-9.-]+$/i.test(endpoint));
-		if (!isCopilotHost) {
-			return undefined;
+		if (endpoint === undefined || !isCopilotApiHost(endpoint)) {
+			return memoize(undefined);
 		}
-		resolvedApiEndpoint = { identity, endpoint, expiresAt: Date.now() + COPILOT_ENDPOINT_TTL_MS };
-		return endpoint;
+		// The front door already serves raw tokens; adopting it is a no-op vs the default.
+		if (endpoint === COPILOT_FRONT_DOOR) {
+			return memoize(undefined);
+		}
+		if (!(await copilotEndpointServesToken(endpoint, token, fetchFn, timeoutMs))) {
+			return memoize(undefined);
+		}
+		return memoize(endpoint);
 	} catch {
 		return undefined;
 	}

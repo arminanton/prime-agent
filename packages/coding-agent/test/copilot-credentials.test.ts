@@ -298,25 +298,66 @@ describe("Copilot live capabilities and plan endpoint", () => {
 		expect(requestHeaders.authorization).toBe("Bearer gho_test");
 	});
 
-	it("resolves the plan-aware endpoint from copilot_internal/user for a pinned account", async () => {
+	it("adopts the plan-aware endpoint only after a token probe succeeds", async () => {
 		vi.stubEnv("COPILOT_GH_USER", "pinned-user");
 		vi.stubEnv("COPILOT_GH_HOST", "github.com");
 		mockGhToken("gho_pinned");
+		resetCopilotApiEndpoint();
 		expect(copilotPinnedBaseUrl()).toBe("https://api.githubcopilot.com");
-		let requestedUrl = "";
+		const urls: string[] = [];
 		const endpoint = await refreshCopilotApiEndpoint("gho_pinned", {
 			fetchFn: (async (input: string | URL | Request) => {
-				requestedUrl = String(input);
-				return new Response(JSON.stringify({ endpoints: { api: "https://api.business.githubcopilot.com/" } }), {
+				const url = String(input);
+				urls.push(url);
+				if (url.endsWith("/copilot_internal/user")) {
+					return new Response(JSON.stringify({ endpoints: { api: "https://api.business.githubcopilot.com/" } }), {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					});
+				}
+				// /models probe succeeds -> business host serves this token.
+				return new Response(JSON.stringify({ data: [] }), { status: 200 });
+			}) as typeof fetch,
+		});
+		expect(urls[0]).toBe("https://api.github.com/copilot_internal/user");
+		expect(urls).toContain("https://api.business.githubcopilot.com/models");
+		expect(endpoint).toBe("https://api.business.githubcopilot.com");
+		expect(copilotPinnedBaseUrl()).toBe("https://api.business.githubcopilot.com");
+		vi.unstubAllEnvs();
+	});
+
+	it("keeps the front door when the per-plan host rejects the raw token (421) and memoizes the decision", async () => {
+		vi.stubEnv("COPILOT_GH_USER", "pinned-user");
+		vi.stubEnv("COPILOT_GH_HOST", "github.com");
+		mockGhToken("gho_pinned");
+		resetCopilotApiEndpoint();
+		let userLookups = 0;
+		const fetchFn = (async (input: string | URL | Request) => {
+			const url = String(input);
+			if (url.endsWith("/copilot_internal/user")) {
+				userLookups++;
+				return new Response(JSON.stringify({ endpoints: { api: "https://api.individual.githubcopilot.com" } }), {
 					status: 200,
 					headers: { "content-type": "application/json" },
 				});
-			}) as typeof fetch,
-		});
-		expect(requestedUrl).toBe("https://api.github.com/copilot_internal/user");
-		expect(endpoint).toBe("https://api.business.githubcopilot.com");
-		expect(copilotPinnedBaseUrl()).toBe("https://api.business.githubcopilot.com");
-		// A non-Copilot host is never adopted.
+			}
+			// Individual plan answers a raw gho token with 421 Misdirected Request.
+			return new Response("Misdirected Request", { status: 421 });
+		}) as typeof fetch;
+		const rejected = await refreshCopilotApiEndpoint("gho_pinned", { fetchFn });
+		expect(rejected).toBeUndefined();
+		expect(copilotPinnedBaseUrl()).toBe("https://api.githubcopilot.com");
+		// Second refresh must not re-run the network lookup (negative memoized).
+		const again = await refreshCopilotApiEndpoint("gho_pinned", { fetchFn });
+		expect(again).toBeUndefined();
+		expect(userLookups).toBe(1);
+		vi.unstubAllEnvs();
+	});
+
+	it("never adopts a non-Copilot host", async () => {
+		vi.stubEnv("COPILOT_GH_USER", "pinned-user");
+		vi.stubEnv("COPILOT_GH_HOST", "github.com");
+		mockGhToken("gho_pinned");
 		resetCopilotApiEndpoint();
 		const rejected = await refreshCopilotApiEndpoint("gho_pinned", {
 			fetchFn: (async () =>

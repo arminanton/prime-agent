@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+	estimatePromptTokens,
 	knownCopilotClaudeOutputCap,
+	parseCopilotCombinedLimitError,
 	parseCopilotOutputCapError,
+	reducedMaxTokensForCombinedLimit,
 	rememberCopilotClaudeOutputCap,
 	resetCopilotClaudeOutputCaps,
 	resolveCopilotClaudeMaxTokens,
 } from "../src/providers/copilot-output-caps.js";
-import type { Model } from "../src/types.js";
+import type { Message, Model } from "../src/types.js";
 
 function copilotModel(id: string, overrides: Partial<Model<"anthropic-messages">> = {}): Model<"anthropic-messages"> {
 	return {
@@ -60,5 +63,55 @@ describe("Copilot Claude output caps", () => {
 		expect(knownCopilotClaudeOutputCap(model)).toBe(96_000);
 		expect(resolveCopilotClaudeMaxTokens(model, 0)).toBe(96_000);
 		resetCopilotClaudeOutputCaps();
+	});
+});
+
+describe("Copilot prompt-token estimate", () => {
+	it("does not count base64 image data (a screenshot must not collapse max_tokens)", () => {
+		const bigBase64 = "A".repeat(400_000); // ~100K tokens if counted as chars/4
+		const messages: Message[] = [
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "describe this screenshot" },
+					{ type: "image", data: bigBase64, mimeType: "image/png" },
+				],
+				timestamp: 0,
+			},
+		];
+		const estimate = estimatePromptTokens({ systemPrompt: "sys", messages });
+		// text ("describe this screenshot" + "sys") is tiny; image charged a small nominal.
+		expect(estimate).toBeLessThan(3_000);
+		// The clamp must keep the full cap, not collapse to the 1024 floor.
+		const model = copilotModel("claude-sonnet-5", { contextWindow: 200_000, maxInputTokens: 190_000 });
+		expect(resolveCopilotClaudeMaxTokens(model, estimate)).toBe(128_000);
+	});
+
+	it("still counts text and tool JSON generously", () => {
+		const messages: Message[] = [{ role: "user", content: "x".repeat(4_000), timestamp: 0 }];
+		expect(estimatePromptTokens({ messages })).toBeGreaterThanOrEqual(1_000);
+	});
+});
+
+describe("Copilot combined prompt+max_tokens limit", () => {
+	it("parses the combined-limit 400 and reduces max_tokens to fit", () => {
+		const text =
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 190000 + 128000 > 200000, decrease input length or `max_tokens` and try again"}}';
+		const parsed = parseCopilotCombinedLimitError(text);
+		expect(parsed).toEqual({ input: 190_000, maxTokens: 128_000, limit: 200_000 });
+		// room = 200000 - 190000 - 4096 = 5904, below the requested 128000 -> reduce.
+		expect(reducedMaxTokensForCombinedLimit(parsed!)).toBe(5_904);
+	});
+
+	it("returns undefined for a true overflow (no room for output)", () => {
+		expect(reducedMaxTokensForCombinedLimit({ input: 199_900, maxTokens: 4_000, limit: 200_000 })).toBeUndefined();
+	});
+
+	it("does not match the plain output-cap rejection", () => {
+		expect(
+			parseCopilotCombinedLimitError(
+				"max_tokens: 200000 > 128000, which is the maximum allowed number of output tokens",
+			),
+		).toBeUndefined();
 	});
 });

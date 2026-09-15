@@ -5,6 +5,8 @@ import type { Context } from "../src/types.js";
 const mockState = vi.hoisted(() => ({
 	constructorOpts: undefined as Record<string, unknown> | undefined,
 	createParams: undefined as Record<string, unknown> | undefined,
+	createCalls: [] as Record<string, unknown>[],
+	failNextError: undefined as { status: number; message: string } | undefined,
 }));
 
 vi.mock("@anthropic-ai/sdk", () => {
@@ -37,6 +39,18 @@ vi.mock("@anthropic-ai/sdk", () => {
 		messages = {
 			create: (params: Record<string, unknown>) => {
 				mockState.createParams = params;
+				mockState.createCalls.push(params);
+				const pending = mockState.failNextError;
+				if (pending) {
+					mockState.failNextError = undefined;
+					return {
+						asResponse: async () => {
+							const error = new Error(pending.message) as Error & { status: number };
+							error.status = pending.status;
+							throw error;
+						},
+					};
+				}
 				return {
 					asResponse: async () => createSseResponse(),
 				};
@@ -119,5 +133,25 @@ describe("Copilot Claude via Anthropic Messages", () => {
 		expect(headers["X-Stainless-Lang"]).toBeNull();
 		expect(headers["X-Stainless-Runtime-Version"]).toBeNull();
 		expect(headers["X-Stainless-Helper-Method"]).toBe("stream");
+	});
+
+	it("retries once with a reduced max_tokens on a combined prompt+max_tokens 400", async () => {
+		mockState.createCalls = [];
+		mockState.failNextError = {
+			status: 400,
+			message:
+				"input length and `max_tokens` exceed context limit: 190000 + 128000 > 200000, decrease input length or `max_tokens` and try again",
+		};
+		const model = getModel("github-copilot", "claude-sonnet-4.6");
+		const { streamAnthropic } = await import("../src/providers/anthropic.js");
+		const s = streamAnthropic(model, context, { apiKey: "tid_copilot_session_test_token" });
+		for await (const event of s) {
+			if (event.type === "error") break;
+		}
+		expect(mockState.createCalls.length).toBe(2);
+		const retried = mockState.createCalls[1] as { max_tokens: number };
+		// room = 200000 - 190000 - 4096 = 5904 (< requested).
+		expect(retried.max_tokens).toBe(5_904);
+		mockState.failNextError = undefined;
 	});
 });

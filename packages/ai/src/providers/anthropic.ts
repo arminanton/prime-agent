@@ -51,7 +51,9 @@ import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import {
 	estimatePromptTokens,
 	knownCopilotClaudeOutputCap,
+	parseCopilotCombinedLimitError,
 	parseCopilotOutputCapError,
+	reducedMaxTokensForCombinedLimit,
 	rememberCopilotClaudeOutputCap,
 	resolveCopilotClaudeMaxTokens,
 } from "./copilot-output-caps.js";
@@ -494,6 +496,15 @@ async function createWithOutputCapRetry(
 			if (params.max_tokens <= cap) throw error;
 			rememberCopilotClaudeOutputCap(model, cap);
 			return await client.messages.create({ ...params, max_tokens: cap, stream: true }, requestOptions).asResponse();
+		}
+		const combinedLimit = parseCopilotCombinedLimitError(message);
+		if (combinedLimit !== undefined) {
+			const reduced = reducedMaxTokensForCombinedLimit(combinedLimit);
+			// Undefined means the prompt itself leaves no room: a real overflow the caller surfaces.
+			if (reduced === undefined || reduced >= params.max_tokens) throw error;
+			return await client.messages
+				.create({ ...params, max_tokens: reduced, stream: true }, requestOptions)
+				.asResponse();
 		}
 		const adjustment = classifyCopilotRequestError(message);
 		const adjusted = adjustment
