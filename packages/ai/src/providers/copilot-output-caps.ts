@@ -104,75 +104,21 @@ export function reducedMaxTokensForCombinedLimit(limit: CopilotCombinedLimit): n
  * base64 `data` field itself is NEVER counted: at chars/4 a single screenshot would
  * add 75K-250K phantom tokens and collapse the clamped max_tokens to its floor.
  */
-const NOMINAL_IMAGE_TOKENS = 1_600;
-
-/** Rough token estimate for the combined prompt+output validation (chars/4, generous). */
-export function estimatePromptTokens(context: {
-	systemPrompt?: string;
-	messages: unknown[];
-	tools?: unknown[];
-}): number {
-	let chars = context.systemPrompt?.length ?? 0;
-	let imageTokens = 0;
-	const seen = new WeakSet<object>();
-	const walk = (node: unknown): void => {
-		if (node === null || node === undefined) return;
-		const t = typeof node;
-		if (t === "string") {
-			chars += (node as string).length;
-			return;
-		}
-		if (t === "number" || t === "boolean") {
-			chars += String(node).length;
-			return;
-		}
-		if (t !== "object") return;
-		if (seen.has(node as object)) return;
-		seen.add(node as object);
-		if (Array.isArray(node)) {
-			for (const el of node) walk(el);
-			return;
-		}
-		const rec = node as Record<string, unknown>;
-		// Image content blocks: charge a nominal token cost and skip base64 payloads
-		// (internal `{ type: "image", data, mimeType }` and any `source: { data }`).
-		if (rec.type === "image" || rec.type === "image_url" || rec.type === "input_image") {
-			imageTokens += NOMINAL_IMAGE_TOKENS;
-			for (const [key, value] of Object.entries(rec)) {
-				if (key === "data" || key === "image_url") continue;
-				if (key === "source" && value && typeof value === "object" && !Array.isArray(value)) {
-					for (const [sk, sv] of Object.entries(value as Record<string, unknown>)) {
-						if (sk === "data") continue;
-						walk(sv);
-					}
-					continue;
-				}
-				walk(value);
-			}
-			return;
-		}
-		for (const value of Object.values(rec)) walk(value);
-	};
-	try {
-		walk(context.messages);
-		if (context.tools) walk(context.tools);
-	} catch {
-		return 0;
-	}
-	return Math.ceil(chars / 4) + imageTokens;
-}
-
 /**
- * Resolve `max_tokens` for a Copilot Claude request: the probed server cap,
- * clamped so `prompt + max_tokens` stays under the model's total context
- * (Anthropic validates the sum), never below a small floor. Returns undefined
- * for non-Copilot models so the caller keeps its default.
+ * Resolve `max_tokens` for a Copilot Claude request: the probed server output cap
+ * (128K opus/sonnet/fable, 64K haiku), or the catalog value when unprobed. Returns
+ * undefined for non-Copilot models so the caller keeps its default.
+ *
+ * No context-window pre-clamp: a rough prompt-token estimate systematically
+ * over-counts dense code/JSON/image contexts (a ~798K-token prompt estimated near
+ * ~1M collapsed max_tokens to the floor and truncated every turn). The server
+ * enforces `prompt + max_tokens <= context`, and `createWithOutputCapRetry` reacts
+ * to the "input length and max_tokens exceed context limit" 400 by reducing
+ * max_tokens to fit, so the proactive clamp is redundant and only caused false
+ * collapses on large sessions.
  */
-export function resolveCopilotClaudeMaxTokens(model: Model<any>, promptTokens: number): number | undefined {
+export function resolveCopilotClaudeMaxTokens(model: Model<any>): number | undefined {
 	const cap = knownCopilotClaudeOutputCap(model) ?? model.maxTokens;
 	if (model.provider !== "github-copilot" || !cap) return undefined;
-	const contextWindow = model.contextWindow || 0;
-	if (contextWindow <= 0) return cap;
-	const room = contextWindow - promptTokens - COMBINED_LIMIT_MARGIN_TOKENS;
-	return Math.max(MIN_OUTPUT_TOKENS, Math.min(cap, room));
+	return cap;
 }

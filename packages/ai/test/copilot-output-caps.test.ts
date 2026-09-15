@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-	estimatePromptTokens,
 	knownCopilotClaudeOutputCap,
 	parseCopilotCombinedLimitError,
 	parseCopilotOutputCapError,
@@ -9,7 +8,7 @@ import {
 	resetCopilotClaudeOutputCaps,
 	resolveCopilotClaudeMaxTokens,
 } from "../src/providers/copilot-output-caps.js";
-import type { Message, Model } from "../src/types.js";
+import type { Model } from "../src/types.js";
 
 function copilotModel(id: string, overrides: Partial<Model<"anthropic-messages">> = {}): Model<"anthropic-messages"> {
 	return {
@@ -39,15 +38,15 @@ describe("Copilot Claude output caps", () => {
 		expect(knownCopilotClaudeOutputCap(copilotModel("claude-opus-4.8", { provider: "anthropic" }))).toBeUndefined();
 	});
 
-	it("clamps max_tokens so prompt plus output stays inside the context window", () => {
+	it("returns the probed cap without a context-window pre-clamp (no false collapse on large contexts)", () => {
 		resetCopilotClaudeOutputCaps();
 		const model = copilotModel("claude-fable-5.1");
-		expect(resolveCopilotClaudeMaxTokens(model, 10_000)).toBe(128_000);
-		expect(resolveCopilotClaudeMaxTokens(model, 900_000)).toBe(1_000_000 - 900_000 - 4_096);
-		expect(resolveCopilotClaudeMaxTokens(model, 999_000)).toBe(1_024);
-		expect(
-			resolveCopilotClaudeMaxTokens(copilotModel("claude-opus-4.8", { provider: "anthropic" }), 0),
-		).toBeUndefined();
+		// A near-full context must NOT collapse max_tokens; the server + combined-limit retry handle overflow.
+		expect(resolveCopilotClaudeMaxTokens(model)).toBe(128_000);
+		// haiku probed cap
+		expect(resolveCopilotClaudeMaxTokens(copilotModel("claude-haiku-4.5"))).toBe(64_000);
+		// non-Copilot models keep the caller default
+		expect(resolveCopilotClaudeMaxTokens(copilotModel("claude-opus-4.8", { provider: "anthropic" }))).toBeUndefined();
 	});
 
 	it("parses the server cap out of the 400 text and remembers it per model", () => {
@@ -58,38 +57,11 @@ describe("Copilot Claude output caps", () => {
 		expect(parseCopilotOutputCapError("prompt is too long: 1000759 tokens > 1000000 maximum")).toBeUndefined();
 		const model = copilotModel("claude-new-model");
 		expect(knownCopilotClaudeOutputCap(model)).toBeUndefined();
-		expect(resolveCopilotClaudeMaxTokens(model, 0)).toBe(64_000);
+		expect(resolveCopilotClaudeMaxTokens(model)).toBe(64_000);
 		rememberCopilotClaudeOutputCap(model, 96_000);
 		expect(knownCopilotClaudeOutputCap(model)).toBe(96_000);
-		expect(resolveCopilotClaudeMaxTokens(model, 0)).toBe(96_000);
+		expect(resolveCopilotClaudeMaxTokens(model)).toBe(96_000);
 		resetCopilotClaudeOutputCaps();
-	});
-});
-
-describe("Copilot prompt-token estimate", () => {
-	it("does not count base64 image data (a screenshot must not collapse max_tokens)", () => {
-		const bigBase64 = "A".repeat(400_000); // ~100K tokens if counted as chars/4
-		const messages: Message[] = [
-			{
-				role: "user",
-				content: [
-					{ type: "text", text: "describe this screenshot" },
-					{ type: "image", data: bigBase64, mimeType: "image/png" },
-				],
-				timestamp: 0,
-			},
-		];
-		const estimate = estimatePromptTokens({ systemPrompt: "sys", messages });
-		// text ("describe this screenshot" + "sys") is tiny; image charged a small nominal.
-		expect(estimate).toBeLessThan(3_000);
-		// The clamp must keep the full cap, not collapse to the 1024 floor.
-		const model = copilotModel("claude-sonnet-5", { contextWindow: 200_000, maxInputTokens: 190_000 });
-		expect(resolveCopilotClaudeMaxTokens(model, estimate)).toBe(128_000);
-	});
-
-	it("still counts text and tool JSON generously", () => {
-		const messages: Message[] = [{ role: "user", content: "x".repeat(4_000), timestamp: 0 }];
-		expect(estimatePromptTokens({ messages })).toBeGreaterThanOrEqual(1_000);
 	});
 });
 

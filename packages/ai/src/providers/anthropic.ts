@@ -49,7 +49,6 @@ import {
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import {
-	estimatePromptTokens,
 	knownCopilotClaudeOutputCap,
 	parseCopilotCombinedLimitError,
 	parseCopilotOutputCapError,
@@ -1075,9 +1074,9 @@ function createClient(
  * clamped to the remaining context; every other Anthropic host keeps the
  * conservative third-of-catalog default unless the caller sets maxTokens.
  */
-function resolveMaxTokens(model: Model<"anthropic-messages">, context: Context, options?: AnthropicOptions): number {
+function resolveMaxTokens(model: Model<"anthropic-messages">, options?: AnthropicOptions): number {
 	if (options?.maxTokens) return options.maxTokens;
-	const copilotCap = resolveCopilotClaudeMaxTokens(model, estimatePromptTokens(context));
+	const copilotCap = resolveCopilotClaudeMaxTokens(model);
 	if (copilotCap !== undefined) return copilotCap;
 	return (model.maxTokens / 3) | 0;
 }
@@ -1092,7 +1091,7 @@ function buildParams(
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
 		messages: convertMessages(context.messages, model, isOAuthToken, cacheControl),
-		max_tokens: resolveMaxTokens(model, context, options),
+		max_tokens: resolveMaxTokens(model, options),
 		stream: true,
 	};
 
