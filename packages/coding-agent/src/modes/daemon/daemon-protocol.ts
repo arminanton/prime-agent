@@ -256,6 +256,13 @@ export function collectDaemonClientEnv(source: NodeJS.ProcessEnv = process.env):
 	return Object.keys(env).length > 0 ? env : undefined;
 }
 
+// Set by the auto-launcher on the DETACHED daemon supervisor's env so its log() suppresses the
+// duplicate console.error() to the inherited stderr FD (the rotated daemon log + structured log
+// remain the source of truth). A manual foreground `--mode daemon` run does not set it, so it keeps
+// console.error. The PRIME_AGENT_INTERNAL_ prefix means collectDaemonLaunchEnv never forwards it to
+// workers (workers keep their own stderr handling).
+export const DAEMON_QUIET_STDERR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_QUIET_STDERR";
+
 export function collectDaemonLaunchEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const [key, value] of Object.entries(source)) {

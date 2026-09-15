@@ -81,6 +81,7 @@ import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
 	DAEMON_COMMAND_COMPATIBILITY,
+	DAEMON_QUIET_STDERR_ENV,
 	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
@@ -913,7 +914,11 @@ export class DaemonSupervisor {
 	}
 
 	private log(message: string): void {
-		console.error(message);
+		// The auto-launched detached supervisor suppresses this duplicate stderr write (the rotating
+		// daemon log + structured log stay authoritative), so it never grows the inherited stderr FD
+		// the launcher points at the rotated log. A manual foreground `--mode daemon` run leaves the
+		// env unset and keeps console.error for the operator.
+		if (process.env[DAEMON_QUIET_STDERR_ENV] !== "1") console.error(message);
 		structuredLog.warn(message, { socketPath: this.socketPath });
 		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] supervisor: ${message}`);
 	}

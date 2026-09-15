@@ -5,13 +5,13 @@
  * the heavy main module graph loads. main.ts reuses the same memoized promise.
  */
 
-import { accessSync, closeSync, constants, existsSync, openSync, readFileSync, rmSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, openSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
-import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
+import { DAEMON_PROTOCOL_VERSION, DAEMON_QUIET_STDERR_ENV, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
@@ -451,6 +451,10 @@ Then retry the original command.`,
 	delete env[ORPHAN_PROCESS_JOURNAL_ENV];
 	delete env[SESSION_LEASES_ENABLED_ENV];
 	delete env[SESSION_LEASE_OWNER_ID_ENV];
+	// The detached supervisor suppresses its duplicate console.error to the inherited stderr FD
+	// (its rotated log + structured log stay authoritative), so it never grows the inherited FD.
+	// Not forwarded to workers (collectDaemonLaunchEnv strips the PRIME_AGENT_INTERNAL_ prefix).
+	env[DAEMON_QUIET_STDERR_ENV] = "1";
 
 	const daemonArgs = [...process.execArgv, entrypoint, "--mode", "daemon", "--daemon-socket", socketPath];
 	const invocation = buildDaemonScopeInvocation(process.execPath, daemonArgs);
@@ -535,27 +539,32 @@ async function attemptDaemonLaunch(
 	spawnCwd: string,
 ): Promise<DaemonLaunchAttempt> {
 	const logOffset = currentDaemonLogSize(socketPath);
-	const scopeStderrPath = invocation.scoped ? `${getDaemonLogPath(socketPath)}.scope-launch` : undefined;
-	let scopeStderrFd: number | undefined;
-	if (scopeStderrPath) {
+	// For a scoped launch, point the daemon child's stderr at the NORMAL rotated daemon log (append),
+	// NOT a sidecar we later unlink. systemd-run's own scope-creation stderr is the only thing that
+	// lands there (the detached daemon runs with DAEMON_QUIET_STDERR set so it does not duplicate its
+	// console.error into this FD); it is read back per-attempt via the log offset below. This avoids
+	// the pre-fix bug where the daemon held FD 2 to an unlinked sidecar inode that grew for its whole
+	// lifetime, and where concurrent same-socket launches clobbered a fixed sidecar path.
+	let daemonStderrFd: number | undefined;
+	if (invocation.scoped) {
 		try {
-			scopeStderrFd = openSync(scopeStderrPath, "w");
+			daemonStderrFd = openSync(getDaemonLogPath(socketPath), "a");
 		} catch {
-			scopeStderrFd = undefined;
+			daemonStderrFd = undefined;
 		}
 	}
 	const child = spawnHidden(invocation.command, invocation.args, {
 		cwd: spawnCwd,
 		detached: true,
 		env,
-		// A pipe would tie the daemon's stderr to this short-lived CLI (EPIPE once it exits);
-		// crash details come from the daemon log. systemd-run's own stderr goes to a sidecar file
-		// so a scope-creation failure is captured; everything else is discarded.
-		stdio: scopeStderrFd !== undefined ? ["ignore", "ignore", scopeStderrFd] : "ignore",
+		// A pipe would tie the daemon's stderr to this short-lived CLI (EPIPE once it exits). For a
+		// scoped launch the child stderr is the rotated daemon log (captures systemd-run's own
+		// scope-creation stderr); otherwise it is discarded (the daemon logs via its own writer).
+		stdio: daemonStderrFd !== undefined ? ["ignore", "ignore", daemonStderrFd] : "ignore",
 	});
-	if (scopeStderrFd !== undefined) {
+	if (daemonStderrFd !== undefined) {
 		try {
-			closeSync(scopeStderrFd);
+			closeSync(daemonStderrFd);
 		} catch {
 			// The child kept its dup; closing the parent copy is best-effort.
 		}
@@ -572,34 +581,18 @@ async function attemptDaemonLaunch(
 	});
 	child.unref();
 
-	const readScopeStderr = (): string => {
-		if (!scopeStderrPath) return "";
-		try {
-			return readFileSync(scopeStderrPath, "utf8").trim();
-		} catch {
-			return "";
-		}
-	};
-	const cleanupScopeStderr = (): void => {
-		if (!scopeStderrPath) return;
-		try {
-			rmSync(scopeStderrPath, { force: true });
-		} catch {
-			// Best-effort; a leftover sidecar is truncated by the next scoped launch.
-		}
-	};
 	const failureMessage = (): string => {
+		// The per-attempt (offset-bounded) tail of the rotated daemon log now includes systemd-run's
+		// own scope-creation stderr for a scoped launch, so no separate sidecar detail is needed.
 		const logTail = readDaemonLogTail(socketPath, logOffset);
-		const scopeErr = readScopeStderr();
-		const scopeDetail = scopeErr ? ` systemd-run stderr: ${scopeErr}` : "";
 		if (!childFailure) {
-			return `Timed out waiting for daemon to start on ${socketPath}.${logTail}${scopeDetail}`;
+			return `Timed out waiting for daemon to start on ${socketPath}.${logTail}`;
 		}
 		if (childFailure.type === "error") {
-			return `Failed to spawn Prime Agent daemon: ${childFailure.error.message}.${logTail}${scopeDetail}`;
+			return `Failed to spawn Prime Agent daemon: ${childFailure.error.message}.${logTail}`;
 		}
 		const signal = childFailure.signal ? `, signal ${childFailure.signal}` : "";
-		return `Prime Agent daemon exited during startup (code ${childFailure.code ?? "unknown"}${signal}).${logTail}${scopeDetail}`;
+		return `Prime Agent daemon exited during startup (code ${childFailure.code ?? "unknown"}${signal}).${logTail}`;
 	};
 
 	// A child exit is not immediately fatal: it may have lost the socket to a concurrent launcher
@@ -610,7 +603,6 @@ async function attemptDaemonLaunch(
 	while (Date.now() < Math.min(deadline, exitDeadline ?? Number.POSITIVE_INFINITY)) {
 		const started = await probeDaemonVersion(socketPath);
 		if (started.status === "current") {
-			cleanupScopeStderr();
 			return { started: true };
 		}
 		if (childFailure) {
@@ -620,7 +612,6 @@ async function attemptDaemonLaunch(
 	}
 
 	const message = failureMessage();
-	cleanupScopeStderr();
 	// childFailure is set only when the spawned child actually exited or failed to spawn. When it is
 	// undefined the loop hit the plain 30s timeout with the child STILL ALIVE (the daemon is likely
 	// still booting), which must NOT trigger a second (unscoped) spawn.

@@ -151,6 +151,7 @@ import {
 	collectDaemonLaunchEnv,
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
+	DAEMON_QUIET_STDERR_ENV,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
@@ -685,10 +686,12 @@ export class AgentDaemon {
 	}
 
 	// The daemon runs detached with no terminal, so route its diagnostics to its
-	// rotating log file and the shared structured log (and stderr too, for when
-	// it's run in the foreground).
+	// rotating log file and the shared structured log. The auto-launcher sets
+	// DAEMON_QUIET_STDERR on a detached supervisor so the duplicate console.error to the inherited
+	// stderr FD is suppressed (it would otherwise grow the FD the launcher points at the rotated
+	// log); a manual foreground `--mode daemon` run leaves it unset and keeps stderr output.
 	private log(message: string): void {
-		console.error(message);
+		if (process.env[DAEMON_QUIET_STDERR_ENV] !== "1") console.error(message);
 		structuredLog.warn(message, { socketPath: this.socketPath });
 		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] ${message}`);
 	}
