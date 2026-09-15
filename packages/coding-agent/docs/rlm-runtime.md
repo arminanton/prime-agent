@@ -79,6 +79,8 @@ The kernel is created lazily on first Python REPL use. Python resolution is:
 2. `~/.prime/agent/kernel-venv/bin/python`, bootstrapped with `uv`; or
 3. the XDG data location when `~/.prime` is not writable.
 
+Set `PRIME_AGENT_RUNTIME_SOURCE` to install `prime-agent-runtime` from a local checkout instead of the copy that ships with this install; when it is set it is the only candidate, and a missing source fails the bootstrap cleanly without touching the existing kernel venv.
+
 The managed environment includes Python 3.11, `prime-agent-runtime`, `dill`, and the default Python packages. A bootstrap marker detects stale environments.
 
 Startup spawns `python -m rlm.repl` and exchanges newline-delimited JSON over stdio: the runtime announces itself with a single `ready` event, then requests and events flow one JSON object per line (see `prime-agent-runtime/src/rlm/repl.md`).

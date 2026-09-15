@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, existsSync, readdirSync, readFileSync } from "node:fs";
-import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { stderr, stdin } from "node:process";
@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { getPackageDir } from "../../config.js";
 import { isProcessAlive, spawnHidden } from "../../utils/child-process.js";
 import { tryAcquireDirLock } from "../../utils/dir-lock.js";
+import { writeFileAtomicSync } from "../../utils/atomic-file.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 
 const BOOTSTRAP_SCHEMA = 9;
@@ -129,6 +130,10 @@ interface BootstrapVersion {
 	runtime?: string;
 	snapshot?: string;
 	extraUvArgs?: string[];
+	// Content id of the expensive base (schema + runtime + snapshot + default packages +
+	// python version + readiness check). A change here means this venv is a different
+	// generation and must not be reused as the current base.
+	generation?: string;
 	pythonSkills?: BootstrapPythonSkill[];
 }
 
@@ -407,21 +412,52 @@ function getBaseKernelVenvDir(): string {
 }
 
 // Content-addressed identity of the EXPENSIVE part of a venv (runtime + interpreter +
-// default packages) used to name a generation dir. Python skills are installed
-// incrementally into an existing generation, so they are deliberately excluded here:
-// a skill change syncs in place rather than forcing a full rebuild into a new dir.
-function bootstrapGenerationHash(runtimeIdentity: string): string {
+// default packages + python version + readiness check) used to name a generation dir and
+// to key the backoff marker. Python skills are installed incrementally into an existing
+// generation, so they are deliberately excluded here: a skill change syncs in place rather
+// than forcing a full rebuild into a new dir. PYTHON_VERSION and RUNTIME_READY_CHECK are
+// included so a TS-side interpreter or readiness change yields a new generation instead of
+// a same-identity rebuild against the live venv.
+export function bootstrapGenerationHash(runtimeIdentity: string): string {
 	const identity = JSON.stringify({
 		schema: BOOTSTRAP_SCHEMA,
 		runtime: runtimeIdentity,
 		snapshot: STATE_SNAPSHOT_REQUIREMENT,
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+		pythonVersion: PYTHON_VERSION,
+		readyCheck: RUNTIME_READY_CHECK,
 	});
 	return createHash("sha256").update(identity).digest("hex").slice(0, BOOTSTRAP_GENERATION_HASH_LENGTH);
 }
 
 function generationVenvDir(baseDir: string, generationHash: string): string {
 	return `${baseDir}-${generationHash}`;
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// A generation dir belongs to this base family iff its basename is `<basename>-<16 hex>`
+// with an optional `-<32 hex nonce>` suffix. Matching this exactly (not a loose prefix)
+// keeps a default-base operation from ever touching a sibling family such as
+// `<basename>-prod-<hash>` or `<basename>-next`.
+function generationFamilyPattern(baseDir: string): RegExp {
+	const base = escapeRegExp(path.basename(baseDir));
+	return new RegExp(`^${base}-[0-9a-f]{${BOOTSTRAP_GENERATION_HASH_LENGTH}}(?:-[0-9a-f]{32})?$`);
+}
+
+// A basename that belongs to a specific identity within the base family:
+// `<basename>-<generationHash>` with an optional nonce suffix.
+function generationIdentityPattern(baseDir: string, generationHash: string): RegExp {
+	const base = escapeRegExp(path.basename(baseDir));
+	return new RegExp(`^${base}-${generationHash}(?:-[0-9a-f]{32})?$`);
+}
+
+// Each build attempt gets a unique nonce-suffixed sibling dir so a same-identity rebuild
+// can never collide with (and therefore never remove or overwrite) the live venv.
+function newGenerationVenvDir(baseDir: string, generationHash: string): string {
+	return `${baseDir}-${generationHash}-${randomUUID().replaceAll("-", "")}`;
 }
 
 function bootstrapPointerPath(baseDir: string): string {
@@ -446,10 +482,13 @@ function readBootstrapPointer(baseDir: string): BootstrapPointer | null {
 	}
 }
 
-// The live venv dir the pointer publishes, or null when there is no valid pointer.
+// The live venv dir the pointer publishes, or null when there is no valid pointer. The
+// published basename is validated against this base's generation family before being joined,
+// so a torn or hostile pointer can never resolve to a directory outside the family.
 function publishedGenerationDir(baseDir: string): string | null {
 	const pointer = readBootstrapPointer(baseDir);
 	if (!pointer) return null;
+	if (!generationFamilyPattern(baseDir).test(pointer.current)) return null;
 	const dir = path.join(path.dirname(baseDir), pointer.current);
 	return existsSync(dir) ? dir : null;
 }
@@ -717,6 +756,7 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 			runtime: typeof parsed.runtime === "string" ? parsed.runtime : undefined,
 			snapshot: typeof parsed.snapshot === "string" ? parsed.snapshot : undefined,
 			extraUvArgs,
+			generation: typeof parsed.generation === "string" ? parsed.generation : undefined,
 			pythonSkills,
 		};
 	} catch {
@@ -762,7 +802,8 @@ function bootstrapBaseVersionCurrent(version: BootstrapVersion | null, runtimeId
 		version?.schema === BOOTSTRAP_SCHEMA &&
 		version.runtime === runtimeIdentity &&
 		version.snapshot === STATE_SNAPSHOT_REQUIREMENT &&
-		extraUvArgsMatch(version.extraUvArgs, DEFAULT_RLM_EXTRA_UV_ARGS)
+		extraUvArgsMatch(version.extraUvArgs, DEFAULT_RLM_EXTRA_UV_ARGS) &&
+		version.generation === bootstrapGenerationHash(runtimeIdentity)
 	);
 }
 
@@ -776,9 +817,12 @@ async function writeBootstrapVersion(
 		runtime: runtimeIdentity,
 		snapshot: STATE_SNAPSHOT_REQUIREMENT,
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+		generation: bootstrapGenerationHash(runtimeIdentity),
 		pythonSkills: [...pythonSkills],
 	};
-	await writeFile(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`, "utf8");
+	// Atomic temp+rename: a crash mid-write must never leave a torn version file, which
+	// would read back as null and mislead the readiness check into a rebuild.
+	writeFileAtomicSync(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`);
 }
 
 function runtimeCandidateDirs(): string[] {
@@ -998,19 +1042,28 @@ function formatBootstrapFailure(error: unknown): Error {
 	);
 }
 
-// Publish a freshly validated generation for readers with a single pointer write. The
-// generation being replaced is kept as `previous` for rollback. A torn/partial pointer
-// fails JSON.parse in readBootstrapPointer, and callers fall back to the base dir.
+// Publish a freshly validated generation for readers with a single atomic pointer write.
+// The generation being replaced is kept as `previous` for rollback. A previous basename is
+// only carried forward when it belongs to this base's generation family, so a stray value
+// can never be resolved by a later join.
 async function publishGeneration(baseDir: string, generationDir: string): Promise<void> {
 	const current = path.basename(generationDir);
+	const familyPattern = generationFamilyPattern(baseDir);
 	const existing = readBootstrapPointer(baseDir);
-	const previous = existing && existing.current !== current ? existing.current : existing?.previous;
+	const previousCandidate =
+		existing && existing.current !== current ? existing.current : existing?.previous;
+	const previous =
+		previousCandidate && previousCandidate !== current && familyPattern.test(previousCandidate)
+			? previousCandidate
+			: undefined;
 	const pointer: BootstrapPointer = {
 		current,
-		...(previous && previous !== current ? { previous } : {}),
+		...(previous ? { previous } : {}),
 		updatedAt: Date.now(),
 	};
-	await writeFile(bootstrapPointerPath(baseDir), `${JSON.stringify(pointer)}\n`, "utf8");
+	// Atomic temp+rename: a torn pointer would read back null and drop readers onto the
+	// base path, which is not a venv in the generation layout.
+	writeFileAtomicSync(bootstrapPointerPath(baseDir), `${JSON.stringify(pointer)}\n`);
 }
 
 function readBootstrapFailure(baseDir: string): BootstrapFailureMarker | null {
@@ -1051,7 +1104,8 @@ async function recordBootstrapFailure(baseDir: string, identity: string, error: 
 		nextRetryAt: Date.now() + bootstrapBackoffMs(attempt),
 		lastError: errorMessage(error).slice(0, RUN_STDERR_TAIL_CHARS),
 	};
-	await writeFile(bootstrapFailedPath(baseDir), `${JSON.stringify(marker)}\n`, "utf8");
+	// Atomic temp+rename so a crash mid-write cannot leave a torn marker.
+	writeFileAtomicSync(bootstrapFailedPath(baseDir), `${JSON.stringify(marker)}\n`);
 }
 
 async function clearBootstrapFailure(baseDir: string): Promise<void> {
@@ -1063,25 +1117,30 @@ function bootstrapBackoffError(marker: BootstrapFailureMarker): Error {
 	const retryAt = new Date(marker.nextRetryAt).toISOString();
 	return new Error(
 		`kernel venv bootstrap failed ${marker.attempt} time(s) for this runtime; ` +
-			`not rebuilding again before ${retryAt} (a runtime or skill change retries immediately). ` +
+			`not rebuilding again before ${retryAt} (a runtime, python-version, or readiness-check change retries immediately; a skill change syncs in place). ` +
 			`Last error: ${marker.lastError ?? "unknown"}`,
 	);
 }
 
-// Reclaim superseded generation dirs. Best-effort: the live and immediately-previous
-// generations are kept, and only idle dirs are removed, so this never disturbs a venv a
-// kernel is importing from and never fails a bootstrap.
+// Reclaim superseded generation dirs of THIS base family only. It is deliberately NOT run
+// in-band during a normal ensureKernelPython: a venv dir's mtime is its BUILD time (a kernel
+// importing from it never refreshes it), so "idle" cannot prove no live kernel is importing
+// from an older generation across a rolling deploy. It is opt-in operator/prebuild-time
+// cleanup (PRIME_AGENT_KERNEL_VENV_GC=1) and matches the exact family pattern
+// `^<basename>-[0-9a-f]{16}(-<nonce>)?$`, so it can never delete a sibling family such as
+// `<basename>-prod-<hash>` or `<basename>-next`. A per-live-reference eviction check is
+// Deploy B.
 async function gcOldGenerations(baseDir: string): Promise<void> {
 	try {
 		const pointer = readBootstrapPointer(baseDir);
 		const keep = new Set<string>();
-		if (pointer?.current) keep.add(pointer.current);
-		if (pointer?.previous) keep.add(pointer.previous);
+		if (pointer?.current && generationFamilyPattern(baseDir).test(pointer.current)) keep.add(pointer.current);
+		if (pointer?.previous && generationFamilyPattern(baseDir).test(pointer.previous)) keep.add(pointer.previous);
 		const parent = path.dirname(baseDir);
-		const prefix = `${path.basename(baseDir)}-`;
+		const familyPattern = generationFamilyPattern(baseDir);
 		const now = Date.now();
 		for (const entry of await readdir(parent, { withFileTypes: true })) {
-			if (!entry.isDirectory() || !entry.name.startsWith(prefix) || keep.has(entry.name)) continue;
+			if (!entry.isDirectory() || !familyPattern.test(entry.name) || keep.has(entry.name)) continue;
 			const dir = path.join(parent, entry.name);
 			try {
 				const info = await stat(dir);
@@ -1094,6 +1153,55 @@ async function gcOldGenerations(baseDir: string): Promise<void> {
 	} catch {
 		// GC must never fail a bootstrap.
 	}
+}
+
+// A "clean" bootstrap error (backoff active, or a same-identity readiness probe failure that
+// must not rebuild) is surfaced as-is instead of being wrapped in the generic first-time-setup
+// guidance, which would be misleading for those cases.
+const CLEAN_BOOTSTRAP_ERROR = Symbol("primeAgentBootstrapCleanError");
+
+function markCleanBootstrapError(error: Error): Error {
+	(error as Error & { [CLEAN_BOOTSTRAP_ERROR]?: true })[CLEAN_BOOTSTRAP_ERROR] = true;
+	return error;
+}
+
+function isCleanBootstrapError(error: unknown): boolean {
+	return error instanceof Error && (error as Error & { [CLEAN_BOOTSTRAP_ERROR]?: true })[CLEAN_BOOTSTRAP_ERROR] === true;
+}
+
+// Reuse an already-built generation of THIS identity by publishing it instead of running a
+// full rebuild (fixes rollback/ping-pong A -> B -> A). Scans base-family siblings whose
+// basename encodes this generation hash and returns the freshest one whose recorded base is
+// current and whose runtime imports. Never removes or rebuilds anything.
+async function findReusableGeneration(
+	baseDir: string,
+	generationHash: string,
+	skipDir: string,
+	runtimeIdentity: string,
+): Promise<string | null> {
+	const parent = path.dirname(baseDir);
+	const identityPattern = generationIdentityPattern(baseDir, generationHash);
+	const skipName = path.basename(skipDir);
+	const candidates: { dir: string; mtimeMs: number }[] = [];
+	try {
+		for (const entry of await readdir(parent, { withFileTypes: true })) {
+			if (!entry.isDirectory() || !identityPattern.test(entry.name) || entry.name === skipName) continue;
+			const dir = path.join(parent, entry.name);
+			try {
+				candidates.push({ dir, mtimeMs: (await stat(dir)).mtimeMs });
+			} catch {
+				// A sibling that vanished mid-scan is simply skipped.
+			}
+		}
+	} catch {
+		return null;
+	}
+	// Prefer the most recently built generation.
+	candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	for (const { dir } of candidates) {
+		if (await kernelBaseReady(kernelVenvPython(dir), dir, runtimeIdentity)) return dir;
+	}
+	return null;
 }
 
 async function ensureKernelPythonUncached(
@@ -1139,75 +1247,120 @@ async function ensureKernelPythonUncached(
 	const runtimeIdentity = await hashRuntimeSource(runtimeSourceDir);
 	const baseDir = await resolveWritableKernelVenvDir();
 	const generationHash = bootstrapGenerationHash(runtimeIdentity);
-	const generationDir = generationVenvDir(baseDir, generationHash);
+	// An operator escape hatch: force a fresh generation build even when the recorded base
+	// matches. Always builds into a new unique dir, so it still never removes the live venv.
+	const forceRebuild = process.env.PRIME_AGENT_KERNEL_VENV_FORCE_REBUILD === "1";
 
 	// The live venv is the published generation, or a legacy venv still sitting at the
 	// base path (pre-generation layout). Reuse it untouched whenever it is already
 	// current, so an identity that has not changed never triggers a rebuild.
 	const liveDir = publishedGenerationDir(baseDir) ?? baseDir;
 	const livePython = kernelVenvPython(liveDir);
-	if (await kernelReady(livePython, liveDir, runtimeIdentity, pythonSkills)) return livePython;
+	if (!forceRebuild && (await kernelReady(livePython, liveDir, runtimeIdentity, pythonSkills))) return livePython;
 
 	const releaseLock = await acquireBootstrapLock(baseDir);
 	try {
 		// Recheck under the lock: another process may have just published a generation.
 		const currentDir = publishedGenerationDir(baseDir) ?? baseDir;
 		const currentPython = kernelVenvPython(currentDir);
-		if (await kernelReady(currentPython, currentDir, runtimeIdentity, pythonSkills)) return currentPython;
-
-		// Base (runtime + interpreter + default packages) already matches: install only
-		// the changed Python skills into the live venv in place. This is the cheap path;
-		// it never rebuilds and never removes the live venv, so it stays safe under load.
-		if (await kernelBaseReady(currentPython, currentDir, runtimeIdentity)) {
-			await syncPythonSkills(
-				await ensureUv(options),
-				currentDir,
-				currentPython,
-				runtimeIdentity,
-				pythonSkills,
-				options,
-			);
+		if (!forceRebuild && (await kernelReady(currentPython, currentDir, runtimeIdentity, pythonSkills)))
 			return currentPython;
+
+		// The live venv's RECORDED base already matches this identity (a pure file read, no
+		// subprocess). Its interpreter + runtime + default packages are exactly right, so a
+		// FAILING readiness probe here is a transient spawn/out-of-memory failure, NOT a reason
+		// to rebuild. This is the freeze-day path: under memory pressure the probe python is
+		// EAGAIN/ENOMEM at spawn or OOM-killed, and the old code rm -rf'd this live dir. We must
+		// never do that. Either sync the changed skills in place (the runtime probe passed) or,
+		// when even the runtime probe fails while the interpreter binary is present, fail clean
+		// and leave the live venv every kernel imports from intact.
+		if (!forceRebuild && bootstrapBaseVersionCurrent(await readBootstrapVersion(currentDir), runtimeIdentity)) {
+			if (await hasPrimeAgentRuntime(currentPython)) {
+				await syncPythonSkills(
+					await ensureUv(options),
+					currentDir,
+					currentPython,
+					runtimeIdentity,
+					pythonSkills,
+					options,
+				);
+				return currentPython;
+			}
+			// Interpreter present + failing runtime probe = ambiguous (transient or corrupt). A
+			// missing interpreter is unambiguously broken and safe to rebuild (no kernel can be
+			// importing from a venv with no interpreter), so only fail clean when the binary exists.
+			if (existsSync(currentPython)) {
+				const probeError = markCleanBootstrapError(
+					new Error(
+						`the live kernel venv (${currentDir}) is recorded for the current runtime but failed its readiness probe; ` +
+							"not rebuilding it -- a transient spawn or out-of-memory failure must not tear down a venv other kernels are importing from. " +
+							"Retry once memory frees up, or set PRIME_AGENT_KERNEL_VENV_FORCE_REBUILD=1 to force a fresh generation.",
+					),
+				);
+				await recordBootstrapFailure(baseDir, generationHash, probeError).catch(() => undefined);
+				throw probeError;
+			}
 		}
 
-		// A full (expensive) rebuild is required. Fail fast while a genuinely failing
-		// rebuild of this same identity is in backoff (do not run uv). A changed identity
-		// has a different generationHash, so a real code change always retries at once.
-		const marker = readBootstrapFailure(baseDir);
-		if (marker && marker.identity === generationHash && Date.now() < marker.nextRetryAt) {
-			throw bootstrapBackoffError(marker);
+		if (!forceRebuild) {
+			// Reuse an already-built generation of this identity (e.g. rollback A -> B -> A) by
+			// publishing it instead of rebuilding. Never removes the live venv.
+			const reusable = await findReusableGeneration(baseDir, generationHash, currentDir, runtimeIdentity);
+			if (reusable) {
+				await publishGeneration(baseDir, reusable);
+				const reusablePython = kernelVenvPython(reusable);
+				await syncPythonSkills(
+					await ensureUv(options),
+					reusable,
+					reusablePython,
+					runtimeIdentity,
+					pythonSkills,
+					options,
+				);
+				await clearBootstrapFailure(baseDir);
+				return reusablePython;
+			}
+
+			// A full (expensive) rebuild is required. Fail fast while a genuinely failing
+			// rebuild of this same identity is in backoff (do not run uv). A changed identity
+			// has a different generationHash, so a real code change always retries at once.
+			const marker = readBootstrapFailure(baseDir);
+			if (marker && marker.identity === generationHash && Date.now() < marker.nextRetryAt) {
+				throw markCleanBootstrapError(bootstrapBackoffError(marker));
+			}
 		}
 
-		const generationPython = kernelVenvPython(generationDir);
+		// Build into a UNIQUE nonce-suffixed sibling. It can never collide with the live or
+		// previous generation, so the working venv stays intact until the new one is validated
+		// and published; no directory the pointer names is ever removed.
+		const buildDir = newGenerationVenvDir(baseDir, generationHash);
+		const generationPython = kernelVenvPython(buildDir);
 		try {
 			reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
-			// Build into the versioned sibling dir. The live venv is never removed here;
-			// for an identity change generationDir differs from the live dir, so the
-			// working venv stays intact until the new one is validated and published.
-			// Only a leftover/partial dir for THIS identity is cleared before rebuilding.
-			if (existsSync(generationDir)) {
-				reportProgress(options, "rebuilding kernel venv");
-				await rm(generationDir, { recursive: true, force: true });
-			}
-			await bootstrapVenv(generationDir, runtimeSourceDir, runtimeIdentity, pythonSkills, options);
+			await bootstrapVenv(buildDir, runtimeSourceDir, runtimeIdentity, pythonSkills, options);
 			// Validate the runtime is actually importable and the base version was recorded
 			// before publishing. Python skills are best-effort (a failed optional skill is
 			// tolerated by syncPythonSkills), so the gate is base readiness, not kernelReady.
-			if (!(await kernelBaseReady(generationPython, generationDir, runtimeIdentity))) {
-				throw new Error(`kernel venv failed its readiness check after bootstrap: ${generationDir}`);
+			if (!(await kernelBaseReady(generationPython, buildDir, runtimeIdentity))) {
+				throw new Error(`kernel venv failed its readiness check after bootstrap: ${buildDir}`);
 			}
 			// Atomic publish (single pointer write), then drop the backoff marker.
-			await publishGeneration(baseDir, generationDir);
+			await publishGeneration(baseDir, buildDir);
 			await clearBootstrapFailure(baseDir);
 		} catch (error) {
+			// The freshly built dir is uniquely ours and was never published, so removing a
+			// failed partial can never disturb a live or previous generation.
+			await rm(buildDir, { recursive: true, force: true }).catch(() => undefined);
 			await recordBootstrapFailure(baseDir, generationHash, error).catch(() => undefined);
 			throw error;
 		}
-		// Reclaim superseded generations only after a successful publish; best-effort.
-		await gcOldGenerations(baseDir);
+		// In-band GC is intentionally NOT run here: a venv dir's mtime is its build time, so it
+		// cannot prove no live kernel still imports from an older generation across a rolling
+		// deploy. Superseded dirs are cleaned by opt-in operator/prebuild-time GC only.
 		reportProgress(options, "✓ ready");
 		return generationPython;
 	} catch (error) {
+		if (isCleanBootstrapError(error)) throw error;
 		throw formatBootstrapFailure(error);
 	} finally {
 		await releaseLock().catch(() => undefined);
@@ -1224,4 +1377,51 @@ export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Pro
 	});
 	inFlightEnsureKernelPython = { key, promise };
 	return promise;
+}
+
+export interface KernelPrebuildOptions {
+	// A deploy prebuild must name its venv family so it only ever touches that family and does
+	// not depend on a forwarded shell env. The public --prime-agent-bootstrap flag sets this;
+	// the internal test prebuild leaves it off and warns on the default base.
+	requireNamedVenv?: boolean;
+}
+
+// One shared prebuild implementation for both the public `--prime-agent-bootstrap` flag
+// (cli/runtime-bootstrap.ts) and the internal test prebuild (bootstrap-cli.ts). It builds (or
+// reuses) the kernel venv for the resolved runtime identity, publishes it, and prints what was
+// resolved so a deploy step can gate on it. Throws on any failure so the caller can exit
+// non-zero. Optional PRIME_AGENT_KERNEL_VENV_GC=1 runs family-exact cleanup of superseded
+// generations at prebuild time (operator opt-in only; never in-band).
+export async function runKernelPrebuild(options: KernelPrebuildOptions = {}): Promise<void> {
+	const namedVenv = process.env.PRIME_AGENT_KERNEL_VENV;
+	if (options.requireNamedVenv && !namedVenv) {
+		throw new Error(
+			"PRIME_AGENT_KERNEL_VENV must be set to prebuild a kernel venv with --prime-agent-bootstrap. " +
+				"Point it at the per-checkout venv base (for example .../kernel-venv-prod) so the prebuild only ever touches that family, " +
+				"then re-run. First Python use will otherwise build the venv lazily.",
+		);
+	}
+	if (process.env.PRIME_AGENT_KERNEL_PYTHON) {
+		throw new Error(
+			"PRIME_AGENT_KERNEL_PYTHON conflicts with a kernel prebuild: the override skips building a venv entirely. " +
+				"Unset PRIME_AGENT_KERNEL_PYTHON to prebuild the kernel venv, or drop --prime-agent-bootstrap to use the override at runtime.",
+		);
+	}
+	if (namedVenv) {
+		console.log(`kernel venv target: ${namedVenv}`);
+	} else {
+		console.warn(
+			"PRIME_AGENT_KERNEL_VENV is not set; bootstrapping the default kernel venv location. " +
+				"Set PRIME_AGENT_KERNEL_VENV to prebuild a specific per-checkout venv at deploy time.",
+		);
+	}
+	const identity = await resolveRuntimeIdentity();
+	console.log(`runtime identity: ${identity}`);
+	const python = await ensureKernelPython();
+	console.log(`kernel venv: ${getKernelVenvDir()}`);
+	console.log(`kernel python: ${python}`);
+	if (process.env.PRIME_AGENT_KERNEL_VENV_GC === "1") {
+		await gcOldGenerations(getBaseKernelVenvDir());
+		console.log("kernel venv gc: reclaimed superseded generations of this base family");
+	}
 }

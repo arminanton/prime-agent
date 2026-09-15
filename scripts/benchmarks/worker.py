@@ -47,6 +47,24 @@ def clean_error(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"[:500]
 
 
+
+def kernel_venv_python(home: Path) -> Path:
+    """Resolve the live kernel venv python via the generation pointer.
+
+    The venv now lives in a published generation dir named by the pointer sibling
+    (kernel-venv.current); fall back to the legacy base path when there is no pointer.
+    """
+    base = home / ".prime/agent/kernel-venv"
+    pointer = home / ".prime/agent/kernel-venv.current"
+    try:
+        current = json.loads(pointer.read_text())["current"]
+        candidate = base.parent / current / "bin" / "python"
+        if candidate.exists():
+            return candidate
+    except (OSError, ValueError, KeyError):
+        pass
+    return base / "bin" / "python"
+
 def environment(user: str) -> dict[str, str]:
     home = str(HOMES / user)
     env = {
@@ -310,7 +328,7 @@ def install(request: Request, side: Side, trial: int) -> None:
         if VERSION not in version:
             raise RuntimeError(f"Installed version does not match the packed release: {version[:100]}")
         verify_installation_format(home, side)
-        if not (home / ".prime/agent/kernel-venv/bin/python").exists():
+        if not kernel_venv_python(home).exists():
             raise RuntimeError("The installer's Python bootstrap did not complete")
         record(side, "install", trial, elapsed)
         if trial == 0:
@@ -465,7 +483,7 @@ def runtime(side: Side, trial: int) -> None:
         "-u",
         "benchmark1",
         "--",
-        str(home / ".prime/agent/kernel-venv/bin/python"),
+        str(kernel_venv_python(home)),
         "-m",
         "rlm.repl",
     ]

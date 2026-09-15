@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	bootstrapGenerationHash,
 	DEFAULT_RLM_EXTRA_IMPORT_NAMES,
 	DEFAULT_RLM_EXTRA_UV_ARGS,
 	ensureKernelPython,
@@ -34,6 +35,7 @@ function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPython
 			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+			generation: bootstrapGenerationHash(runtimeIdentity),
 			pythonSkills: pythonSkills.map((skill) => ({
 				importName: skill.importName,
 				packagePath: skill.packagePath,
@@ -45,17 +47,14 @@ function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPython
 }
 
 function generationIdentityHash(identity: string): string {
-	const key = JSON.stringify({
-		schema: 9,
-		runtime: identity,
-		snapshot: "dill",
-		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
-	});
-	return createHash("sha256").update(key).digest("hex").slice(0, 16);
+	return bootstrapGenerationHash(identity);
 }
 
-function generationVenvDir(baseVenv: string, identity: string = runtimeIdentity): string {
-	return `${baseVenv}-${generationIdentityHash(identity)}`;
+// Each build now lands in a unique nonce-suffixed sibling `<base>-<hash>-<nonce>` that the
+// pointer publishes, so the exact dir name is only known after the build. Resolve the live
+// generation dir the same way production readers do: via getKernelVenvDir().
+function liveGenerationDir(): string {
+	return getKernelVenvDir();
 }
 
 // A minimal prime-agent-runtime source whose content (and therefore identity hash)
@@ -201,11 +200,13 @@ describe("kernel bootstrap", () => {
 	it("bootstraps a missing venv with uv, prime-agent-runtime, and default extra packages", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
-		const gen = generationVenvDir(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
-		await expect(ensureKernelPython()).resolves.toBe(join(gen, "bin", "python"));
-		expect(getKernelVenvDir()).toBe(gen);
+		const python = await ensureKernelPython();
+		const gen = liveGenerationDir();
+		expect(python).toBe(join(gen, "bin", "python"));
+		// The build lands in a unique nonce-suffixed sibling, never at the base path.
+		expect(gen).toMatch(new RegExp(`^${venv}-[0-9a-f]{16}-[0-9a-f]{32}$`));
 
 		const log = readFileSync(logPath, "utf8");
 		expect(log).toContain("python install 3.11");
@@ -223,6 +224,7 @@ describe("kernel bootstrap", () => {
 			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+			generation: bootstrapGenerationHash(runtimeIdentity),
 			pythonSkills: [],
 		});
 		expect(version.runtime).toMatch(/^sha256:/);
@@ -244,9 +246,10 @@ describe("kernel bootstrap", () => {
 		process.env.PRIME_AGENT_RUNTIME_SOURCE = runtimeSource;
 
 		const sourceIdentity = await resolveRuntimeIdentity();
-		const gen = generationVenvDir(venv, sourceIdentity);
-		await expect(ensureKernelPython()).resolves.toBe(join(gen, "bin", "python"));
-		expect(getKernelVenvDir()).toBe(gen);
+		const python = await ensureKernelPython();
+		const gen = liveGenerationDir();
+		expect(python).toBe(join(gen, "bin", "python"));
+		expect(gen).toMatch(new RegExp(`^${venv}-[0-9a-f]{16}-[0-9a-f]{32}$`));
 
 		expect(readFileSync(logPath, "utf8")).toContain(
 			`pip install --python ${join(gen, "bin", "python")} ${runtimeSource} dill`,
@@ -305,13 +308,11 @@ describe("kernel bootstrap", () => {
 		const venv = join(tempDir, "kernel-venv");
 		const progress: string[] = [];
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
-		const gen = generationVenvDir(venv);
 		const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
 		try {
-			await expect(ensureKernelPython({ onProgress: (message) => progress.push(message) })).resolves.toBe(
-				join(gen, "bin", "python"),
-			);
+			const python = await ensureKernelPython({ onProgress: (message) => progress.push(message) });
+			expect(python).toBe(join(liveGenerationDir(), "bin", "python"));
 		} finally {
 			stderrWrite.mockRestore();
 		}
@@ -325,10 +326,11 @@ describe("kernel bootstrap", () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
 		const pythonSkill = createPythonSkill();
-		const gen = generationVenvDir(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
-		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(join(gen, "bin", "python"));
+		const python = await ensureKernelPython({ pythonSkills: [pythonSkill] });
+		const gen = liveGenerationDir();
+		expect(python).toBe(join(gen, "bin", "python"));
 
 		const log = readFileSync(logPath, "utf8");
 		expect(log).toContain(`--editable ${pythonSkill.packagePath}`);
@@ -348,10 +350,11 @@ describe("kernel bootstrap", () => {
 		const venv = join(tempDir, "kernel-venv");
 		const dependencySkill = createPythonSkill("agent-observe");
 		const dependentSkill = createPythonSkillWithDependency("orchestration-heartbeat", "agent-observe");
-		const gen = generationVenvDir(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
-		await expect(ensureKernelPython({ pythonSkills: [dependentSkill] })).resolves.toBe(join(gen, "bin", "python"));
+		const python = await ensureKernelPython({ pythonSkills: [dependentSkill] });
+		const gen = liveGenerationDir();
+		expect(python).toBe(join(gen, "bin", "python"));
 
 		const log = readFileSync(logPath, "utf8");
 		expect(log).toContain(`--editable ${dependencySkill.packagePath}`);
@@ -388,10 +391,10 @@ version = "0.1.0"
 			"orchestration-heartbeat",
 			"prime-agent-skill-attach-image",
 		);
-		const gen = generationVenvDir(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
-		await expect(ensureKernelPython({ pythonSkills: [dependentSkill] })).resolves.toBe(join(gen, "bin", "python"));
+		const python = await ensureKernelPython({ pythonSkills: [dependentSkill] });
+		expect(python).toBe(join(liveGenerationDir(), "bin", "python"));
 
 		const log = readFileSync(logPath, "utf8");
 		expect(log).toContain(`--editable ${dependencySkill.packagePath}`);
@@ -403,10 +406,10 @@ version = "0.1.0"
 		const venv = join(tempDir, "kernel-venv");
 		const dependencySkill = createPythonSkill("gidgethub");
 		const dependentSkill = createPythonSkillWithDependency("orchestration-heartbeat", "gidgethub[httpx]>4.0.0");
-		const gen = generationVenvDir(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
-		await expect(ensureKernelPython({ pythonSkills: [dependentSkill] })).resolves.toBe(join(gen, "bin", "python"));
+		const python = await ensureKernelPython({ pythonSkills: [dependentSkill] });
+		expect(python).toBe(join(liveGenerationDir(), "bin", "python"));
 
 		const log = readFileSync(logPath, "utf8");
 		expect(log).toContain(`--editable ${dependencySkill.packagePath}`);
@@ -445,13 +448,12 @@ dependencies = ["httpx"]
 		const venv = join(tempDir, "kernel-venv");
 		const goodSkill = createPythonSkill("good-skill");
 		const brokenSkill = createPythonSkill("broken-skill");
-		const gen = generationVenvDir(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 		process.env.UV_FAIL_ARG = brokenSkill.packagePath;
 
-		await expect(ensureKernelPython({ pythonSkills: [goodSkill, brokenSkill] })).resolves.toBe(
-			join(gen, "bin", "python"),
-		);
+		const firstPython = await ensureKernelPython({ pythonSkills: [goodSkill, brokenSkill] });
+		const gen = liveGenerationDir();
+		expect(firstPython).toBe(join(gen, "bin", "python"));
 
 		const log = readFileSync(logPath, "utf8");
 		expect(log).toContain(`--editable ${goodSkill.packagePath}`);
@@ -469,6 +471,7 @@ dependencies = ["httpx"]
 		await expect(ensureKernelPython({ pythonSkills: [goodSkill, brokenSkill] })).resolves.toBe(
 			join(gen, "bin", "python"),
 		);
+		expect(liveGenerationDir()).toBe(gen);
 
 		const retryLog = readFileSync(logPath, "utf8");
 		expect(retryLog.split("\n").filter((line) => line.startsWith(`venv ${gen} `))).toHaveLength(1);
@@ -499,10 +502,11 @@ dependencies = ["httpx"]
 				],
 			})}\n`,
 		);
-		const gen = generationVenvDir(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
-		await expect(ensureKernelPython()).resolves.toBe(join(gen, "bin", "python"));
+		const built = await ensureKernelPython();
+		const gen = liveGenerationDir();
+		expect(built).toBe(join(gen, "bin", "python"));
 
 		expect(readFileSync(logPath, "utf8")).toContain(`venv ${gen} --python 3.11 --seed`);
 	});
@@ -510,13 +514,14 @@ dependencies = ["httpx"]
 	it("shares concurrent bootstrap work in one process", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
-		const python = join(generationVenvDir(venv), "bin", "python");
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
-		await expect(Promise.all([ensureKernelPython(), ensureKernelPython()])).resolves.toEqual([python, python]);
+		const [first, second] = await Promise.all([ensureKernelPython(), ensureKernelPython()]);
+		const gen = liveGenerationDir();
+		expect([first, second]).toEqual([join(gen, "bin", "python"), join(gen, "bin", "python")]);
 
 		const log = readFileSync(logPath, "utf8");
-		expect(log.split("\n").filter((line) => line.startsWith(`venv ${generationVenvDir(venv)} `))).toHaveLength(1);
+		expect(log.split("\n").filter((line) => line.startsWith(`venv ${gen} `))).toHaveLength(1);
 	});
 
 	it("reuses a current warm venv without invoking uv", async () => {
@@ -546,21 +551,24 @@ dependencies = ["httpx"]
 				pythonSkills: [],
 			})}\n`,
 		);
-		const gen = generationVenvDir(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
-		await expect(ensureKernelPython()).resolves.toBe(join(gen, "bin", "python"));
+		const built = await ensureKernelPython();
+		const gen = liveGenerationDir();
+		expect(built).toBe(join(gen, "bin", "python"));
 
 		expect(readFileSync(logPath, "utf8")).toContain(`venv ${gen} --python 3.11 --seed`);
 		const version = JSON.parse(readFileSync(join(gen, ".bootstrap-version"), "utf8"));
 		expect(version.runtime).toBe(runtimeIdentity);
 	});
 
-	it("rebuilds a warm venv with a stale rlm runtime", async () => {
+	it("does not rebuild a live venv whose recorded generation matches but readiness probe fails", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
 		const python = join(venv, "bin", "python");
 		mkdirSync(join(venv, "bin"), { recursive: true });
+		// The recorded base matches the current identity, but the interpreter fails the full
+		// readiness probe (a stale rlm, or a transient spawn/out-of-memory failure under load).
 		writeExecutable(
 			python,
 			[
@@ -576,12 +584,13 @@ dependencies = ["httpx"]
 			].join("\n"),
 		);
 		writeBootstrapVersion(venv);
-		const gen = generationVenvDir(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
-		await expect(ensureKernelPython()).resolves.toBe(join(gen, "bin", "python"));
-
-		expect(readFileSync(logPath, "utf8")).toContain(`venv ${gen} --python 3.11 --seed`);
+		// It must fail clean instead of rm-ing and rebuilding the live venv other kernels use.
+		await expect(ensureKernelPython()).rejects.toThrow(/failed its readiness probe/);
+		// uv is never invoked and the live venv is left intact.
+		expect(existsSync(logPath)).toBe(false);
+		expect(existsSync(python)).toBe(true);
 	});
 
 	it("rebuilds a broken venv", async () => {
@@ -589,10 +598,11 @@ dependencies = ["httpx"]
 		const venv = join(tempDir, "kernel-venv");
 		mkdirSync(join(venv, "bin"), { recursive: true });
 		writeBootstrapVersion(venv);
-		const gen = generationVenvDir(venv);
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
-		await expect(ensureKernelPython()).resolves.toBe(join(gen, "bin", "python"));
+		const built = await ensureKernelPython();
+		const gen = liveGenerationDir();
+		expect(built).toBe(join(gen, "bin", "python"));
 
 		expect(readFileSync(logPath, "utf8")).toContain(`venv ${gen} --python 3.11 --seed`);
 	});
@@ -607,15 +617,15 @@ dependencies = ["httpx"]
 		// A first generation builds and publishes cleanly.
 		writeRuntimeSource(runtimeSource, "spawn = 1\n");
 		const first = await resolveRuntimeIdentity();
-		const genA = generationVenvDir(venv, first);
-		await expect(ensureKernelPython()).resolves.toBe(join(genA, "bin", "python"));
+		const genAPython = await ensureKernelPython();
+		const genA = liveGenerationDir();
+		expect(genAPython).toBe(join(genA, "bin", "python"));
 		expect(getKernelVenvDir()).toBe(genA);
 
 		// A runtime change forces a new generation, but this rebuild fails.
 		writeRuntimeSource(runtimeSource, "spawn = 2\n");
 		const second = await resolveRuntimeIdentity();
-		const genB = generationVenvDir(venv, second);
-		expect(genB).not.toBe(genA);
+		expect(second).not.toBe(first);
 		process.env.UV_FAIL_ARG = "dill";
 
 		await expect(ensureKernelPython()).rejects.toThrow(/Failed to set up the Python kernel runtime/);
@@ -623,6 +633,9 @@ dependencies = ["httpx"]
 		// The previous good generation is untouched and still the published one.
 		expect(existsSync(join(genA, "bin", "python"))).toBe(true);
 		expect(getKernelVenvDir()).toBe(genA);
+		// The failed build's unique dir was removed; only the good generation remains.
+		const familyDirs = readdirSync(dirname(venv)).filter((name) => name.startsWith(`${basename(venv)}-`));
+		expect(familyDirs).toEqual([basename(genA)]);
 		// A backoff marker for the failing identity is recorded.
 		const marker = JSON.parse(readFileSync(`${venv}.bootstrap-failed`, "utf8"));
 		expect(marker.identity).toBe(generationIdentityHash(second));
@@ -672,9 +685,11 @@ dependencies = ["httpx"]
 		);
 		const logPath = installFakeUv();
 		const identity = await resolveRuntimeIdentity();
-		const gen = generationVenvDir(venv, identity);
 
-		await expect(ensureKernelPython()).resolves.toBe(join(gen, "bin", "python"));
+		const built = await ensureKernelPython();
+		const gen = liveGenerationDir();
+		expect(built).toBe(join(gen, "bin", "python"));
+		expect(gen).toMatch(new RegExp(`^${venv}-${generationIdentityHash(identity)}-[0-9a-f]{32}$`));
 		expect(readFileSync(logPath, "utf8")).toContain(`venv ${gen} --python 3.11 --seed`);
 		expect(getKernelVenvDir()).toBe(gen);
 		// A successful build clears the stale marker.
@@ -689,9 +704,8 @@ dependencies = ["httpx"]
 		process.env.PRIME_AGENT_RUNTIME_SOURCE = runtimeSource;
 
 		writeRuntimeSource(runtimeSource, "spawn = 1\n");
-		const first = await resolveRuntimeIdentity();
-		const genA = generationVenvDir(venv, first);
 		await ensureKernelPython();
+		const genA = liveGenerationDir();
 
 		// A single small pointer names the live generation; the base path is never a venv,
 		// so publishing is one write and never a directory rename (uv writes absolute shebangs).
@@ -703,14 +717,113 @@ dependencies = ["httpx"]
 
 		// Publishing a new generation records the prior one for rollback and keeps it.
 		writeRuntimeSource(runtimeSource, "spawn = 2\n");
-		const second = await resolveRuntimeIdentity();
-		const genB = generationVenvDir(venv, second);
 		await ensureKernelPython();
+		const genB = liveGenerationDir();
+		expect(genB).not.toBe(genA);
 		const pointer2 = JSON.parse(readFileSync(`${venv}.current`, "utf8"));
 		expect(pointer2.current).toBe(basename(genB));
 		expect(pointer2.previous).toBe(basename(genA));
 		expect(getKernelVenvDir()).toBe(genB);
 		expect(existsSync(join(genA, "bin", "python"))).toBe(true);
+	});
+
+	it("leaves a published generation intact and does not rerun uv when it later fails readiness", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		// Build and publish a real generation.
+		await ensureKernelPython();
+		const gen = liveGenerationDir();
+		const genPython = join(gen, "bin", "python");
+		expect(existsSync(genPython)).toBe(true);
+		writeFileSync(join(gen, "CANARY"), "live");
+		const uvLogAfterBuild = readFileSync(logPath, "utf8");
+
+		// Its readiness probe now fails (an OOM-killed / ENOMEM probe under memory pressure):
+		// the interpreter is present but the readiness check exits non-zero.
+		writeExecutable(
+			genPython,
+			[
+				"#!/bin/sh",
+				'if [ "$1" = "-c" ]; then',
+				'  case "$2" in',
+				'    "import rlm") exit 0 ;;',
+				"    *) exit 1 ;;",
+				"  esac",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+
+		await expect(ensureKernelPython()).rejects.toThrow(/failed its readiness probe/);
+		// The live dir and its contents survive; no rm, and uv did not run again.
+		expect(existsSync(genPython)).toBe(true);
+		expect(readFileSync(join(gen, "CANARY"), "utf8")).toBe("live");
+		expect(getKernelVenvDir()).toBe(gen);
+		expect(readFileSync(logPath, "utf8")).toBe(uvLogAfterBuild);
+	});
+
+	it("reuses an existing base-ready generation on rollback (A -> B -> A) with no uv rerun or rm", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const runtimeSource = join(tempDir, "runtime-src");
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.PRIME_AGENT_RUNTIME_SOURCE = runtimeSource;
+		const venvBuilds = (log: string) => log.split("\n").filter((line) => line.startsWith("venv ")).length;
+
+		// Build generation A.
+		writeRuntimeSource(runtimeSource, "spawn = 1\n");
+		await ensureKernelPython();
+		const genA = liveGenerationDir();
+		writeFileSync(join(genA, "CANARY"), "A");
+
+		// Build generation B (a runtime change).
+		writeRuntimeSource(runtimeSource, "spawn = 2\n");
+		await ensureKernelPython();
+		const genB = liveGenerationDir();
+		expect(genB).not.toBe(genA);
+		const buildsBefore = venvBuilds(readFileSync(logPath, "utf8"));
+
+		// Roll back to A: it must be re-published, not rebuilt.
+		writeRuntimeSource(runtimeSource, "spawn = 1\n");
+		const backToA = await ensureKernelPython();
+		expect(backToA).toBe(join(genA, "bin", "python"));
+		expect(getKernelVenvDir()).toBe(genA);
+		// A (and its canary) is intact -- never removed and never rebuilt; B survives too.
+		expect(readFileSync(join(genA, "CANARY"), "utf8")).toBe("A");
+		expect(existsSync(join(genB, "bin", "python"))).toBe(true);
+		// No new uv `venv` build ran for the rollback (zero uv builds).
+		expect(venvBuilds(readFileSync(logPath, "utf8"))).toBe(buildsBefore);
+		// A is live again with B kept as the rollback previous.
+		const pointer = JSON.parse(readFileSync(`${venv}.current`, "utf8"));
+		expect(pointer.current).toBe(basename(genA));
+		expect(pointer.previous).toBe(basename(genB));
+	});
+
+	it("a default-base ensure never touches a sibling venv family", async () => {
+		const logPath = installFakeUv();
+		// This process uses the DEFAULT base (no PRIME_AGENT_KERNEL_VENV); HOME is the sandbox.
+		const agentDir = join(tempDir, ".prime", "agent");
+		mkdirSync(agentDir, { recursive: true });
+		// A prod family and a "next" sibling that a loose prefix match would have deleted.
+		const prodGen = join(agentDir, "kernel-venv-prod-0123456789abcdef");
+		const prodBase = join(agentDir, "kernel-venv-prod");
+		const nextSibling = join(agentDir, "kernel-venv-next");
+		for (const dir of [prodGen, prodBase, nextSibling]) {
+			mkdirSync(join(dir, "bin"), { recursive: true });
+			writeFileSync(join(dir, "CANARY"), "keep");
+		}
+
+		// A full default-base build + publish (in-band GC is disabled).
+		await ensureKernelPython();
+		expect(readFileSync(logPath, "utf8")).toContain("venv ");
+
+		// Every sibling family survives untouched.
+		for (const dir of [prodGen, prodBase, nextSibling]) {
+			expect(readFileSync(join(dir, "CANARY"), "utf8")).toBe("keep");
+		}
 	});
 
 	it("uses PRIME_AGENT_KERNEL_PYTHON as an override contract", async () => {

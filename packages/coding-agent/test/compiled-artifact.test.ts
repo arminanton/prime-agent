@@ -382,7 +382,11 @@ writeFileSync(join(process.cwd(), "hot-runtime.json"), JSON.stringify({ value, e
 		expect(result.code, `${result.stderr}\n${existsSync(uvLog) ? readFileSync(uvLog, "utf8") : ""}`).toBe(0);
 		expect(result.stdout).toContain("artifact-python-result 42");
 		expect(result.stdout).toContain("artifact-shell-ok");
-		const bootstrap = JSON.parse(readFileSync(join(home, ".prime/agent/kernel-venv/.bootstrap-version"), "utf8"));
+		// The venv now lives in a published generation dir named by the pointer, not at the base path.
+		const pointer = JSON.parse(readFileSync(join(home, ".prime/agent/kernel-venv.current"), "utf8"));
+		const bootstrap = JSON.parse(
+			readFileSync(join(home, ".prime/agent", pointer.current, ".bootstrap-version"), "utf8"),
+		);
 		expect(bootstrap.runtime).toMatch(/^sha256:/);
 		expect(bootstrap.pythonSkills.length).toBeGreaterThan(0);
 		expect(
