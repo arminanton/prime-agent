@@ -865,6 +865,24 @@ dependencies = ["httpx"]
 		expect(pointer.current).toBe(basename(gen));
 	});
 
+	it("runKernelPrebuild without requireNamedVenv prebuilds the DEFAULT family and exits 0 with no named venv (M8)", async () => {
+		const logPath = installFakeUv();
+		// HOME is the sandbox (beforeEach); no PRIME_AGENT_KERNEL_VENV. This is the native-installer /
+		// public-flag path with PRIME_AGENT_KERNEL_VENV_REQUIRED unset: warn + build the default family.
+		const runtimeSource = join(tempDir, "runtime-src");
+		writeRuntimeSource(runtimeSource, "spawn = 1\n");
+		process.env.PRIME_AGENT_RUNTIME_SOURCE = runtimeSource;
+		mkdirSync(join(tempDir, ".prime", "agent"), { recursive: true });
+		delete process.env.PRIME_AGENT_KERNEL_VENV;
+
+		await runKernelPrebuild({ requireNamedVenv: false });
+
+		const gen = getKernelVenvDir();
+		expect(gen).toMatch(/kernel-venv-[0-9a-f]{16}-[0-9a-f]{32}$/);
+		expect(existsSync(join(gen, "bin", "python"))).toBe(true);
+		expect(readFileSync(logPath, "utf8")).toContain("venv ");
+	});
+
 	it("runKernelPrebuild with requireNamedVenv rejects a missing PRIME_AGENT_KERNEL_VENV", async () => {
 		installFakeUv();
 		delete process.env.PRIME_AGENT_KERNEL_VENV;
