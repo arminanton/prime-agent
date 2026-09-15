@@ -58,7 +58,15 @@ export PRIME_AGENT_KERNEL_VENV=/home/ndsadmin/.prime/agent/kernel-venv-prod
 export PRIME_AGENT_RUNTIME_SOURCE=/mnt/devvm/custom/prime/prime-agent-runtime
 # Deploy-time prebuild via the REAL public flag: prints the runtime identity + resolved venv +
 # python, exits non-zero on failure (a deploy blocker), and only touches the
-# PRIME_AGENT_KERNEL_VENV family.
+# PRIME_AGENT_KERNEL_VENV family. Set PRIME_AGENT_KERNEL_VENV_REQUIRED=1 so the public flag is
+# strict (it fails instead of falling back to the default family when PRIME_AGENT_KERNEL_VENV is
+# unset).
+#
+# F8 (one-time first-boot skill sync): the prebuild builds the base generation but installs NO
+# Python skills. The first real session syncs skills IN PLACE into the live generation (a fast
+# uv-pip step, no rebuild). Trigger it once with a single throwaway session BEFORE putting the
+# daemon under load, so the first user turn does not pay the skill-sync latency:
+#   prime-agent -p "noop" >/dev/null 2>&1 || true
 node dist/cli.js --prime-agent-bootstrap
 ```
 
@@ -108,13 +116,23 @@ Files are in deploy/deploy-a/. Review each, then apply under this health gate. R
   telemetry AND after Deploy B lands the crash-loop breaker. Keep MemorySwapMax tiny (1G or 0):
   swap thrash IS the freeze. Do NOT install prime-agent-daemon.service (WITHDRAWN; it does not
   fit the self-relaunch update-restart model).
-- Start the scoped daemon and VERIFY containment BEFORE touching the soft cap: with
-  PRIME_AGENT_DAEMON_SCOPE=1 set, start the daemon, then confirm the supervisor, workers, and
-  kernels are all under prime-agent.slice (`systemd-cgls --user`; every prime-agent/python pid is
-  inside a `*.scope` under prime-agent.slice, NOT session-3.scope). Check the client-errors log
-  for a "retrying UNSCOPED" warning: if present, the scoped launch FELL BACK and containment is
-  NOT applied - STOP and fix systemd-run / the slice before continuing. A containment failure
-  BLOCKS the rest of the cutover.
+- Start the scoped daemon and VERIFY containment + the EFFECTIVE CAP BEFORE touching the soft cap:
+  with PRIME_AGENT_DAEMON_SCOPE=1 set, start the daemon through the AUTO-LAUNCH path (run a normal
+  client command such as `prime-agent list`, which triggers ensureDaemonRunning). Do NOT start it
+  with `prime-agent start` or an explicit `prime-agent --mode daemon`: those spawn the daemon
+  directly (daemon-command.ts runStart at :696) and BYPASS the systemd-run scope wrapper, so the
+  daemon lands unscoped. Then run the verifier:
+  `EXPECT_MEMORY_MAX_BYTES=<slice MemoryMax in bytes> EXPECT_MEMORY_SWAP_MAX_BYTES=<slice MemorySwapMax in bytes> deploy/deploy-a/verify-containment.sh`.
+  It resolves THIS user's prime-agent.slice via its ControlGroup and asserts: the memory controller
+  is present, memory.max and memory.swap.max are BOUNDED integers (rejecting "max"/infinity/missing
+  and any value that does not match the expected bytes), memory.oom.group=0, every prime-agent /
+  python process is under the slice, and the client-errors log has NO scope-fallback marker
+  ("cgroup containment NOT applied", which BOTH fallback outcomes now carry - systemd-run
+  missing/non-exec AND the confirmed-early-exit UNSCOPED retry). Membership + memory.current alone
+  is NOT enough: an implicitly created UNCAPPED prime-agent.slice of the same name would pass a
+  membership check but fail the cap assertion. `systemd-cgls --user` remains a useful visual cross
+  check (every prime-agent/python pid inside a `*.scope` under prime-agent.slice, NOT
+  session-3.scope). Any verifier failure BLOCKS the rest of the cutover.
 - ONLY after containment is verified, remove the user-400.slice MemoryHigh=50G SOFT throttle -
   it IS the freeze, and while it is kept it still throttles the whole user slice (the daemon
   scope sits under it). It is set in TWO drop-ins on this host
@@ -126,12 +144,12 @@ Files are in deploy/deploy-a/. Review each, then apply under this health gate. R
 - earlyoom (HOST BACKUP only; the cgroup MemoryMax is PRIMARY): apply
   deploy/deploy-a/earlyoom.conf to /etc/default/earlyoom (this host's earlyoom.service uses
   EnvironmentFile=/etc/default/earlyoom), then restart earlyoom. It uses absolute -M/-S in KiB
-  (with -M above freeze-day MemAvailable), NO inner quotes, and --prefer `python` (a kernel is
-  the right first victim; the `prime-agent` supervisor is avoided so killing it does not orphan
-  every worker). Numbers are PROVISIONAL.
-- Telemetry: start deploy/deploy-a/telemetry-sampler.sh (it auto-discovers the prime-agent.slice
-  cgroup) so you can measure memory.current / memory.swap.current before ratcheting MemoryMax
-  down.
+  (with -M above freeze-day MemAvailable), NO inner quotes, and --prefer `python[0-9.]*` (matches
+  python/python3/python3.11 comms; a kernel is the right first victim; the `prime-agent`
+  supervisor is avoided so killing it does not orphan every worker). Numbers are PROVISIONAL.
+- Telemetry: start deploy/deploy-a/telemetry-sampler.sh (it resolves the prime-agent.slice cgroup
+  via THIS user's ControlGroup, not the first same-named dir) so you can measure memory.current /
+  memory.swap.current before ratcheting MemoryMax down.
 
 ## 4. Update-restart onto the new build
 
@@ -142,9 +160,12 @@ prime-agent.slice cap (the auto-named scope avoids a unit-name collision on rest
 
 ## 5. Post-cutover verification (health gate)
 
-- Containment holds: `systemd-cgls --user` shows the supervisor + workers + kernels under a
-  `*.scope` in prime-agent.slice, NOT session-3.scope. No "retrying UNSCOPED" warning in the
-  client-errors log.
+- Containment + effective cap hold: re-run
+  `EXPECT_MEMORY_MAX_BYTES=... EXPECT_MEMORY_SWAP_MAX_BYTES=... deploy/deploy-a/verify-containment.sh`
+  after the restart (it must exit 0 again: bounded memory.max/memory.swap.max, memory.oom.group=0,
+  all prime-agent/python under prime-agent.slice, no scope-fallback marker in the client-errors
+  log). `systemd-cgls --user` shows the supervisor + workers + kernels under a `*.scope` in
+  prime-agent.slice, NOT session-3.scope.
 - `prime-agent list` shows the expected sessions; the main conversation resumes.
 - Telemetry lines show slice memory.current well under MemoryMax and swap use flat.
 - A test scheduled wake fires (A.3): a session with a due job wakes without a live worker.
@@ -153,9 +174,14 @@ prime-agent.slice cap (the auto-named scope avoids a unit-name collision on rest
 ## R. Rollback
 
 - Real rollback = the PREVIOUS BUILD plus PRIME_AGENT_KERNEL_VENV pointed at the untouched legacy
-  `~/.prime/agent/kernel-venv` (the new code never deletes it). Restart the daemon from the
-  previous build directory (its launcher) with PRIME_AGENT_KERNEL_VENV set to the legacy base;
-  sessions persist on disk and reload. Do NOT roll back by editing `<base>.current`: a venv-only
+  `~/.prime/agent/kernel-venv` (the new code never deletes it) AND a matching
+  PRIME_AGENT_RUNTIME_SOURCE. Restart the daemon from the previous build directory (its launcher)
+  with PRIME_AGENT_KERNEL_VENV set to the legacy base and PRIME_AGENT_RUNTIME_SOURCE restored to
+  the value that previous build used (or unset so it uses that build's shipped runtime copy):
+  the generation identity is hashed from the runtime source, so leaving RUNTIME_SOURCE pointed at
+  the new checkout would make the legacy venv non-current and force a full rebuild. Keep both env
+  values identical across EVERY launching shell (collectDaemonLaunchEnv forwards the client env).
+  Sessions persist on disk and reload. Do NOT roll back by editing `<base>.current`: a venv-only
   pointer edit only makes sense together with a matching build rollback, and a pre-Deploy-A build
   does not understand the pointer.
 - A within-Deploy-A venv rollback (same new build) can re-publish the previous generation: A.2

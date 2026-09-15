@@ -8,8 +8,9 @@
 # addition inside the supervisor; this script covers the host-visible signals now.
 #
 # The daemon scope is auto-named, so by default this samples the parent SLICE (the aggregate of
-# every daemon scope + its workers + kernels), auto-discovered under the cgroup tree. Override
-# with SCOPE_CGROUP to sample a specific cgroup dir.
+# every daemon scope + its workers + kernels), resolved via THIS user's ControlGroup for the slice
+# (not the first same-named dir under the tree). Override with SCOPE_CGROUP to sample a specific
+# cgroup dir.
 #
 # Usage: [SCOPE_CGROUP=/sys/fs/cgroup/.../prime-agent.slice] [INTERVAL=30] \
 #        [OUT=~/.prime/agent/telemetry.jsonl] [MAX_BYTES=10485760] telemetry-sampler.sh
@@ -21,11 +22,19 @@ SLICE_NAME="${SLICE_NAME:-prime-agent.slice}"
 uid=$(id -u)
 
 discover_slice_cgroup() {
-  # Prefer an explicit override, else find the slice dir once under the cgroup2 tree.
+  # Prefer an explicit override.
   if [ -n "${SCOPE_CGROUP:-}" ]; then
     printf '%s\n' "$SCOPE_CGROUP"
     return
   fi
+  # Resolve THIS user's slice via its ControlGroup, not the first same-named dir found under the
+  # tree (a bare `find -name` could match another user's identically named slice).
+  rel=$(systemctl --user show -p ControlGroup --value "$SLICE_NAME" 2>/dev/null || printf '')
+  if [ -n "$rel" ] && [ -d "/sys/fs/cgroup$rel" ]; then
+    printf '%s\n' "/sys/fs/cgroup$rel"
+    return
+  fi
+  # Last-resort fallback (may match another user's slice): the previous best-effort search.
   find /sys/fs/cgroup -type d -name "$SLICE_NAME" 2>/dev/null | head -n1
 }
 

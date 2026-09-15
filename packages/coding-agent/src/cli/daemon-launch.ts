@@ -27,6 +27,10 @@ import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } fro
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
 const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
+// The marker BOTH scoped-fallback log lines carry (systemd-run missing/non-executable, and a
+// confirmed early-exit UNSCOPED retry) so the cutover gate can detect EVERY fallback outcome from
+// one grep, not just the "retrying UNSCOPED" phrasing.
+export const DAEMON_SCOPE_FALLBACK_MARKER = "cgroup containment NOT applied";
 const DAEMON_STARTUP_LOG_TAIL_BYTES = 4 * 1024;
 const DAEMON_STARTUP_EXIT_GRACE_MS = 2_000;
 
@@ -396,8 +400,7 @@ export function buildDaemonScopeInvocation(command: string, args: readonly strin
 			command,
 			args: [...args],
 			scoped: false,
-			warning:
-				"PRIME_AGENT_DAEMON_SCOPE=1 but an executable systemd-run was not found on PATH; launching the daemon unscoped.",
+			warning: `PRIME_AGENT_DAEMON_SCOPE=1 but an executable systemd-run was not found on PATH; launching the daemon unscoped (${DAEMON_SCOPE_FALLBACK_MARKER}).`,
 		};
 	}
 	const slice = process.env.PRIME_AGENT_DAEMON_SLICE ?? "prime-agent.slice";
@@ -470,10 +473,6 @@ Then retry the original command.`,
 		(candidate) => attemptDaemonLaunch(candidate, socketPath, env, spawnCwd ?? process.cwd()),
 	);
 }
-
-// The marker both scoped-fallback log lines carry (systemd-run missing/non-exec, and a confirmed
-// early-exit retry) so the cutover gate can detect EVERY fallback outcome, not just one phrasing.
-export const DAEMON_SCOPE_FALLBACK_MARKER = "cgroup containment NOT applied";
 
 /**
  * Run one daemon launch and, for a SCOPED launch, retry UNSCOPED exactly once but ONLY when the
