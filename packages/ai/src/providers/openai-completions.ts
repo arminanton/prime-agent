@@ -142,6 +142,72 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 	return "short";
 }
 
+/**
+ * Fetch one non-streaming completion and expose it through the same chunk
+ * iterator the streaming path consumes: message fields become a single delta,
+ * so reasoning text, tool calls, usage, and finish reason flow unchanged.
+ */
+async function createNonStreamingChunkSource(
+	client: OpenAI,
+	params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+	requestOptions: { signal?: AbortSignal; timeout?: number },
+): Promise<{ data: AsyncIterable<ChatCompletionChunk>; response: Response }> {
+	const {
+		stream: _stream,
+		stream_options: _streamOptions,
+		...rest
+	} = params as typeof params & {
+		stream_options?: unknown;
+	};
+	const { data: completion, response } = await client.chat.completions
+		.create({ ...rest, stream: false }, requestOptions)
+		.withResponse();
+	const chunks: ChatCompletionChunk[] = [];
+	const choices = Array.isArray(completion.choices) ? completion.choices : [];
+	for (const choice of choices) {
+		const message = choice.message as unknown as Record<string, unknown>;
+		const { role: _role, content, tool_calls, refusal: _refusal, ...reasoningFields } = message;
+		const toolCalls = Array.isArray(tool_calls)
+			? tool_calls.map((toolCall, index) => ({ index, ...(toolCall as Record<string, unknown>) }))
+			: undefined;
+		chunks.push({
+			id: completion.id,
+			object: "chat.completion.chunk",
+			created: completion.created,
+			model: completion.model,
+			choices: [
+				{
+					index: choice.index,
+					delta: {
+						...reasoningFields,
+						...(typeof content === "string" ? { content } : {}),
+						...(toolCalls ? { tool_calls: toolCalls } : {}),
+					} as ChatCompletionChunk.Choice.Delta,
+					finish_reason: choice.finish_reason,
+					logprobs: null,
+				},
+			],
+			...(completion.usage ? { usage: completion.usage } : {}),
+		});
+	}
+	if (chunks.length === 0) {
+		chunks.push({
+			id: completion.id,
+			object: "chat.completion.chunk",
+			created: completion.created,
+			model: completion.model,
+			choices: [],
+			...(completion.usage ? { usage: completion.usage } : {}),
+		});
+	}
+	return {
+		data: (async function* () {
+			for (const chunk of chunks) yield chunk;
+		})(),
+		response,
+	};
+}
+
 export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenAICompletionsOptions> = (
 	model: Model<"openai-completions">,
 	context: Context,
@@ -196,9 +262,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 			};
-			const { data: openaiStream, response } = await client.chat.completions
-				.create(params, requestOptions)
-				.withResponse();
+			const { data: openaiStream, response } = compat.nonStreaming
+				? await createNonStreamingChunkSource(client, params, requestOptions)
+				: await client.chat.completions.create(params, requestOptions).withResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
@@ -384,12 +450,24 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 						}
 					}
 
+					const reasoningOpaque = (choice.delta as { reasoning_opaque?: unknown }).reasoning_opaque;
 					if (choice?.delta?.tool_calls) {
 						for (const toolCall of choice.delta.tool_calls) {
 							const block = ensureToolCallBlock(toolCall);
 							if (!block.id && toolCall.id) {
 								block.id = toolCall.id;
 								toolCallBlocksById.set(toolCall.id, block);
+							}
+							// Copilot (Gemini) sends the encrypted reasoning state once, on the
+							// tool_calls delta; keep it with the call so the continuation can
+							// resume the model's reasoning instead of re-deriving it.
+							if (
+								model.provider === "github-copilot" &&
+								typeof reasoningOpaque === "string" &&
+								reasoningOpaque.length > 0 &&
+								!block.thoughtSignature
+							) {
+								block.thoughtSignature = encodeCopilotReasoningOpaque(reasoningOpaque);
 							}
 							if (!block.name && toolCall.function?.name) {
 								block.name = toolCall.function.name;
@@ -590,6 +668,45 @@ function createClient(
 	});
 }
 
+const COPILOT_REASONING_OPAQUE_PREFIX = "copilot-reasoning-opaque:";
+
+function encodeCopilotReasoningOpaque(opaque: string): string {
+	return `${COPILOT_REASONING_OPAQUE_PREFIX}${opaque}`;
+}
+
+/** Returns the opaque blob when the signature was recorded by the Copilot path. */
+export function decodeCopilotReasoningOpaque(signature: string | undefined): string | undefined {
+	if (!signature || !signature.startsWith(COPILOT_REASONING_OPAQUE_PREFIX)) return undefined;
+	const opaque = signature.slice(COPILOT_REASONING_OPAQUE_PREFIX.length);
+	return opaque.length > 0 ? opaque : undefined;
+}
+
+const COPILOT_EFFORT_PREFERENCE = ["max", "xhigh", "high", "medium", "low", "minimal"] as const;
+
+/**
+ * Pick the reasoning_effort for a Copilot completions request from the model's
+ * catalog map: the requested level when the catalog maps it, else the highest
+ * level the catalog lists. Returns undefined when nothing is safe to send.
+ */
+export function resolveCopilotCompletionsEffort(
+	model: Model<"openai-completions">,
+	requested: string | undefined,
+): string | undefined {
+	const map = model.thinkingLevelMap;
+	if (requested) {
+		const mapped = map?.[requested as keyof typeof map];
+		if (mapped === null) return undefined;
+		if (typeof mapped === "string") return mapped;
+		return map ? undefined : requested;
+	}
+	if (!map) return undefined;
+	for (const level of COPILOT_EFFORT_PREFERENCE) {
+		const mapped = map[level];
+		if (typeof mapped === "string") return mapped;
+	}
+	return undefined;
+}
+
 function buildParams(
 	model: Model<"openai-completions">,
 	context: Context,
@@ -651,23 +768,25 @@ function buildParams(
 	}
 
 	if (model.provider === "github-copilot" && model.reasoning && options?.reasoningEnabled !== false) {
-		// Copilot runs reasoning server-side but returns only the opaque
-		// encrypted handle unless the request asks for a summary, so the visible
-		// reasoning_text never arrives. Send a nested reasoning object with a
-		// detailed summary (matching the official CLI) so the thinking stream is
-		// readable. These models do not take an explicit effort scale
-		// (supportsReasoningEffort is false), so honor a requested effort when
-		// the catalog maps it and otherwise fall back to medium. Skipped when the
-		// caller explicitly disables reasoning. A null catalog mapping is an
-		// explicit rejection, so omit effort instead of sending an unsupported
-		// Prime level. Without a request, use medium only when the catalog allows it.
-		const requestedEffort = options?.reasoningEffort;
-		const mappedEffort = requestedEffort ? model.thinkingLevelMap?.[requestedEffort] : model.thinkingLevelMap?.medium;
-		const effort = requestedEffort ? (mappedEffort === undefined ? requestedEffort : mappedEffort) : mappedEffort;
-		(params as any).reasoning = {
-			...(effort ? { effort } : {}),
-			summary: "detailed",
-		};
+		// Copilot /chat/completions (Gemini family) takes the official CLI body: a
+		// top-level reasoning_effort validated against the catalog's supported
+		// efforts, temperature 1, a validated tool_choice, and snippy disabled.
+		// The server streams reasoning_text on its own; a nested reasoning object
+		// does not change that (live probes 2026-09-15). Reasoning tokens are not
+		// billed on Copilot, so the default effort is the highest listed level.
+		// A null catalog mapping is an explicit rejection: the server answers
+		// invalid_reasoning_effort, so the effort is omitted instead.
+		const effort = resolveCopilotCompletionsEffort(model, options?.reasoningEffort);
+		if (effort) {
+			(params as any).reasoning_effort = effort;
+		}
+		if (params.temperature === undefined) {
+			params.temperature = 1;
+		}
+		if (params.tools && params.tools.length > 0 && !params.tool_choice) {
+			(params as any).tool_choice = "validated";
+		}
+		(params as any).snippy = { enabled: false };
 	} else if (compat.thinkingFormat === "zai" && model.reasoning) {
 		(params as any).enable_thinking = !!options?.reasoningEffort;
 	} else if (compat.thinkingFormat === "qwen" && model.reasoning) {
@@ -996,8 +1115,21 @@ export function convertMessages(
 						arguments: JSON.stringify(tc.arguments),
 					},
 				}));
+				const copilotOpaque = toolCalls
+					.map((tc) => decodeCopilotReasoningOpaque(tc.thoughtSignature))
+					.find(Boolean);
+				if (model.provider === "github-copilot" && copilotOpaque) {
+					// CLI replay shape: the visible summary as reasoning_text plus the opaque blob.
+					const record = assistantMsg as unknown as Record<string, unknown>;
+					if (typeof record.reasoning_text !== "string") {
+						record.reasoning_text = nonEmptyThinkingBlocks
+							.map((block) => sanitizeSurrogates(block.thinking))
+							.join("\n");
+					}
+					record.reasoning_opaque = copilotOpaque;
+				}
 				const reasoningDetails = toolCalls
-					.filter((tc) => tc.thoughtSignature)
+					.filter((tc) => tc.thoughtSignature && !decodeCopilotReasoningOpaque(tc.thoughtSignature))
 					.map((tc) => {
 						try {
 							return JSON.parse(tc.thoughtSignature!);
@@ -1246,6 +1378,7 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		cacheControlFormat,
 		sendSessionAffinityHeaders: false,
 		supportsLongCacheRetention: !(isCloudflareWorkersAI || isCloudflareAiGateway),
+		nonStreaming: false,
 	};
 }
 
@@ -1278,5 +1411,6 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		cacheControlFormat: model.compat.cacheControlFormat ?? detected.cacheControlFormat,
 		sendSessionAffinityHeaders: model.compat.sendSessionAffinityHeaders ?? detected.sendSessionAffinityHeaders,
 		supportsLongCacheRetention: model.compat.supportsLongCacheRetention ?? detected.supportsLongCacheRetention,
+		nonStreaming: model.compat.nonStreaming ?? detected.nonStreaming,
 	};
 }

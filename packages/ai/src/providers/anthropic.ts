@@ -48,6 +48,12 @@ import {
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import {
+	estimatePromptTokens,
+	parseCopilotOutputCapError,
+	rememberCopilotClaudeOutputCap,
+	resolveCopilotClaudeMaxTokens,
+} from "./copilot-output-caps.js";
+import {
 	buildCopilotDynamicHeaders,
 	hasCopilotVisionInput,
 	sanitizeCopilotModelHeaders,
@@ -460,6 +466,29 @@ async function* iterateAnthropicEvents(
 	}
 }
 
+/**
+ * Send the request; when Copilot's Anthropic backend rejects `max_tokens` above
+ * its real cap, remember the cap for this model and retry once at exactly the cap.
+ */
+async function createWithOutputCapRetry(
+	client: Anthropic,
+	model: Model<"anthropic-messages">,
+	params: MessageCreateParamsStreaming,
+	requestOptions: { signal?: AbortSignal; timeout?: number },
+): Promise<Response> {
+	try {
+		return await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
+	} catch (error) {
+		if (model.provider !== "github-copilot") throw error;
+		const status = (error as { status?: unknown }).status;
+		const message = error instanceof Error ? error.message : String(error);
+		const cap = status === 400 ? parseCopilotOutputCapError(message) : undefined;
+		if (cap === undefined || params.max_tokens <= cap) throw error;
+		rememberCopilotClaudeOutputCap(model, cap);
+		return await client.messages.create({ ...params, max_tokens: cap, stream: true }, requestOptions).asResponse();
+	}
+}
+
 export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	model: Model<"anthropic-messages">,
 	context: Context,
@@ -535,7 +564,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 			};
-			const response = await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
+			const response = await createWithOutputCapRetry(client, model, params, requestOptions);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			const requestId = response.headers.get("request-id") ?? undefined;
 			stream.push({ type: "start", partial: output });
@@ -974,6 +1003,18 @@ function createClient(
 	return { client, isOAuthToken: false };
 }
 
+/**
+ * Copilot-served Claude uses the probed server output cap (128K, 64K haiku)
+ * clamped to the remaining context; every other Anthropic host keeps the
+ * conservative third-of-catalog default unless the caller sets maxTokens.
+ */
+function resolveMaxTokens(model: Model<"anthropic-messages">, context: Context, options?: AnthropicOptions): number {
+	if (options?.maxTokens) return options.maxTokens;
+	const copilotCap = resolveCopilotClaudeMaxTokens(model, estimatePromptTokens(context));
+	if (copilotCap !== undefined) return copilotCap;
+	return (model.maxTokens / 3) | 0;
+}
+
 function buildParams(
 	model: Model<"anthropic-messages">,
 	context: Context,
@@ -984,7 +1025,7 @@ function buildParams(
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
 		messages: convertMessages(context.messages, model, isOAuthToken, cacheControl),
-		max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
+		max_tokens: resolveMaxTokens(model, context, options),
 		stream: true,
 	};
 

@@ -203,9 +203,27 @@ export interface CopilotCatalogInfo {
 	ids: Set<string>;
 	/** id -> api mode derived from supported_endpoints. Only ids with a clear signal are present. */
 	apiById: Map<string, CopilotApiMode>;
+	/** id -> live capability limits and reasoning efforts. Only ids with usable numbers are present. */
+	capabilitiesById: Map<string, CopilotModelCapabilities>;
 }
 
 export type CopilotApiMode = "anthropic-messages" | "openai-responses" | "openai-completions";
+
+/**
+ * Live per-model capabilities from `/models`. `maxPromptTokens` is enforced by
+ * the server (400 above it), so it is the compaction limit. `maxOutputTokens`
+ * is only a client hint: Claude enforces higher caps (128K, 64K for haiku) and
+ * Gemini/GPT enforce none, so callers must not treat it as the ceiling.
+ */
+export interface CopilotModelCapabilities {
+	contextWindow?: number;
+	maxPromptTokens?: number;
+	maxOutputTokens?: number;
+	/** Reasoning effort values the server accepts for this model, in catalog order. */
+	reasoningEfforts?: string[];
+	/** Whether the model accepts image input. */
+	vision?: boolean;
+}
 
 function copilotCatalogBaseUrl(token: string): string {
 	const pinned = copilotPinnedBaseUrl();
@@ -238,6 +256,40 @@ export function copilotApiModeFromEndpoints(endpoints: string[]): CopilotApiMode
 	return undefined;
 }
 
+function positiveInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
+
+/**
+ * Read `capabilities.limits` and `capabilities.supports.reasoning_effort` from a
+ * live `/models` entry. Returns undefined when the entry carries no usable value.
+ */
+export function copilotCapabilitiesFromEntry(entry: object): CopilotModelCapabilities | undefined {
+	const capabilities = (entry as { capabilities?: unknown }).capabilities;
+	if (!capabilities || typeof capabilities !== "object") return undefined;
+	const limits = (capabilities as { limits?: unknown }).limits;
+	const supports = (capabilities as { supports?: unknown }).supports;
+	const result: CopilotModelCapabilities = {};
+	if (limits && typeof limits === "object") {
+		const record = limits as Record<string, unknown>;
+		const contextWindow = positiveInteger(record.max_context_window_tokens);
+		const maxPromptTokens = positiveInteger(record.max_prompt_tokens);
+		const maxOutputTokens = positiveInteger(record.max_output_tokens);
+		if (contextWindow !== undefined) result.contextWindow = contextWindow;
+		if (maxPromptTokens !== undefined) result.maxPromptTokens = maxPromptTokens;
+		if (maxOutputTokens !== undefined) result.maxOutputTokens = maxOutputTokens;
+		if (record.vision !== undefined) result.vision = Boolean(record.vision);
+	}
+	if (supports && typeof supports === "object") {
+		const efforts = (supports as { reasoning_effort?: unknown }).reasoning_effort;
+		if (Array.isArray(efforts)) {
+			const values = efforts.filter((effort): effort is string => typeof effort === "string" && effort.length > 0);
+			if (values.length > 0) result.reasoningEfforts = values;
+		}
+	}
+	return Object.keys(result).length > 0 ? result : undefined;
+}
+
 /**
  * Fetch the account's live Copilot catalog: entitled ids + per-model api routing
  * derived from `supported_endpoints`. Uses the front-door base URL (accepts a raw
@@ -249,7 +301,12 @@ export async function fetchCopilotCatalogInfo(
 	token: string,
 	options?: { baseUrl?: string; timeoutMs?: number; fetchFn?: typeof fetch },
 ): Promise<CopilotCatalogInfo> {
-	const empty: CopilotCatalogInfo = { catalogAvailable: false, ids: new Set(), apiById: new Map() };
+	const empty: CopilotCatalogInfo = {
+		catalogAvailable: false,
+		ids: new Set(),
+		apiById: new Map(),
+		capabilitiesById: new Map(),
+	};
 	const base = options?.baseUrl ?? copilotCatalogBaseUrl(token);
 	const fetchFn = options?.fetchFn ?? fetch;
 	const timeoutMs = options?.timeoutMs ?? 6000;
@@ -273,6 +330,7 @@ export async function fetchCopilotCatalogInfo(
 		}
 		const ids = new Set<string>();
 		const apiById = new Map<string, CopilotApiMode>();
+		const capabilitiesById = new Map<string, CopilotModelCapabilities>();
 		for (const entry of payload.data) {
 			if (!entry || typeof entry !== "object" || !("id" in entry) || typeof entry.id !== "string") {
 				continue;
@@ -294,8 +352,12 @@ export async function fetchCopilotCatalogInfo(
 					apiById.set(entry.id, api);
 				}
 			}
+			const capabilities = copilotCapabilitiesFromEntry(entry);
+			if (capabilities) {
+				capabilitiesById.set(entry.id, capabilities);
+			}
 		}
-		return { catalogAvailable: true, ids, apiById };
+		return { catalogAvailable: true, ids, apiById, capabilitiesById };
 	} catch {
 		return empty;
 	}

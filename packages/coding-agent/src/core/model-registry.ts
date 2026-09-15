@@ -20,6 +20,7 @@ import {
 	registerApiProvider,
 	resetApiProviders,
 	type SimpleStreamOptions,
+	type ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
 import { getXaiSubscriptionModel, registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
@@ -31,7 +32,12 @@ import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import { writeFileAtomicSync } from "../utils/atomic-file.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
-import { type CopilotApiMode, copilotPinnedBaseUrl, fetchCopilotCatalogInfo } from "./copilot-credentials.js";
+import {
+	type CopilotApiMode,
+	type CopilotModelCapabilities,
+	copilotPinnedBaseUrl,
+	fetchCopilotCatalogInfo,
+} from "./copilot-credentials.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
 	buildPrimeInferenceModels,
@@ -454,7 +460,72 @@ interface CopilotEntitlementCache {
 	modelIds: string[];
 	/** id -> api mode from live supported_endpoints (fixes routing for grok/mai-code/etc). */
 	apiById?: Record<string, string>;
+	/** id -> live capability limits and reasoning efforts. */
+	capabilitiesById?: Record<string, CopilotModelCapabilities>;
 	refreshedAt: number;
+}
+
+const THINKING_LEVEL_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+/**
+ * Map the live `supported_reasoning_efforts` list onto Prime thinking levels.
+ * Levels the server does not list become `null` so the picker hides them and
+ * requests never carry an effort the model rejects (`invalid_reasoning_effort`).
+ */
+export function thinkingLevelMapFromCopilotEfforts(efforts: readonly string[]): ThinkingLevelMap {
+	const supported = new Set(efforts);
+	const map: ThinkingLevelMap = { off: supported.has("none") ? "none" : null };
+	for (const level of THINKING_LEVEL_EFFORTS) {
+		map[level] = supported.has(level) ? level : null;
+	}
+	return map;
+}
+
+/**
+ * Overlay live catalog capabilities on a baked Copilot model. Prompt and context
+ * limits come from the server and are enforced there; the output hint is kept
+ * only when the baked catalog has nothing better (the server caps differ from it).
+ */
+export function applyCopilotCapabilities(model: Model<Api>, capabilities: CopilotModelCapabilities): Model<Api> {
+	let next: Model<Api> = model;
+	const contextWindow = capabilities.contextWindow ?? model.contextWindow;
+	const maxInputTokens = capabilities.maxPromptTokens;
+	if (
+		contextWindow !== model.contextWindow ||
+		(maxInputTokens !== undefined && maxInputTokens !== model.maxInputTokens)
+	) {
+		next = {
+			...next,
+			contextWindow,
+			...(maxInputTokens !== undefined ? { maxInputTokens: Math.min(maxInputTokens, contextWindow) } : {}),
+		};
+	}
+	if (capabilities.reasoningEfforts && model.reasoning) {
+		next = { ...next, thinkingLevelMap: thinkingLevelMapFromCopilotEfforts(capabilities.reasoningEfforts) };
+	}
+	if (capabilities.vision === true && !model.input.includes("image")) {
+		next = { ...next, input: [...model.input, "image"] };
+	}
+	return next;
+}
+
+function capabilitiesByIdFromRecord(
+	record: Record<string, CopilotModelCapabilities> | undefined,
+): Map<string, CopilotModelCapabilities> {
+	const map = new Map<string, CopilotModelCapabilities>();
+	if (!record) return map;
+	for (const [id, capabilities] of Object.entries(record)) {
+		if (capabilities && typeof capabilities === "object") map.set(id, capabilities);
+	}
+	return map;
+}
+
+function capabilitiesByIdToRecord(
+	map: Map<string, CopilotModelCapabilities>,
+): Record<string, CopilotModelCapabilities> {
+	const record: Record<string, CopilotModelCapabilities> = {};
+	for (const [id, capabilities] of map) record[id] = capabilities;
+	return record;
 }
 
 const COPILOT_API_MODES: ReadonlySet<string> = new Set<CopilotApiMode>([
@@ -541,6 +612,8 @@ export class ModelRegistry {
 	// used to correct routing for models prime's name-heuristics misroute
 	// (grok, mai-code/oswe -> /responses). Empty means "use the baked api".
 	private copilotApiById = new Map<string, CopilotApiMode>();
+	// Per-model live limits/efforts from the same catalog fetch. Empty means "use the baked values".
+	private copilotCapabilitiesById = new Map<string, CopilotModelCapabilities>();
 	private backgroundCopilotEntitlement: { fingerprint: string; promise: Promise<void> } | undefined;
 	private livePrimeInferenceModels: Model<"openai-completions">[] | undefined;
 	private pendingPrimeInferenceCatalogRefresh: Promise<void> | undefined;
@@ -718,6 +791,10 @@ export class ModelRegistry {
 					if (liveApi && liveApi !== configuredModel.api) {
 						const { compat: _staleCompat, ...rest } = configuredModel as Model<Api> & { compat?: unknown };
 						configuredModel = { ...rest, api: liveApi } as Model<Api>;
+					}
+					const capabilities = this.copilotCapabilitiesById.get(model.id);
+					if (capabilities) {
+						configuredModel = applyCopilotCapabilities(configuredModel, capabilities);
 					}
 				}
 
@@ -1079,6 +1156,10 @@ export class ModelRegistry {
 				fingerprint: parsed.fingerprint,
 				modelIds: parsed.modelIds,
 				apiById: parsed.apiById && typeof parsed.apiById === "object" ? parsed.apiById : undefined,
+				capabilitiesById:
+					parsed.capabilitiesById && typeof parsed.capabilitiesById === "object"
+						? parsed.capabilitiesById
+						: undefined,
 				refreshedAt: parsed.refreshedAt,
 			};
 		} catch {
@@ -1110,10 +1191,12 @@ export class ModelRegistry {
 		if (cached && cached.fingerprint === fingerprint) {
 			this.copilotEntitledModelIds = new Set(cached.modelIds);
 			this.copilotApiById = apiByIdFromRecord(cached.apiById);
+			this.copilotCapabilitiesById = capabilitiesByIdFromRecord(cached.capabilitiesById);
 			this.copilotEntitlementKnown = true;
 		} else {
 			this.copilotEntitledModelIds = new Set();
 			this.copilotApiById = new Map();
+			this.copilotCapabilitiesById = new Map();
 			this.copilotEntitlementKnown = false;
 		}
 	}
@@ -1147,6 +1230,7 @@ export class ModelRegistry {
 		if (cached && cached.fingerprint === fingerprint) {
 			this.copilotEntitledModelIds = new Set(cached.modelIds);
 			this.copilotApiById = apiByIdFromRecord(cached.apiById);
+			this.copilotCapabilitiesById = capabilitiesByIdFromRecord(cached.capabilitiesById);
 			const fresh = Date.now() - cached.refreshedAt < COPILOT_ENTITLEMENT_CACHE_TTL_MS;
 			if (fresh) {
 				return;
@@ -1164,11 +1248,13 @@ export class ModelRegistry {
 		if (!info.catalogAvailable) return;
 		this.copilotEntitledModelIds = info.ids;
 		this.copilotApiById = info.apiById;
+		this.copilotCapabilitiesById = info.capabilitiesById;
 		this.copilotEntitlementKnown = true;
 		this.writeCopilotEntitlementCache({
 			fingerprint,
 			modelIds: [...info.ids],
 			apiById: apiByIdToRecord(info.apiById),
+			capabilitiesById: capabilitiesByIdToRecord(info.capabilitiesById),
 			refreshedAt: Date.now(),
 		});
 	}
@@ -1188,11 +1274,13 @@ export class ModelRegistry {
 				}
 				this.copilotEntitledModelIds = info.ids;
 				this.copilotApiById = info.apiById;
+				this.copilotCapabilitiesById = info.capabilitiesById;
 				this.copilotEntitlementKnown = true;
 				this.writeCopilotEntitlementCache({
 					fingerprint,
 					modelIds: [...info.ids],
 					apiById: apiByIdToRecord(info.apiById),
+					capabilitiesById: capabilitiesByIdToRecord(info.capabilitiesById),
 					refreshedAt: Date.now(),
 				});
 				// The scoped catalog changed underneath the loaded model list.

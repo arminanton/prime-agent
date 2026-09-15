@@ -312,6 +312,13 @@ export interface OpenAICompletionsCompat {
 	sendSessionAffinityHeaders?: boolean;
 	/** Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. */
 	supportsLongCacheRetention?: boolean;
+	/**
+	 * Request the completion without streaming and replay the single response as one chunk.
+	 * Copilot's Gemini models only flush complete reasoning segments while streaming and drop
+	 * the trailing segment, so tool-call turns show no reasoning text; the non-streaming response
+	 * carries it in full. Bounded by the request timeout. Default: false.
+	 */
+	nonStreaming?: boolean;
 }
 
 /** Compatibility settings for OpenAI Responses APIs. */

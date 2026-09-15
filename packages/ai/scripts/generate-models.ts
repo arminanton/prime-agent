@@ -91,35 +91,38 @@ interface CopilotLiveLimits {
 	maxTokens: number;
 }
 
-// Capability maxima returned by the Copilot CLI 1.0.84-5 live CAPI catalog (2026-09-14 snapshot).
-// These override stale or rounded models.dev values, but do not assert that a
-// particular account is entitled to the model. The static catalog remains a
-// fallback and runtime discovery is responsible for account availability.
+// Offline fallback for the live Copilot catalog (CLI 1.0.84-5 identity, 2026-09-14
+// snapshot). contextWindow/maxInputTokens mirror capabilities.limits, which the
+// server enforces. maxTokens is NOT the catalog max_output_tokens hint: it is the
+// probed server output cap (Claude 128K, haiku 64K; 400 above it) or, for the
+// Gemini/GPT families where no request-time cap is enforced, the client ceiling
+// the user chose (Gemini 200K). At runtime the registry overlays the account's
+// live limits and efforts on top of these rows.
 const modelsDevCopilotSourceIds = new Set<string>();
 
 const COPILOT_LIVE_LIMITS: Record<string, CopilotLiveLimits> = {
-	"claude-fable-5": { contextWindow: 1_000_000, maxInputTokens: 872_000, maxTokens: 128_000 },
-	"claude-fable-5.1": { contextWindow: 1_000_000, maxInputTokens: 872_000, maxTokens: 128_000 },
+	"claude-fable-5": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 128_000 },
+	"claude-fable-5.1": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 128_000 },
 	"claude-opus-4.5": { contextWindow: 200_000, maxInputTokens: 168_000, maxTokens: 32_000 },
 	"claude-opus-4.6": { contextWindow: 200_000, maxInputTokens: 168_000, maxTokens: 32_000 },
-	"claude-opus-4.7": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 64_000 },
-	"claude-opus-4.8": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 64_000 },
+	"claude-opus-4.7": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 128_000 },
+	"claude-opus-4.8": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 128_000 },
 	// GitHub documentation says fast mode cannot select the 1M context tier,
 	// while CAPI reports this raw maximum. Preserve the server capability here;
 	// no context-tier field is sent on inference requests.
-	"claude-opus-4.8-fast": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 64_000 },
-	"claude-opus-5": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 64_000 },
+	"claude-opus-4.8-fast": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 128_000 },
+	"claude-opus-5": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 128_000 },
 	"claude-sonnet-4": { contextWindow: 216_000, maxInputTokens: 128_000, maxTokens: 16_000 },
 	"claude-sonnet-4.5": { contextWindow: 200_000, maxInputTokens: 168_000, maxTokens: 32_000 },
 	"claude-sonnet-4.6": { contextWindow: 200_000, maxInputTokens: 168_000, maxTokens: 32_000 },
-	"claude-sonnet-5": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 64_000 },
+	"claude-sonnet-5": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 128_000 },
 	"gemini-2.5-pro": { contextWindow: 128_000, maxInputTokens: 128_000, maxTokens: 64_000 },
 	"gemini-3-pro-preview": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 64_000 },
 	"gemini-3.1-pro-preview": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 64_000 },
-	"gemini-3.5-flash": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 64_000 },
-	"gemini-3.6-flash": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 64_000 },
-	"gemini-3.7-flash": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 64_000 },
-	"gemini-3.8-flash": { contextWindow: 1_048_576, maxInputTokens: 983_040, maxTokens: 65_536 },
+	"gemini-3.5-flash": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 200_000 },
+	"gemini-3.6-flash": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 200_000 },
+	"gemini-3.7-flash": { contextWindow: 1_000_000, maxInputTokens: 936_000, maxTokens: 200_000 },
+	"gemini-3.8-flash": { contextWindow: 1_048_576, maxInputTokens: 983_040, maxTokens: 200_000 },
 	"gpt-4.1": { contextWindow: 128_000, maxInputTokens: 64_000, maxTokens: 16_384 },
 	"gpt-5.2": { contextWindow: 400_000, maxInputTokens: 272_000, maxTokens: 128_000 },
 	"gpt-5.2-codex": { contextWindow: 400_000, maxInputTokens: 272_000, maxTokens: 128_000 },

@@ -4451,7 +4451,7 @@ export const MODELS = {
 				cacheWrite: 12.5,
 			},
 			contextWindow: 1000000,
-			maxInputTokens: 872000,
+			maxInputTokens: 936000,
 			maxTokens: 128000,
 		} satisfies Model<"anthropic-messages">,
 		"claude-fable-5.1": {
@@ -4471,7 +4471,7 @@ export const MODELS = {
 				cacheWrite: 12.5,
 			},
 			contextWindow: 1000000,
-			maxInputTokens: 872000,
+			maxInputTokens: 936000,
 			maxTokens: 128000,
 		} satisfies Model<"anthropic-messages">,
 		"claude-haiku-4.5": {
@@ -4551,7 +4551,7 @@ export const MODELS = {
 			},
 			contextWindow: 1000000,
 			maxInputTokens: 936000,
-			maxTokens: 64000,
+			maxTokens: 128000,
 		} satisfies Model<"anthropic-messages">,
 		"claude-opus-4.8": {
 			id: "claude-opus-4.8",
@@ -4571,7 +4571,7 @@ export const MODELS = {
 			},
 			contextWindow: 1000000,
 			maxInputTokens: 936000,
-			maxTokens: 64000,
+			maxTokens: 128000,
 		} satisfies Model<"anthropic-messages">,
 		"claude-opus-4.8-fast": {
 			id: "claude-opus-4.8-fast",
@@ -4591,7 +4591,7 @@ export const MODELS = {
 			},
 			contextWindow: 1000000,
 			maxInputTokens: 936000,
-			maxTokens: 64000,
+			maxTokens: 128000,
 		} satisfies Model<"anthropic-messages">,
 		"claude-opus-5": {
 			id: "claude-opus-5",
@@ -4611,7 +4611,7 @@ export const MODELS = {
 			},
 			contextWindow: 1000000,
 			maxInputTokens: 936000,
-			maxTokens: 64000,
+			maxTokens: 128000,
 		} satisfies Model<"anthropic-messages">,
 		"claude-sonnet-4": {
 			id: "claude-sonnet-4",
@@ -4691,7 +4691,7 @@ export const MODELS = {
 			},
 			contextWindow: 1000000,
 			maxInputTokens: 936000,
-			maxTokens: 64000,
+			maxTokens: 128000,
 		} satisfies Model<"anthropic-messages">,
 		"gemini-2.5-pro": {
 			id: "gemini-2.5-pro",
@@ -4772,7 +4772,7 @@ export const MODELS = {
 			},
 			contextWindow: 1000000,
 			maxInputTokens: 936000,
-			maxTokens: 64000,
+			maxTokens: 200000,
 		} satisfies Model<"openai-completions">,
 		"gemini-3.6-flash": {
 			id: "gemini-3.6-flash",
@@ -4793,7 +4793,7 @@ export const MODELS = {
 			},
 			contextWindow: 1000000,
 			maxInputTokens: 936000,
-			maxTokens: 64000,
+			maxTokens: 200000,
 		} satisfies Model<"openai-completions">,
 		"gemini-3.7-flash": {
 			id: "gemini-3.7-flash",
@@ -4814,7 +4814,7 @@ export const MODELS = {
 			},
 			contextWindow: 1000000,
 			maxInputTokens: 936000,
-			maxTokens: 64000,
+			maxTokens: 200000,
 		} satisfies Model<"openai-completions">,
 		"gemini-3.8-flash": {
 			id: "gemini-3.8-flash",
@@ -4835,7 +4835,7 @@ export const MODELS = {
 			},
 			contextWindow: 1048576,
 			maxInputTokens: 983040,
-			maxTokens: 65536,
+			maxTokens: 200000,
 		} satisfies Model<"openai-completions">,
 		"gpt-4.1": {
 			id: "gpt-4.1",
