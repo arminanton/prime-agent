@@ -460,37 +460,66 @@ Then retry the original command.`,
 		logDaemonLaunch(`launching daemon in a systemd --user scope via ${invocation.command}`);
 	}
 
-	const attempt = await attemptDaemonLaunch(invocation, socketPath, env, spawnCwd ?? process.cwd());
-	if (attempt.started) {
-		return;
-	}
+	await launchDaemonWithScopedFallback(
+		invocation,
+		() => ({ command: process.execPath, args: [...daemonArgs], scoped: false }),
+		(candidate) => attemptDaemonLaunch(candidate, socketPath, env, spawnCwd ?? process.cwd()),
+	);
+}
 
-	// R5: a scoped launch that exits before the socket appears (a scope-unit collision on rapid
-	// restart, an unreachable user bus in a cron/heartbeat context, a rejected property, or a
-	// missing slice) must never lock the user out of the daemon. Retry UNSCOPED exactly once,
-	// loudly: cgroup containment was NOT applied for this launch, so the host cutover gate
-	// (DEPLOY-A-RUNBOOK.md) must verify supervisor+worker+kernel cgroup membership before the
-	// user-400.slice soft cap is removed.
-	if (invocation.scoped) {
-		logDaemonLaunch(
-			`scoped daemon launch failed; retrying UNSCOPED once (cgroup containment NOT applied for this launch). ${attempt.message}`,
+// The marker both scoped-fallback log lines carry (systemd-run missing/non-exec, and a confirmed
+// early-exit retry) so the cutover gate can detect EVERY fallback outcome, not just one phrasing.
+export const DAEMON_SCOPE_FALLBACK_MARKER = "cgroup containment NOT applied";
+
+/**
+ * Run one daemon launch and, for a SCOPED launch, retry UNSCOPED exactly once but ONLY when the
+ * scoped child is CONFIRMED gone (an early exit or a spawn failure). A scoped launch that merely
+ * TIMED OUT with its child still alive (for example a boot reclaim pushing the daemon_hello past
+ * the startup timeout) stays fail-closed and never spawns a second daemon: a second (unscoped)
+ * launcher racing a still-alive scoped one could win the socket lease and lose cgroup containment.
+ * `launch` is injected so the retry decision is unit-testable without spawning real processes.
+ */
+export async function launchDaemonWithScopedFallback(
+	invocation: DaemonLaunchInvocation,
+	buildUnscopedInvocation: () => DaemonLaunchInvocation,
+	launch: (invocation: DaemonLaunchInvocation) => Promise<DaemonLaunchAttempt>,
+	log: (message: string) => void = logDaemonLaunch,
+): Promise<void> {
+	const attempt = await launch(invocation);
+	if (attempt.started) return;
+
+	// R5 (corrected): retry UNSCOPED exactly once, loudly, and ONLY on a confirmed early exit /
+	// spawn failure of the scoped child (a scope-unit collision on rapid restart, an unreachable
+	// user bus, a rejected property, a missing slice). cgroup containment was NOT applied for this
+	// launch, so the cutover gate (DEPLOY-A-RUNBOOK.md) must verify membership + effective caps
+	// before the soft cap is removed.
+	if (invocation.scoped && (attempt.childExited || attempt.spawnError)) {
+		log(
+			`scoped daemon launch failed (${attempt.spawnError ? "spawn error" : "early exit"}); ` +
+				`retrying UNSCOPED once (${DAEMON_SCOPE_FALLBACK_MARKER} for this launch). ${attempt.message}`,
 		);
-		const unscoped = await attemptDaemonLaunch(
-			{ command: process.execPath, args: [...daemonArgs], scoped: false },
-			socketPath,
-			env,
-			spawnCwd ?? process.cwd(),
-		);
-		if (unscoped.started) {
-			return;
-		}
+		const unscoped = await launch(buildUnscopedInvocation());
+		if (unscoped.started) return;
 		throw new Error(unscoped.message);
 	}
 
+	// A live-child timeout (childFailure undefined) or a non-scoped failure is fail-closed: the
+	// scoped child was left running (unref'd) and is likely still booting, so throw instead of
+	// double-spawning. The caller retries the original command once the daemon is ready.
 	throw new Error(attempt.message);
 }
 
-type DaemonLaunchAttempt = { started: true } | { started: false; message: string };
+export type DaemonLaunchAttempt =
+	| { started: true }
+	| {
+			started: false;
+			// A confirmed early exit of the spawned child (systemd-run for a scoped launch, node
+			// otherwise); the scoped child is NOT alive, so a single UNSCOPED retry cannot double-spawn.
+			childExited: boolean;
+			// The child could not be spawned at all (ENOENT etc.); also safe to retry unscoped.
+			spawnError: boolean;
+			message: string;
+	  };
 
 /**
  * Spawn one detached daemon launch and probe for its socket. Returns started=true once the
@@ -592,7 +621,15 @@ async function attemptDaemonLaunch(
 
 	const message = failureMessage();
 	cleanupScopeStderr();
-	return { started: false, message };
+	// childFailure is set only when the spawned child actually exited or failed to spawn. When it is
+	// undefined the loop hit the plain 30s timeout with the child STILL ALIVE (the daemon is likely
+	// still booting), which must NOT trigger a second (unscoped) spawn.
+	return {
+		started: false,
+		childExited: childFailure?.type === "exit",
+		spawnError: childFailure?.type === "error",
+		message,
+	};
 }
 
 function currentDaemonLogSize(socketPath: string): number {

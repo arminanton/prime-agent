@@ -2,7 +2,12 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { buildDaemonScopeInvocation } from "../src/cli/daemon-launch.js";
+import {
+	buildDaemonScopeInvocation,
+	type DaemonLaunchAttempt,
+	type DaemonLaunchInvocation,
+	launchDaemonWithScopedFallback,
+} from "../src/cli/daemon-launch.js";
 
 // A.1 launcher scope: opt-in, reversible, and falls back cleanly when systemd-run is absent.
 
@@ -103,5 +108,89 @@ describe("buildDaemonScopeInvocation", () => {
 		expect(invocation.scoped).toBe(false);
 		expect(invocation.command).toBe("/usr/bin/node");
 		expect(invocation.warning).toMatch(/systemd-run was not found/);
+	});
+});
+
+
+// A.1 M5: the scoped -> unscoped fallback retries ONLY on a confirmed early exit / spawn failure of
+// the scoped child, never on a live-child timeout (which would double-spawn a daemon and could lose
+// the lease + cgroup containment). The launch step is injected so no real process is spawned.
+describe("launchDaemonWithScopedFallback", () => {
+	const scoped: DaemonLaunchInvocation = { command: "systemd-run", args: ["--scope"], scoped: true };
+	const buildUnscoped = (): DaemonLaunchInvocation => ({ command: "node", args: ["--mode", "daemon"], scoped: false });
+	const silent = () => {};
+
+	it("retries UNSCOPED exactly once on a confirmed nonzero early exit, then succeeds", async () => {
+		const calls: DaemonLaunchInvocation[] = [];
+		const results: DaemonLaunchAttempt[] = [
+			{ started: false, childExited: true, spawnError: false, message: "daemon exited during startup (code 1)" },
+			{ started: true },
+		];
+		const launch = async (invocation: DaemonLaunchInvocation): Promise<DaemonLaunchAttempt> => {
+			calls.push(invocation);
+			return results.shift()!;
+		};
+
+		await launchDaemonWithScopedFallback(scoped, buildUnscoped, launch, silent);
+
+		expect(calls.map((c) => c.scoped)).toEqual([true, false]);
+	});
+
+	it("retries UNSCOPED on a scoped spawn failure (systemd-run not spawnable)", async () => {
+		const calls: DaemonLaunchInvocation[] = [];
+		const results: DaemonLaunchAttempt[] = [
+			{ started: false, childExited: false, spawnError: true, message: "Failed to spawn Prime Agent daemon" },
+			{ started: true },
+		];
+		const launch = async (invocation: DaemonLaunchInvocation): Promise<DaemonLaunchAttempt> => {
+			calls.push(invocation);
+			return results.shift()!;
+		};
+
+		await launchDaemonWithScopedFallback(scoped, buildUnscoped, launch, silent);
+
+		expect(calls.map((c) => c.scoped)).toEqual([true, false]);
+	});
+
+	it("does not retry more than once even when the unscoped fallback also fails", async () => {
+		let count = 0;
+		const launch = async (invocation: DaemonLaunchInvocation): Promise<DaemonLaunchAttempt> => {
+			count += 1;
+			return invocation.scoped
+				? { started: false, childExited: true, spawnError: false, message: "scoped early exit" }
+				: { started: false, childExited: true, spawnError: false, message: "unscoped early exit" };
+		};
+
+		await expect(launchDaemonWithScopedFallback(scoped, buildUnscoped, launch, silent)).rejects.toThrow(
+			/unscoped early exit/,
+		);
+		expect(count).toBe(2);
+	});
+
+	it("does NOT spawn a second daemon on a live-child timeout (fail-closed)", async () => {
+		const calls: DaemonLaunchInvocation[] = [];
+		const launch = async (invocation: DaemonLaunchInvocation): Promise<DaemonLaunchAttempt> => {
+			calls.push(invocation);
+			// childExited=false + spawnError=false is the live-child timeout: the scoped daemon is
+			// still alive and likely still booting.
+			return { started: false, childExited: false, spawnError: false, message: "Timed out waiting for daemon to start" };
+		};
+
+		await expect(launchDaemonWithScopedFallback(scoped, buildUnscoped, launch, silent)).rejects.toThrow(/Timed out/);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.scoped).toBe(true);
+	});
+
+	it("an already-unscoped launch failure never retries", async () => {
+		let count = 0;
+		const launch = async (): Promise<DaemonLaunchAttempt> => {
+			count += 1;
+			return { started: false, childExited: true, spawnError: false, message: "boom" };
+		};
+
+		await expect(
+			launchDaemonWithScopedFallback(buildUnscoped(), buildUnscoped, launch, silent),
+		).rejects.toThrow(/boom/);
+		expect(count).toBe(1);
 	});
 });
