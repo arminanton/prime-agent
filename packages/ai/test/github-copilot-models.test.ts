@@ -102,8 +102,8 @@ describe("GitHub Copilot model catalog", () => {
 	it("uses the current CLI identity in every static fallback", () => {
 		for (const model of getModels("github-copilot")) {
 			expect(model.headers).toEqual({
-				"User-Agent": "copilot/1.0.84-1",
-				"Editor-Version": "copilot/1.0.84-1",
+				"User-Agent": "copilot/1.0.84-5",
+				"Editor-Version": "copilot/1.0.84-5",
 				"Copilot-Integration-Id": "copilot-developer-cli",
 			});
 		}

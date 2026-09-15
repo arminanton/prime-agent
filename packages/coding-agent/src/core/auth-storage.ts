@@ -15,22 +15,23 @@ import {
 	type OAuthProviderId,
 } from "@earendil-works/pi-ai";
 import { getOAuthApiKey, getOAuthProvider, getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { closeSync, existsSync, fchmodSync, mkdirSync, openSync, readFileSync, writeSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
+import { realpathIfPresentSync, writeFileAtomicSync } from "../utils/atomic-file.js";
 import { copilotPinIdentity, hasCopilotPin, resolvePinnedCopilotToken } from "./copilot-credentials.js";
-import {
-	clearPrimeCliCredentials,
-	getPrimeCliConfigPath,
-	loadPrimeCliConfig,
-	PRIME_INFERENCE_PROVIDER_ID,
-	type PrimeCliConfig,
-	type PrimeTeam,
-	savePrimeCliApiKey,
-	savePrimeCliTeamSelection,
-} from "./prime-inference-auth.js";
+import { getPrimeCliConfigPath, PRIME_INFERENCE_PROVIDER_ID, type PrimeTeam } from "./prime-inference-auth.js";
 import { resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
+
+// Amazon Bedrock auto-activates from generic AWS_* variables that are usually set for
+// unrelated tooling. Keep the provider registered but require an explicit login or
+// --api-key unless PRIME_ENABLE_BEDROCK=1 opts back into ambient credentials.
+const ENVIRONMENT_AUTH_OPT_IN_PROVIDERS: ReadonlySet<string> = new Set(["amazon-bedrock"]);
+
+export function isEnvironmentAuthOptInProvider(provider: string): boolean {
+	return process.env.PRIME_ENABLE_BEDROCK !== "1" && ENVIRONMENT_AUTH_OPT_IN_PROVIDERS.has(provider);
+}
 
 export type PrimeTeamCredential = {
 	teamId: string;
@@ -99,6 +100,7 @@ type AuthSourceCandidate = {
 type AuthApiKeyResult = {
 	apiKey?: string;
 	sourceToken?: AuthSourceToken;
+	credentialType?: AuthCredential["type"];
 };
 
 export interface AuthStorageBackend {
@@ -117,9 +119,27 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 	}
 
 	private ensureFileExists(): void {
-		if (!existsSync(this.authPath)) {
-			writeFileSync(this.authPath, "{}", "utf-8");
-			chmodSync(this.authPath, 0o600);
+		let descriptor: number;
+		try {
+			// Exclusive create: a racing initializer must never replace saved credentials.
+			descriptor = openSync(this.authPath, "wx", 0o600);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+				throw error;
+			}
+			return;
+		}
+		try {
+			const bytes = Buffer.from("{}");
+			let offset = 0;
+			while (offset < bytes.length) {
+				const written = writeSync(descriptor, bytes, offset, bytes.length - offset);
+				if (written <= 0) throw new Error(`Short write initializing ${this.authPath}`);
+				offset += written;
+			}
+			fchmodSync(descriptor, 0o600); // Exact bits despite the umask.
+		} finally {
+			closeSync(descriptor);
 		}
 	}
 
@@ -172,8 +192,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
 			const { result, next } = fn(current);
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, "utf-8");
-				chmodSync(this.authPath, 0o600);
+				writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, { mode: 0o600 });
 			}
 			return result;
 		} finally {
@@ -217,8 +236,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const { result, next } = await fn(current);
 			throwIfCompromised();
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, "utf-8");
-				chmodSync(this.authPath, 0o600);
+				writeFileAtomicSync(realpathIfPresentSync(this.authPath), next, { mode: 0o600 });
 			}
 			throwIfCompromised();
 			return result;
@@ -385,22 +403,6 @@ export class AuthStorage {
 		};
 	}
 
-	private getPrimeCliAuthCandidate(provider: string): AuthSourceCandidate | undefined {
-		const apiKey = this.getPrimeCliApiKey(provider);
-		if (!apiKey) {
-			return undefined;
-		}
-		return {
-			label: "Prime CLI",
-			...this.createAuthSourceCandidate({
-				configured: false,
-				source: "prime_cli",
-				identityMaterial: provider,
-				valueMaterial: apiKey,
-			}),
-		};
-	}
-
 	private getStoredAuthCandidate(
 		provider: string,
 		options?: { resolveCommandValue?: boolean; resolvedCommandValue?: string },
@@ -493,19 +495,23 @@ export class AuthStorage {
 	private getAuthSourceCandidates(provider: string, options?: { includeFallback?: boolean }): AuthSourceCandidate[] {
 		const fallbackCandidate =
 			options?.includeFallback === false ? undefined : this.getFallbackAuthCandidate(provider);
+		// Opt-in providers never activate from ambient environment credentials; only an
+		// explicit --api-key or a stored login counts as configured auth.
+		const environmentCandidate = isEnvironmentAuthOptInProvider(provider)
+			? undefined
+			: this.getEnvironmentAuthCandidate(provider);
 		const candidates =
 			provider === PRIME_INFERENCE_PROVIDER_ID
 				? [
 						this.getRuntimeAuthCandidate(provider),
-						this.getEnvironmentAuthCandidate(provider),
-						this.getPrimeCliAuthCandidate(provider),
+						environmentCandidate,
 						this.getStoredAuthCandidate(provider),
 						fallbackCandidate,
 					]
 				: [
 						this.getRuntimeAuthCandidate(provider),
 						this.getStoredAuthCandidate(provider),
-						this.getEnvironmentAuthCandidate(provider),
+						environmentCandidate,
 						fallbackCandidate,
 					];
 		return candidates.filter((candidate): candidate is AuthSourceCandidate => candidate !== undefined);
@@ -585,7 +591,25 @@ export class AuthStorage {
 		};
 	}
 
+	private createCopilotPinAuthCandidate(pinnedToken: string): AuthSourceCandidate {
+		return this.createAuthSourceCandidate({
+			configured: true,
+			source: "environment",
+			label: hasCopilotPin() ? "pinned account" : undefined,
+			identityMaterial: copilotPinIdentity(),
+			valueMaterial: `${copilotPinIdentity()}\0${pinnedToken}`,
+		});
+	}
+
 	getCurrentAuthSourceToken(provider: string): AuthSourceToken | undefined {
+		// A pinned Copilot identity wins over every stored/env candidate (see
+		// getApiKeyWithSourceToken), so the account-scoped cache key must follow it.
+		if (provider === "github-copilot") {
+			const pinnedToken = resolvePinnedCopilotToken();
+			if (pinnedToken) {
+				return this.getAuthSourceTokenForCandidate(provider, this.createCopilotPinAuthCandidate(pinnedToken));
+			}
+		}
 		const { candidate } = this.getAvailableAuthCandidate(provider);
 		if (!candidate) {
 			return undefined;
@@ -612,6 +636,11 @@ export class AuthStorage {
 		return true;
 	}
 
+	/** Forget every stale marking for a provider (explicit user re-selection). */
+	clearAuthStale(provider: string): void {
+		this.staleAuthSources.delete(provider);
+	}
+
 	private clearStaleAuthSource(provider: string, source: ActiveAuthStatusSource): void {
 		const stale = this.staleAuthSources.get(provider);
 		if (!stale) {
@@ -629,7 +658,11 @@ export class AuthStorage {
 		if (!content) {
 			return {};
 		}
-		return JSON.parse(content) as AuthStorageData;
+		const data: unknown = JSON.parse(content);
+		if (typeof data !== "object" || data === null || Array.isArray(data)) {
+			throw new Error("Invalid auth storage: expected a JSON object");
+		}
+		return data as AuthStorageData;
 	}
 
 	/**
@@ -774,14 +807,9 @@ export class AuthStorage {
 	 * Logout from a provider.
 	 */
 	logout(provider: string): void {
-		if (provider === PRIME_INFERENCE_PROVIDER_ID && this.isPrimeCliConfigEnabled()) {
-			try {
-				clearPrimeCliCredentials(this.getEnabledPrimeCliConfigPath());
-				this.clearStaleAuthSource(provider, "prime_cli");
-			} catch (error) {
-				this.recordError(error);
-				throw error;
-			}
+		if (provider === PRIME_INFERENCE_PROVIDER_ID) {
+			this.removeVerified(provider);
+			return;
 		}
 		this.remove(provider);
 	}
@@ -840,7 +868,7 @@ export class AuthStorage {
 	 * Get API key for a provider.
 	 * Priority:
 	 * 1. Runtime override (CLI --api-key)
-	 * 2. Prime Inference: environment variable, Prime CLI config, auth.json
+	 * 2. Prime Inference: environment variable, auth.json
 	 * 3. Other providers: auth.json, environment variable
 	 * 4. Fallback resolver (models.json custom providers)
 	 */
@@ -869,16 +897,12 @@ export class AuthStorage {
 		if (providerId === "github-copilot") {
 			const pinnedToken = resolvePinnedCopilotToken();
 			if (pinnedToken) {
-				const pinCandidate = this.createAuthSourceCandidate({
-					configured: true,
-					source: "environment",
-					label: hasCopilotPin() ? "pinned account" : undefined,
-					identityMaterial: copilotPinIdentity(),
-					valueMaterial: `${copilotPinIdentity()}\0${pinnedToken}`,
-				});
 				return {
 					apiKey: pinnedToken,
-					sourceToken: this.getAuthSourceTokenForCandidate(providerId, pinCandidate),
+					sourceToken: this.getAuthSourceTokenForCandidate(
+						providerId,
+						this.createCopilotPinAuthCandidate(pinnedToken),
+					),
 				};
 			}
 			// An explicit pin was requested but no token could be resolved (e.g.
@@ -903,17 +927,6 @@ export class AuthStorage {
 			};
 		}
 
-		if (providerId === PRIME_INFERENCE_PROVIDER_ID) {
-			const primeCliCandidate = this.getPrimeCliAuthCandidate(providerId);
-			const primeCliKey = this.getPrimeCliApiKey(providerId);
-			if (primeCliKey && primeCliCandidate && !this.isAuthSourceStale(providerId, primeCliCandidate)) {
-				return {
-					apiKey: primeCliKey,
-					sourceToken: this.getAuthSourceTokenForCandidate(providerId, primeCliCandidate),
-				};
-			}
-		}
-
 		const cred = this.data[providerId];
 
 		if (cred?.type === "api_key") {
@@ -934,7 +947,7 @@ export class AuthStorage {
 											storedCandidate)
 									: storedCandidate,
 							);
-				return { apiKey, sourceToken };
+				return { apiKey, sourceToken, credentialType: "api_key" };
 			}
 		}
 
@@ -955,6 +968,7 @@ export class AuthStorage {
 							const refreshedCandidate = this.getStoredAuthCandidate(providerId);
 							return {
 								apiKey: result.apiKey,
+								credentialType: "oauth",
 								sourceToken: refreshedCandidate
 									? this.getAuthSourceTokenForCandidate(providerId, refreshedCandidate)
 									: undefined,
@@ -970,6 +984,7 @@ export class AuthStorage {
 							const updatedCandidate = this.getStoredAuthCandidate(providerId);
 							return {
 								apiKey: provider.getApiKey(updatedCred),
+								credentialType: "oauth",
 								sourceToken: updatedCandidate
 									? this.getAuthSourceTokenForCandidate(providerId, updatedCandidate)
 									: undefined,
@@ -982,6 +997,7 @@ export class AuthStorage {
 				} else {
 					return {
 						apiKey: provider.getApiKey(cred),
+						credentialType: "oauth",
 						sourceToken: this.getAuthSourceTokenForCandidate(providerId, storedCandidate),
 					};
 				}
@@ -1024,113 +1040,60 @@ export class AuthStorage {
 		return getOAuthProviders();
 	}
 
-	setPrimeInferenceTeamSelection(team: PrimeTeam | null): void {
-		if (this.isPrimeCliConfigEnabled()) {
-			try {
-				savePrimeCliTeamSelection(team, this.getEnabledPrimeCliConfigPath());
-			} catch (error) {
-				this.recordError(error);
-				throw error;
-			}
-			return;
+	private updatePrimeInferenceCredential(
+		update: (credential: AuthCredential | undefined) => ApiKeyCredential | undefined,
+	): void {
+		try {
+			const data = this.storage.withLock((current) => {
+				const data = this.parseStorageData(current);
+				const credential = update(data[PRIME_INFERENCE_PROVIDER_ID]);
+				if (!credential) return { result: data };
+				data[PRIME_INFERENCE_PROVIDER_ID] = credential;
+				return { result: data, next: JSON.stringify(data, null, 2) };
+			});
+			this.data = data;
+			this.loadError = null;
+		} catch (error) {
+			this.recordError(error);
+			throw error;
 		}
-
-		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
-		if (credential?.type !== "api_key") {
-			return;
-		}
-		this.set(PRIME_INFERENCE_PROVIDER_ID, {
-			...credential,
-			primeTeam: team ? this.toPrimeTeamCredential(team) : null,
-		});
 	}
 
-	setPrimeInferenceApiKey(apiKey: string): void {
-		if (this.isPrimeCliConfigEnabled()) {
-			try {
-				const configPath = this.getEnabledPrimeCliConfigPath();
-				const config = loadPrimeCliConfig(configPath);
-				const existingCredential = this.data[PRIME_INFERENCE_PROVIDER_ID];
-				const legacyPrimeTeam = existingCredential?.type === "api_key" ? existingCredential.primeTeam : undefined;
-				if (config.apiKey !== apiKey) {
-					savePrimeCliApiKey(apiKey, configPath);
-				} else if (!config.teamIdFromEnv && (legacyPrimeTeam === null || (!config.teamId && legacyPrimeTeam))) {
-					savePrimeCliTeamSelection(legacyPrimeTeam, configPath);
-				}
-				this.clearStaleAuthSource(PRIME_INFERENCE_PROVIDER_ID, "prime_cli");
-			} catch (error) {
-				this.recordError(error);
-				throw error;
-			}
-			if (this.data[PRIME_INFERENCE_PROVIDER_ID]) {
-				this.remove(PRIME_INFERENCE_PROVIDER_ID);
-			}
-			return;
-		}
+	setPrimeInferenceTeamSelection(team: PrimeTeam | null, expectedApiKey?: string): void {
+		this.updatePrimeInferenceCredential((credential) =>
+			credential?.type === "api_key" && (expectedApiKey === undefined || credential.key === expectedApiKey)
+				? { ...credential, primeTeam: team ? this.toPrimeTeamCredential(team) : null }
+				: undefined,
+		);
+	}
 
-		const existingCredential = this.data[PRIME_INFERENCE_PROVIDER_ID];
-		const existingPrimeTeam = existingCredential?.type === "api_key" ? existingCredential.primeTeam : undefined;
-		this.set(PRIME_INFERENCE_PROVIDER_ID, {
+	setPrimeInferenceApiKey(apiKey: string, team?: PrimeTeam | null): void {
+		this.updatePrimeInferenceCredential((existing) => ({
 			type: "api_key",
 			key: apiKey,
-			...(existingPrimeTeam !== undefined ? { primeTeam: existingPrimeTeam } : {}),
-		});
+			primeTeam:
+				team !== undefined
+					? team
+						? this.toPrimeTeamCredential(team)
+						: null
+					: existing?.type === "api_key" && existing.key === apiKey
+						? (existing.primeTeam ?? null)
+						: null,
+		}));
+		this.clearStaleAuthSource(PRIME_INFERENCE_PROVIDER_ID, "stored");
 	}
 
 	getPrimeInferenceTeamSelection(): PrimeTeamCredential | null | undefined {
-		let config: PrimeCliConfig | undefined;
-		if (this.isPrimeCliConfigEnabled()) {
-			config = this.getPrimeCliConfig(PRIME_INFERENCE_PROVIDER_ID);
-			if (config?.teamIdFromEnv) {
-				return undefined;
-			}
-		}
-
-		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+		if (process.env.PRIME_TEAM_ID?.trim()) return undefined;
 		const authSource = this.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID).source;
-		if (authSource === "runtime" || authSource === "environment") {
-			return undefined;
-		}
-		if (authSource === "prime_cli") {
-			if (credential?.type === "api_key" && credential.primeTeam === null) {
-				return null;
-			}
-			if (config?.teamId) {
-				return this.toPrimeTeamCredential({
-					teamId: config.teamId,
-					name: config.teamName ?? "Prime CLI team",
-					...(config.teamRole ? { role: config.teamRole } : {}),
-				});
-			}
-			if (credential?.type === "api_key" && credential.primeTeam) {
-				return credential.primeTeam;
-			}
-			return null;
-		}
-		if (credential?.type === "api_key" && credential.primeTeam !== undefined) {
-			return credential.primeTeam;
-		}
-		if (!config?.apiKey && config?.teamId) {
-			return this.toPrimeTeamCredential({
-				teamId: config.teamId,
-				name: config.teamName ?? "Prime CLI team",
-				...(config.teamRole ? { role: config.teamRole } : {}),
-			});
-		}
-		return undefined;
+		if (authSource === "runtime" || authSource === "environment") return undefined;
+		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+		return credential?.type === "api_key" ? credential.primeTeam : undefined;
 	}
 
 	getProviderHeaders(providerId: string): Record<string, string> | undefined {
-		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) {
-			return undefined;
-		}
-
-		const primeCliConfig = this.getPrimeCliConfig(providerId);
-		if (primeCliConfig?.teamIdFromEnv) {
-			return primeCliConfig.teamId ? { "X-Prime-Team-ID": primeCliConfig.teamId } : undefined;
-		}
-
-		const teamId = this.getPrimeInferenceTeamSelection()?.teamId;
+		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) return undefined;
+		const teamId = process.env.PRIME_TEAM_ID?.trim() || this.getPrimeInferenceTeamSelection()?.teamId;
 		return teamId ? { "X-Prime-Team-ID": teamId } : undefined;
 	}
 
@@ -1156,28 +1119,6 @@ export class AuthStorage {
 			credential.createdAt = team.createdAt;
 		}
 		return credential;
-	}
-
-	private getPrimeCliConfig(providerId: string): PrimeCliConfig | undefined {
-		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) {
-			return undefined;
-		}
-		if (!this.isPrimeCliConfigEnabled()) {
-			return undefined;
-		}
-		return loadPrimeCliConfig(this.options.primeCliConfigPath);
-	}
-
-	private getPrimeCliApiKey(providerId: string): string | undefined {
-		return this.getPrimeCliConfig(providerId)?.apiKey;
-	}
-
-	private getEnabledPrimeCliConfigPath(): string {
-		const configPath = this.getPrimeCliConfigPath();
-		if (!configPath) {
-			throw new Error("Prime CLI config is not enabled");
-		}
-		return configPath;
 	}
 
 	private isPrimeCliConfigEnabled(): boolean {

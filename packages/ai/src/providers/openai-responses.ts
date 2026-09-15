@@ -28,6 +28,7 @@ import {
 	sanitizeCopilotModelHeaders,
 } from "./github-copilot-headers.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
+import { withOpenCodeHeaders } from "./opencode-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -96,7 +97,7 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
-			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId);
+			const client = createClient(model, context, apiKey, options?.headers, cacheSessionId, options?.sessionId);
 			let params = buildParams(model, context, options);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
@@ -105,7 +106,6 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
-				...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
 			};
 			const { data: openaiStream, response } = await client.responses.create(params, requestOptions).withResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -169,7 +169,8 @@ function createClient(
 	context: Context,
 	apiKey?: string,
 	optionsHeaders?: Record<string, string>,
-	sessionId?: string,
+	cacheSessionId?: string,
+	conversationId?: string,
 ) {
 	if (!apiKey) {
 		if (!process.env.OPENAI_API_KEY) {
@@ -191,17 +192,17 @@ function createClient(
 			messages: context.messages,
 			hasImages,
 			api: model.api,
-			sessionId,
+			sessionId: conversationId,
 			isStreaming: true,
 		});
 		Object.assign(headers, copilotHeaders);
 	}
 
-	if (sessionId) {
+	if (cacheSessionId) {
 		if (compat.sendSessionIdHeader) {
-			headers.session_id = sessionId;
+			headers.session_id = cacheSessionId;
 		}
-		headers["x-client-request-id"] = sessionId;
+		headers["x-client-request-id"] = cacheSessionId;
 	}
 
 	if (optionsHeaders) {
@@ -221,7 +222,8 @@ function createClient(
 		apiKey,
 		baseURL: isCloudflareProvider(model.provider) ? resolveCloudflareBaseUrl(model) : model.baseUrl,
 		dangerouslyAllowBrowser: true,
-		defaultHeaders,
+		defaultHeaders: withOpenCodeHeaders(model.provider, conversationId, defaultHeaders),
+		maxRetries: 0,
 	});
 }
 
@@ -240,7 +242,7 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 	};
 
 	// `long_context` is a client-side catalog/session tier in Copilot CLI
-	// 1.0.84-1. Paired captures found no inference body or header field for it.
+	// 1.0.84-5. Paired captures found no inference body or header field for it.
 
 	if (options?.maxTokens) {
 		params.max_output_tokens = options?.maxTokens;
@@ -250,9 +252,8 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.temperature = options?.temperature;
 	}
 
-	// GitHub Copilot does not support the OpenAI `service_tier` parameter and
-	// rejects any value (including "default") with a 400 invalid_request_error,
-	// so never send it for Copilot. It remains an OpenAI-direct feature.
+	// GitHub Copilot rejects the service_tier FIELD itself (400) for every value.
+	// Elsewhere it is always sent: absence means "auto" (project tier), not "default".
 	if (options?.serviceTier !== undefined && model.provider !== "github-copilot") {
 		params.service_tier = options.serviceTier;
 	}
@@ -260,7 +261,7 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertResponsesTools(context.tools);
 		if (model.provider === "github-copilot") {
-			// Copilot CLI 1.0.84-1 opts into parallel calls when tools exist.
+			// Copilot CLI 1.0.84-5 opts into parallel calls when tools exist.
 			params.parallel_tool_calls = true;
 		}
 	}
@@ -270,7 +271,7 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 			const effort = options?.reasoningEffort
 				? (model.thinkingLevelMap?.[options.reasoningEffort] ?? options.reasoningEffort)
 				: "medium";
-			// Copilot CLI 1.0.84-1 uses the Responses API default summary
+			// Copilot CLI 1.0.84-5 uses the Responses API default summary
 			// mode explicitly. Keep caller overrides for providers that support
 			// concise or detailed summaries.
 			params.reasoning = {
@@ -283,6 +284,7 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
 			};
 		}
+		if (model.provider === "xai") params.include = ["reasoning.encrypted_content"];
 	}
 
 	return params;

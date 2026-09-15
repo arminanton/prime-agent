@@ -54,7 +54,7 @@ describe("Copilot Claude via Anthropic Messages", () => {
 	};
 
 	it("uses Bearer auth, Copilot headers, and valid Anthropic Messages payload", async () => {
-		const model = getModel("github-copilot", "claude-sonnet-4.5");
+		const model = getModel("github-copilot", "claude-sonnet-4.6");
 		expect(model.api).toBe("anthropic-messages");
 
 		const { streamAnthropic } = await import("../src/providers/anthropic.js");
@@ -70,10 +70,10 @@ describe("Copilot Claude via Anthropic Messages", () => {
 		expect(opts.authToken).toBe("tid_copilot_session_test_token");
 		const headers = opts.defaultHeaders as Record<string, string>;
 
-		// Identity matches the official @github/copilot CLI 1.0.84-1.
-		expect(headers["User-Agent"]).toMatch(/^copilot\/1\.0\.84-1 .* client\/github\/cli$/);
+		// Identity matches the official @github/copilot CLI 1.0.84-5.
+		expect(headers["User-Agent"]).toMatch(/^copilot\/1\.0\.84-5 .* client\/github\/cli$/);
 		expect(headers["Copilot-Integration-Id"]).toBe("copilot-developer-cli");
-		expect(headers["Editor-Version"]).toBe("copilot/1.0.84-1");
+		expect(headers["Editor-Version"]).toBe("copilot/1.0.84-5");
 		expect(headers["Editor-Plugin-Version"]).toBeUndefined();
 		expect(headers["X-GitHub-Api-Version"]).toBe("2026-08-01");
 
@@ -92,14 +92,16 @@ describe("Copilot Claude via Anthropic Messages", () => {
 		expect(beta).not.toContain("fine-grained-tool-streaming");
 
 		const params = mockState.createParams!;
-		expect(params.model).toBe("claude-sonnet-4.5");
+		expect(params.model).toBe("claude-sonnet-4.6");
 		expect(params.stream).toBe(true);
 		expect(params.max_tokens).toBeGreaterThan(0);
 		expect(Array.isArray(params.messages)).toBe(true);
 	});
 
 	it("includes interleaved-thinking beta when reasoning is enabled", async () => {
-		const model = getModel("github-copilot", "claude-sonnet-4.5");
+		// claude-haiku-4.5: the beta header is only sent for non-adaptive-thinking models,
+		// and haiku is the only remaining non-adaptive Claude in the Copilot catalog.
+		const model = getModel("github-copilot", "claude-haiku-4.5");
 		const { streamAnthropic } = await import("../src/providers/anthropic.js");
 		const s = streamAnthropic(model, context, {
 			apiKey: "tid_copilot_session_test_token",

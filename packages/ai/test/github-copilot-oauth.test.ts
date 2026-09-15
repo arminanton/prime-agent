@@ -49,7 +49,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 				expect(init?.headers).toMatchObject({
 					Accept: "application/json",
 					"Content-Type": "application/x-www-form-urlencoded",
-					"User-Agent": expect.stringMatching(/^copilot\/1\.0\.84-1 /),
+					"User-Agent": expect.stringMatching(/^copilot\/1\.0\.84-5 /),
 				});
 				expect(String(init?.body)).toContain("client_id=");
 				expect(String(init?.body)).toContain("scope=read%3Auser");
@@ -81,8 +81,8 @@ describe("GitHub Copilot OAuth device flow", () => {
 
 			if (url.includes("/copilot_internal/v2/token")) {
 				expect(init?.headers).toMatchObject({
-					"User-Agent": expect.stringMatching(/^copilot\/1\.0\.84-1 /),
-					"Editor-Version": "copilot/1.0.84-1",
+					"User-Agent": expect.stringMatching(/^copilot\/1\.0\.84-5 /),
+					"Editor-Version": "copilot/1.0.84-5",
 					"Copilot-Integration-Id": "copilot-developer-cli",
 				});
 				expect(init?.headers).not.toHaveProperty("Editor-Plugin-Version");

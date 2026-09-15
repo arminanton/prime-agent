@@ -38,15 +38,13 @@ describe("copilot dynamic headers", () => {
 		delete process.env.GITHUB_COPILOT_INTEGRATION_ID;
 	});
 
-	it("presents the captured Copilot CLI 1.0.84-1 identity", () => {
+	it("presents the captured Copilot CLI 1.0.84-5 identity", () => {
 		const headers = buildCopilotDynamicHeaders({ messages: userTurn, hasImages: false });
 		expect(headers["Copilot-Integration-Id"]).toBe("copilot-developer-cli");
 		expect(headers["User-Agent"]).toMatch(
-			new RegExp(
-				`^copilot/1\\.0\\.84-1 \\(${process.platform} ${process.version.replaceAll(".", "\\.")}\\) term/.+ client/github/cli$`,
-			),
+			new RegExp(`^copilot/1\\.0\\.84-5 \\(${process.platform} v24\\.20\\.0\\) term/.+ client/github/cli$`),
 		);
-		expect(headers["Editor-Version"]).toBe("copilot/1.0.84-1");
+		expect(headers["Editor-Version"]).toBe("copilot/1.0.84-5");
 		expect(headers["Editor-Plugin-Version"]).toBeUndefined();
 		expect(headers["X-GitHub-Api-Version"]).toBe("2026-08-01");
 	});
@@ -104,8 +102,8 @@ describe("copilot dynamic headers", () => {
 
 	it("keeps package wire identity stable when COPILOT_CLI_VERSION changes CLI behavior", () => {
 		process.env.COPILOT_CLI_VERSION = "9.8.7-test";
-		expect(copilotCliVersion()).toBe("1.0.84-1");
-		expect(copilotUserAgent()).toMatch(/^copilot\/1\.0\.84-1 /);
+		expect(copilotCliVersion()).toBe("1.0.84-5");
+		expect(copilotUserAgent()).toMatch(/^copilot\/1\.0\.84-5 /);
 	});
 
 	it("honors the official GITHUB_COPILOT_INTEGRATION_ID override", () => {
@@ -141,7 +139,7 @@ describe("copilot dynamic headers", () => {
 	});
 
 	it("uses the control-plane user agent without the inference suffix", () => {
-		expect(copilotControlPlaneUserAgent()).toMatch(/^copilot\/1\.0\.84-1 /);
+		expect(copilotControlPlaneUserAgent()).toMatch(/^copilot\/1\.0\.84-5 /);
 		expect(copilotControlPlaneUserAgent()).not.toContain("client/github/cli");
 	});
 

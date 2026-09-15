@@ -22,6 +22,7 @@ import type { CustomMessage } from "../../core/messages.js";
 import type { QueuedMessageLane, QueuedMessageMutation } from "../../core/session-action-store.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { SessionUsageSummary } from "../../core/usage.js";
 import type {
 	AgentConnectionAgentStatus,
 	AgentConnectionHeartbeat,
@@ -70,9 +71,12 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 23 lets workers query the supervisor agent roster on demand.
 // Revision 24 adds the capability-gated agent-roster subscription and push.
 // Revision 25 adds capability-gated direct worker peer transport discovery.
-// Revision 26 lets an attached resident client provide transient context for failed-worker recovery.
-export const DAEMON_SCHEMA_REVISION = 26;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-26-fb17baab29ad";
+// Revision 26 publishes own-session usage totals on session summary and saved-session rows.
+// Revision 27 adds structured session_recovering failure info for known-but-unaddressable sessions.
+// Revision 28 publishes the last recorded model on saved-session rows.
+// Revision 29 lets an attached resident client provide transient context for failed-worker recovery.
+export const DAEMON_SCHEMA_REVISION = 29;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-29-f50bed649543";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -746,7 +750,7 @@ const OWNED_SESSION_RECOVERY_CONTEXT = {
 } as const;
 const RESIDENT_WORKER_RECOVERY_CONTEXT = {
 	minProtocol: 7,
-	minSchemaRevision: 26,
+	minSchemaRevision: 29,
 	capability: "resident_worker_recovery_context",
 } as const;
 const RLM_QUIESCENCE_BARRIER_COMMAND = {
@@ -1058,6 +1062,7 @@ export type DaemonErrorInfo =
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string }
 	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
+	| { code: "session_recovering"; activeSessionId: string }
 	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
@@ -1108,6 +1113,9 @@ export interface DaemonSavedSessionInfo {
 	firstMessage: string;
 	allMessagesText: string;
 	agentStatus?: AgentConnectionAgentStatus;
+	usage?: SessionUsageSummary;
+	/** Last recorded provider/model selector; absent for sessions that never ran a model. */
+	model?: { provider: string; modelId: string };
 }
 
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;
@@ -1248,7 +1256,7 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	session_detached: LEGACY_DAEMON_COMMAND,
 	session_worker_recovering: {
 		minProtocol: 7,
-		minSchemaRevision: 26,
+		minSchemaRevision: 29,
 		capability: "resident_worker_recovery_notifications",
 	},
 	session_closed: LEGACY_DAEMON_COMMAND,

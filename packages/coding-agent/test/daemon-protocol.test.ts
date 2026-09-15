@@ -212,7 +212,7 @@ describe("daemon protocol helpers", () => {
 				},
 			}),
 		).toEqual([
-			{ minProtocol: 7, minSchemaRevision: 26, capability: "resident_worker_recovery_context" },
+			{ minProtocol: 7, minSchemaRevision: 29, capability: "resident_worker_recovery_context" },
 			{ minProtocol: 7 },
 		]);
 		expect(getDaemonCommandCompatibilities({ type: "retry_worker", activeSessionId: "active-1" })).toEqual([
@@ -229,7 +229,7 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain("resident_worker_recovery_context");
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_worker_recovering).toEqual({
 			minProtocol: 7,
-			minSchemaRevision: 26,
+			minSchemaRevision: 29,
 			capability: "resident_worker_recovery_notifications",
 		});
 		expect(
@@ -239,7 +239,7 @@ describe("daemon protocol helpers", () => {
 				capabilities: ["resident_worker_recovery_notifications"],
 			}),
 		).toEqual([
-			{ minProtocol: 7, minSchemaRevision: 26, capability: "resident_worker_recovery_context" },
+			{ minProtocol: 7, minSchemaRevision: 29, capability: "resident_worker_recovery_context" },
 			DAEMON_COMMAND_COMPATIBILITY.get_direct_worker_transport,
 		]);
 	});

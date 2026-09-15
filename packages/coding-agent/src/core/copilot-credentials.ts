@@ -105,10 +105,27 @@ function isUsableCopilotToken(token: string): boolean {
  * is currently active. Returns undefined when gh is unavailable or has no token
  * for the requested user/host.
  */
+const GH_CLI_TOKEN_CACHE_TTL_MS = 60_000;
+let ghCliTokenCache: { identity: string; token: string | undefined; expiresAt: number } | undefined;
+
 function resolveGhCliToken(): string | undefined {
 	const host = copilotPinnedHost();
 	const user = copilotPinnedUser();
+	const identity = `${host}\0${user}`;
+	if (ghCliTokenCache && ghCliTokenCache.identity === identity && ghCliTokenCache.expiresAt > Date.now()) {
+		return ghCliTokenCache.token;
+	}
+	const token = readGhCliToken(host, user);
+	ghCliTokenCache = { identity, token, expiresAt: Date.now() + GH_CLI_TOKEN_CACHE_TTL_MS };
+	return token;
+}
 
+/** Drop the memoized gh token so the next resolution re-reads the credential store. */
+export function resetGhCliTokenCache(): void {
+	ghCliTokenCache = undefined;
+}
+
+function readGhCliToken(host: string, user: string): string | undefined {
 	// Strip ambient tokens so gh reads its own credential store (hosts.yml)
 	// rather than short-circuiting and echoing the shell token back.
 	const cleanEnv: Record<string, string | undefined> = { ...process.env };

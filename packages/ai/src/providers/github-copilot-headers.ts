@@ -4,7 +4,7 @@ import type { Api, Message } from "../types.js";
  * GitHub Copilot request identity.
  *
  * The ordinary first-turn fields below were captured from the official
- * `@github/copilot` CLI 1.0.84-1 across `/responses`, `/chat/completions`, and
+ * `@github/copilot` CLI 1.0.84-5 across `/responses`, `/chat/completions`, and
  * `/v1/messages`. Conditional fields found in the executable but not observed
  * on those requests are documented separately and are not synthesized.
  */
@@ -12,14 +12,14 @@ import type { Api, Message } from "../types.js";
 // Package version embedded in the authoritative executable and used for its
 // User-Agent and Editor-Version. COPILOT_CLI_VERSION changes CLI behavior but
 // does not change this package identity on the wire.
-export const COPILOT_CLI_VERSION_FALLBACK = "1.0.84-1";
+export const COPILOT_CLI_VERSION_FALLBACK = "1.0.84-5";
 
-// Exact API version captured on 1.0.84-1 catalog and inference requests.
+// Exact API version captured on 1.0.84-5 catalog and inference requests.
 // Context tier selection changes client-side limits, not this header.
 const COPILOT_API_VERSION_FALLBACK = "2026-08-01";
 
 // The CLI integration id. The official executable reads this override name.
-const COPILOT_INTEGRATION_ID_DEFAULT = "copilot-developer-cli";
+export const COPILOT_INTEGRATION_ID_DEFAULT = "copilot-developer-cli";
 
 // Fixed interaction type. X-Initiator, rather than Openai-Intent, identifies
 // whether the current turn was initiated by the user or agent.
@@ -73,11 +73,14 @@ function nodePlatform(): string {
 	return typeof process !== "undefined" && process.platform ? process.platform : "linux";
 }
 
+// Node runtime embedded in the official CLI's single-executable build. The CLI
+// reports this token, not the host's Node, so the default follows the binary.
+const COPILOT_CLI_EMBEDDED_NODE_VERSION = "v24.20.0";
+
 function nodeVersion(): string {
 	const override = env("COPILOT_NODE_VERSION");
 	if (override) return override.startsWith("v") ? override : `v${override}`;
-	if (typeof process !== "undefined" && process.version) return process.version;
-	return "";
+	return COPILOT_CLI_EMBEDDED_NODE_VERSION;
 }
 
 /** TERM_PROGRAM token for the User-Agent, including the CLI's `unknown` fallback. */
@@ -186,7 +189,7 @@ export function hasCopilotVisionInput(messages: Message[]): boolean {
  * @param params.sessionId   - stable per-conversation id (maps to X-Client-Session-Id)
  * @param params.isStreaming - whether this is a streamed request (adds the SDK marker)
  *
- * The 1.0.84-1 binary also contains conditional candidates
+ * The 1.0.84-5 binary also contains conditional candidates
  * `X-Parent-Agent-Id`, `X-GitHub-User`, `X-GitHub-Actor-Type`, `Request-HMAC`,
  * `X-Copilot-API-Exp-Assignment-Context`, `X-Copilot-Service-Request-Id`,
  * `X-GitHub-Copilot-Request-TE`, and `Copilot-Subsystem-Id`. Ordinary

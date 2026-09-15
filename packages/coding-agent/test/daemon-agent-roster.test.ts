@@ -395,6 +395,28 @@ describe("worker roster reporter", () => {
 		expect(daemon.rosterReporter.lastComposed.has("session-root-active")).toBe(false);
 	});
 
+	it("republishes a finished row as idle once the settled verdict makes the summary current", async () => {
+		const { daemon, sentDeltas } = makeWorkerReporter();
+		const state = makeState({
+			activeSessionId: "finished",
+			sessionFile: "/tmp/finished.jsonl",
+			messages: [{ role: "user", content: "hi", timestamp: 1 } as unknown as AgentMessage],
+		});
+		daemon.sessions.set("finished", state);
+		daemon.flushRoster();
+		expect(sentDeltas.at(-1)?.entries.map((entry) => entry.summary.activity)).toEqual(["working"]);
+
+		(state as unknown as { summaryState?: unknown }).summaryState = {
+			summary: "Waiting for review",
+			taskState: "needs_input",
+			basedOnMessageCount: 1,
+		};
+		daemon.observeRosterEvent(state, { type: "session_status", activeSessionId: "finished" });
+		await new Promise((resolve) => setImmediate(resolve));
+
+		expect(sentDeltas.at(-1)?.entries.map((entry) => entry.summary.activity)).toEqual(["idle"]);
+	});
+
 	it("flushes cron and model changes that have no session-event carrier", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-roster-cron-flush-"));
 		tempDirs.push(directory);
@@ -445,7 +467,9 @@ describe("worker roster reporter", () => {
 
 		// set_model has no session-event carrier either; its explicit flush publishes the new model.
 		const session = state.runtime.session as unknown as Record<string, unknown>;
-		session.modelRegistry = { refreshAvailableModels: async () => [{ provider: "prov", id: "m2" }] };
+		session.modelRegistry = {
+			refreshAvailableModels: async () => [{ provider: "prov", id: "m2" }],
+		};
 		session.setModel = async (model: unknown) => {
 			session.model = model;
 		};
