@@ -3126,8 +3126,19 @@ export class DaemonSupervisor {
 			if (identity !== "gone" && identity !== "replaced") {
 				return false;
 			}
+			// Mark the reclaim in progress, but keep it RETRYABLE on a transient cleanup failure:
+			// isReclaimableDeadDescriptor excludes a worker that isWorkerStopping (intentionalStop),
+			// so if recoverUncertainWorkerOperations rejects we must roll the temporary stop intent
+			// back or a later sweep would never retry this confirmed-dead descriptor. The descriptor
+			// and its journal are retained on failure (nothing below the reject ran).
+			const previousIntentionalStop = worker.intentionalStop;
 			worker.intentionalStop = true;
-			await this.recoverUncertainWorkerOperations(worker);
+			try {
+				await this.recoverUncertainWorkerOperations(worker);
+			} catch (error) {
+				worker.intentionalStop = previousIntentionalStop;
+				throw error;
+			}
 			this.invalidateWorkerSessionInputPauses(worker, "Session worker stopped while input was paused");
 			this.workers.delete(worker.descriptor.workerId);
 			this.flipWorkerRosterEntriesInactive(worker);
@@ -5246,7 +5257,16 @@ export class DaemonSupervisor {
 				);
 			}
 		}
-		if (removed.length > 0 && !this.shuttingDown) {
+		// Only broadcast (which recomputes + arms a scheduled-session wake) from reclaim when the
+		// daemon is fully ready and not tearing down / preparing an update restart. At boot the
+		// reclaim runs before markReady, and broadcast does not await, so a due-wake could otherwise
+		// start before startupComplete; boot re-arms the wake one line after the reclaim regardless.
+		if (
+			removed.length > 0 &&
+			this.startupComplete &&
+			!this.shuttingDown &&
+			this.updateRestartPhase === undefined
+		) {
 			this.broadcastHeartbeatsChanged();
 		}
 		return removed;

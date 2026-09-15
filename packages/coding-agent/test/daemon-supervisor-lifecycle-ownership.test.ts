@@ -41,6 +41,11 @@ interface SupervisorHandle {
 	isReclaimableDeadDescriptor(worker: TestWorker): boolean;
 	reclaimStaleDeadWorkers(): Promise<TestWorker[]>;
 	prepareUpdateRestartFenced(deadline: number): Promise<{ sessions: unknown[] }>;
+	// Lifecycle gates read by the reclaim broadcast (M3) and settable per test.
+	startupComplete: boolean;
+	shuttingDown: boolean;
+	updateRestartPhase?: "draining" | "fencing" | "prepared";
+	broadcastHeartbeatsChanged: () => void;
 }
 
 function makeSupervisor(processIdentity: (pid: number, startId?: string) => Identity = () => "current"): SupervisorHandle {
@@ -220,5 +225,101 @@ describe("daemon supervisor lifecycle-aware ownership (F10)", () => {
 		expect(sup.workers.size).toBe(0);
 		expect(manifest.sessions).toEqual([]);
 		expect(sup.validateAndPersistUpdateManifest).toHaveBeenCalledTimes(1);
+	});
+
+	it("a transient cleanup failure stays retryable and reclaims on a later sweep (A.3 M4)", async () => {
+		// The trap: intentionalStop was set BEFORE the awaited cleanup and never rolled back, so a
+		// transient recoverUncertainWorkerOperations rejection wedged the worker as "stopping" and
+		// isReclaimableDeadDescriptor then excluded it forever (no retry after the fault cleared).
+		const sup = makeSupervisor(() => "gone");
+		const dead = makeWorker({ workerId: "dead", lifecycle: "failed", pid: 1, processStartId: "old" });
+		sup.workers.set(dead.descriptor.workerId, dead);
+		let attempts = 0;
+		sup.recoverUncertainWorkerOperations = vi.fn(async () => {
+			attempts += 1;
+			if (attempts === 1) throw new Error("injected transient cleanup error");
+		});
+
+		// First sweep: cleanup rejects. The descriptor is retained AND stays retryable.
+		await sup.reclaimStaleDeadWorkers();
+		expect(attempts).toBe(1);
+		expect(sup.workers.has("dead")).toBe(true);
+		expect(dead.intentionalStop).toBe(false);
+		expect(sup.isReclaimableDeadDescriptor(dead)).toBe(true);
+		expect(sup.deleteWorkerDescriptor).not.toHaveBeenCalled();
+
+		// A later sweep once the fault clears reclaims the worker.
+		await sup.reclaimStaleDeadWorkers();
+		expect(attempts).toBe(2);
+		expect(sup.workers.has("dead")).toBe(false);
+		expect(sup.deleteWorkerDescriptor).toHaveBeenCalledWith(dead);
+	});
+
+	it("reclaim broadcasts a wake only when fully ready, never during boot or update-restart (A.3 M3)", async () => {
+		const broadcastCount = async (state: {
+			startupComplete: boolean;
+			shuttingDown: boolean;
+			updateRestartPhase?: "draining" | "fencing" | "prepared";
+		}): Promise<number> => {
+			const sup = makeSupervisor(() => "gone");
+			sup.workers.set("dead", makeWorker({ workerId: "dead", lifecycle: "failed", pid: 1 }));
+			Object.assign(sup, state);
+			const broadcast = vi.fn();
+			sup.broadcastHeartbeatsChanged = broadcast;
+			await sup.reclaimStaleDeadWorkers();
+			return broadcast.mock.calls.length;
+		};
+
+		// Boot: the reclaim runs before markReady/startupComplete, so it must not arm an early wake.
+		expect(await broadcastCount({ startupComplete: false, shuttingDown: false })).toBe(0);
+		// Preparing an update restart: no wake armed.
+		expect(await broadcastCount({ startupComplete: true, shuttingDown: false, updateRestartPhase: "draining" })).toBe(0);
+		// Shutting down: no wake.
+		expect(await broadcastCount({ startupComplete: true, shuttingDown: true })).toBe(0);
+		// Fully ready normal operation: the reclaim broadcasts so a freed root can be woken.
+		expect(await broadcastCount({ startupComplete: true, shuttingDown: false })).toBe(1);
+	});
+
+	it("a sole root: ready+covered -> disconnect+failed -> reclaimed so a due wake can fire (A.3)", async () => {
+		// End-to-end at the supervisor-method level (no real worker process): a lone root that owns
+		// its scheduled job covers its own wake while ready; once its client disconnects and its
+		// process dies (parked failed), the dead descriptor stops masking the root from the wake
+		// scan, is reclaimed, and the now-ready daemon arms a wake recompute for the due job.
+		let identity: Identity = "current";
+		const sup = makeSupervisor(() => identity);
+		Object.assign(sup, { startupComplete: true, shuttingDown: false });
+		const broadcast = vi.fn();
+		sup.broadcastHeartbeatsChanged = broadcast;
+		const sessionFile = "/tmp/prime-agent-f10-test/sole-root.jsonl";
+		const root = makeWorker({
+			workerId: "root",
+			lifecycle: "ready",
+			pid: 7,
+			processStartId: "s",
+			sessionFile,
+			client: {},
+		});
+		sup.workers.set(root.descriptor.workerId, root);
+
+		// Ready + connected: the root covers its own scheduled wake and is not reclaimable.
+		expect(sup.findWakeableWorkerBySessionFile(sessionFile)).toBe(root);
+		expect(sup.isReclaimableDeadDescriptor(root)).toBe(false);
+
+		// The client disconnects and the process dies; the monitor parks the descriptor failed.
+		root.client = undefined;
+		root.descriptor.ownerClientId = undefined;
+		root.descriptor.lifecycle = "failed";
+		identity = "gone";
+
+		// The failed dead descriptor no longer masks the root from the wake scan and is reclaimable.
+		expect(sup.findWakeableWorkerBySessionFile(sessionFile)).toBeUndefined();
+		expect(sup.isReclaimableDeadDescriptor(root)).toBe(true);
+
+		// Reclaim removes it and, now that the daemon is fully ready, arms a wake recompute so the
+		// sole root's due scheduled job can fire.
+		const removed = await sup.reclaimStaleDeadWorkers();
+		expect(removed).toEqual([root]);
+		expect(sup.workers.has("root")).toBe(false);
+		expect(broadcast).toHaveBeenCalledTimes(1);
 	});
 });
