@@ -94,6 +94,18 @@ const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
 const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
 const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
+// Non-destructive rebuild layout: each generation is a versioned sibling venv dir
+// `<base>-<generationHash>`; a small sibling pointer file names the live generation,
+// and a sibling failure marker rate-limits doomed rebuilds. None of these live inside
+// a venv, so publishing/failing never mutates a venv other kernels are importing from.
+const BOOTSTRAP_POINTER_SUFFIX = ".current";
+const BOOTSTRAP_FAILED_SUFFIX = ".bootstrap-failed";
+const BOOTSTRAP_GENERATION_HASH_LENGTH = 16;
+const BOOTSTRAP_BACKOFF_BASE_MS = 60_000;
+const BOOTSTRAP_BACKOFF_MAX_MS = 30 * 60_000;
+// A superseded generation is GC'd only once it has been idle this long, so a kernel
+// that just launched against it is not pulled out from under mid-import.
+const BOOTSTRAP_GENERATION_GC_GRACE_MS = 60 * 60_000;
 
 let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
 
@@ -118,6 +130,22 @@ interface BootstrapVersion {
 	snapshot?: string;
 	extraUvArgs?: string[];
 	pythonSkills?: BootstrapPythonSkill[];
+}
+
+interface BootstrapPointer {
+	// Basename (relative to the base dir's parent) of the live generation venv.
+	current: string;
+	// Basename of the generation kept for rollback.
+	previous?: string;
+	updatedAt: number;
+}
+
+interface BootstrapFailureMarker {
+	// Generation identity this backoff applies to; a changed identity bypasses it.
+	identity: string;
+	attempt: number;
+	nextRetryAt: number;
+	lastError?: string;
 }
 
 function errorMessage(error: unknown): string {
@@ -370,10 +398,67 @@ function ensureKernelPythonKey(pythonSkills: readonly BootstrapPythonSkill[]): s
 	].join("\0");
 }
 
-export function getKernelVenvDir(): string {
+// Root of the kernel-venv family (override or default). Generation dirs, the pointer,
+// and the failure marker all hang off this base path as siblings.
+function getBaseKernelVenvDir(): string {
 	const override = process.env.PRIME_AGENT_KERNEL_VENV;
 	if (override) return path.resolve(expandHome(override));
 	return path.join(os.homedir(), ".prime", "agent", "kernel-venv");
+}
+
+// Content-addressed identity of the EXPENSIVE part of a venv (runtime + interpreter +
+// default packages) used to name a generation dir. Python skills are installed
+// incrementally into an existing generation, so they are deliberately excluded here:
+// a skill change syncs in place rather than forcing a full rebuild into a new dir.
+function bootstrapGenerationHash(runtimeIdentity: string): string {
+	const identity = JSON.stringify({
+		schema: BOOTSTRAP_SCHEMA,
+		runtime: runtimeIdentity,
+		snapshot: STATE_SNAPSHOT_REQUIREMENT,
+		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+	});
+	return createHash("sha256").update(identity).digest("hex").slice(0, BOOTSTRAP_GENERATION_HASH_LENGTH);
+}
+
+function generationVenvDir(baseDir: string, generationHash: string): string {
+	return `${baseDir}-${generationHash}`;
+}
+
+function bootstrapPointerPath(baseDir: string): string {
+	return `${baseDir}${BOOTSTRAP_POINTER_SUFFIX}`;
+}
+
+function bootstrapFailedPath(baseDir: string): string {
+	return `${baseDir}${BOOTSTRAP_FAILED_SUFFIX}`;
+}
+
+function readBootstrapPointer(baseDir: string): BootstrapPointer | null {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(bootstrapPointerPath(baseDir), "utf8"));
+		if (!isRecord(parsed) || typeof parsed.current !== "string") return null;
+		return {
+			current: parsed.current,
+			previous: typeof parsed.previous === "string" ? parsed.previous : undefined,
+			updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0,
+		};
+	} catch {
+		return null;
+	}
+}
+
+// The live venv dir the pointer publishes, or null when there is no valid pointer.
+function publishedGenerationDir(baseDir: string): string | null {
+	const pointer = readBootstrapPointer(baseDir);
+	if (!pointer) return null;
+	const dir = path.join(path.dirname(baseDir), pointer.current);
+	return existsSync(dir) ? dir : null;
+}
+
+export function getKernelVenvDir(): string {
+	const baseDir = getBaseKernelVenvDir();
+	// The live generation when one is published; otherwise the base path, which also
+	// covers a legacy pre-generation venv that still lives directly at the base.
+	return publishedGenerationDir(baseDir) ?? baseDir;
 }
 
 function getXdgKernelVenvDir(): string {
@@ -384,7 +469,7 @@ function getXdgKernelVenvDir(): string {
 }
 
 async function resolveWritableKernelVenvDir(): Promise<string> {
-	const primary = getKernelVenvDir();
+	const primary = getBaseKernelVenvDir();
 	try {
 		await mkdir(path.dirname(primary), { recursive: true });
 		return primary;
@@ -913,6 +998,104 @@ function formatBootstrapFailure(error: unknown): Error {
 	);
 }
 
+// Publish a freshly validated generation for readers with a single pointer write. The
+// generation being replaced is kept as `previous` for rollback. A torn/partial pointer
+// fails JSON.parse in readBootstrapPointer, and callers fall back to the base dir.
+async function publishGeneration(baseDir: string, generationDir: string): Promise<void> {
+	const current = path.basename(generationDir);
+	const existing = readBootstrapPointer(baseDir);
+	const previous = existing && existing.current !== current ? existing.current : existing?.previous;
+	const pointer: BootstrapPointer = {
+		current,
+		...(previous && previous !== current ? { previous } : {}),
+		updatedAt: Date.now(),
+	};
+	await writeFile(bootstrapPointerPath(baseDir), `${JSON.stringify(pointer)}\n`, "utf8");
+}
+
+function readBootstrapFailure(baseDir: string): BootstrapFailureMarker | null {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(bootstrapFailedPath(baseDir), "utf8"));
+		if (
+			!isRecord(parsed) ||
+			typeof parsed.identity !== "string" ||
+			typeof parsed.attempt !== "number" ||
+			typeof parsed.nextRetryAt !== "number"
+		) {
+			return null;
+		}
+		return {
+			identity: parsed.identity,
+			attempt: parsed.attempt,
+			nextRetryAt: parsed.nextRetryAt,
+			lastError: typeof parsed.lastError === "string" ? parsed.lastError : undefined,
+		};
+	} catch {
+		return null;
+	}
+}
+
+// Exponential backoff 1, 2, 4, ... minutes, capped, so a doomed rebuild is not retried
+// by every later kernel boot (the freeze-day cascade).
+function bootstrapBackoffMs(attempt: number): number {
+	const exponent = Math.max(0, attempt - 1);
+	return Math.min(BOOTSTRAP_BACKOFF_BASE_MS * 2 ** exponent, BOOTSTRAP_BACKOFF_MAX_MS);
+}
+
+async function recordBootstrapFailure(baseDir: string, identity: string, error: unknown): Promise<void> {
+	const existing = readBootstrapFailure(baseDir);
+	const attempt = existing && existing.identity === identity ? existing.attempt + 1 : 1;
+	const marker: BootstrapFailureMarker = {
+		identity,
+		attempt,
+		nextRetryAt: Date.now() + bootstrapBackoffMs(attempt),
+		lastError: errorMessage(error).slice(0, RUN_STDERR_TAIL_CHARS),
+	};
+	await writeFile(bootstrapFailedPath(baseDir), `${JSON.stringify(marker)}\n`, "utf8");
+}
+
+async function clearBootstrapFailure(baseDir: string): Promise<void> {
+	await rm(bootstrapFailedPath(baseDir), { force: true });
+}
+
+// A waiter that hits an active backoff fails fast, without running uv, until nextRetryAt.
+function bootstrapBackoffError(marker: BootstrapFailureMarker): Error {
+	const retryAt = new Date(marker.nextRetryAt).toISOString();
+	return new Error(
+		`kernel venv bootstrap failed ${marker.attempt} time(s) for this runtime; ` +
+			`not rebuilding again before ${retryAt} (a runtime or skill change retries immediately). ` +
+			`Last error: ${marker.lastError ?? "unknown"}`,
+	);
+}
+
+// Reclaim superseded generation dirs. Best-effort: the live and immediately-previous
+// generations are kept, and only idle dirs are removed, so this never disturbs a venv a
+// kernel is importing from and never fails a bootstrap.
+async function gcOldGenerations(baseDir: string): Promise<void> {
+	try {
+		const pointer = readBootstrapPointer(baseDir);
+		const keep = new Set<string>();
+		if (pointer?.current) keep.add(pointer.current);
+		if (pointer?.previous) keep.add(pointer.previous);
+		const parent = path.dirname(baseDir);
+		const prefix = `${path.basename(baseDir)}-`;
+		const now = Date.now();
+		for (const entry of await readdir(parent, { withFileTypes: true })) {
+			if (!entry.isDirectory() || !entry.name.startsWith(prefix) || keep.has(entry.name)) continue;
+			const dir = path.join(parent, entry.name);
+			try {
+				const info = await stat(dir);
+				if (now - info.mtimeMs < BOOTSTRAP_GENERATION_GC_GRACE_MS) continue;
+				await rm(dir, { recursive: true, force: true });
+			} catch {
+				// A generation racing another GC or still in use is left alone.
+			}
+		}
+	} catch {
+		// GC must never fail a bootstrap.
+	}
+}
+
 async function ensureKernelPythonUncached(
 	options: EnsureKernelPythonOptions,
 	pythonSkills: readonly BootstrapPythonSkill[],
@@ -954,34 +1137,81 @@ async function ensureKernelPythonUncached(
 	// nothing to (re)install, so a stale-looking venv must not be torn down.
 	const runtimeSourceDir = await requireRuntimeSourceDir();
 	const runtimeIdentity = await hashRuntimeSource(runtimeSourceDir);
-	const venv = await resolveWritableKernelVenvDir();
-	const python = kernelVenvPython(venv);
-	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
+	const baseDir = await resolveWritableKernelVenvDir();
+	const generationHash = bootstrapGenerationHash(runtimeIdentity);
+	const generationDir = generationVenvDir(baseDir, generationHash);
 
-	const releaseLock = await acquireBootstrapLock(venv);
+	// The live venv is the published generation, or a legacy venv still sitting at the
+	// base path (pre-generation layout). Reuse it untouched whenever it is already
+	// current, so an identity that has not changed never triggers a rebuild.
+	const liveDir = publishedGenerationDir(baseDir) ?? baseDir;
+	const livePython = kernelVenvPython(liveDir);
+	if (await kernelReady(livePython, liveDir, runtimeIdentity, pythonSkills)) return livePython;
+
+	const releaseLock = await acquireBootstrapLock(baseDir);
 	try {
-		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
-		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
-			await syncPythonSkills(await ensureUv(options), venv, python, runtimeIdentity, pythonSkills, options);
-			return python;
+		// Recheck under the lock: another process may have just published a generation.
+		const currentDir = publishedGenerationDir(baseDir) ?? baseDir;
+		const currentPython = kernelVenvPython(currentDir);
+		if (await kernelReady(currentPython, currentDir, runtimeIdentity, pythonSkills)) return currentPython;
+
+		// Base (runtime + interpreter + default packages) already matches: install only
+		// the changed Python skills into the live venv in place. This is the cheap path;
+		// it never rebuilds and never removes the live venv, so it stays safe under load.
+		if (await kernelBaseReady(currentPython, currentDir, runtimeIdentity)) {
+			await syncPythonSkills(
+				await ensureUv(options),
+				currentDir,
+				currentPython,
+				runtimeIdentity,
+				pythonSkills,
+				options,
+			);
+			return currentPython;
 		}
 
-		const hadVenv = existsSync(venv);
-		reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
-		if (hadVenv) {
-			reportProgress(options, "rebuilding kernel venv");
-			await rm(venv, { recursive: true, force: true });
+		// A full (expensive) rebuild is required. Fail fast while a genuinely failing
+		// rebuild of this same identity is in backoff (do not run uv). A changed identity
+		// has a different generationHash, so a real code change always retries at once.
+		const marker = readBootstrapFailure(baseDir);
+		if (marker && marker.identity === generationHash && Date.now() < marker.nextRetryAt) {
+			throw bootstrapBackoffError(marker);
 		}
 
-		await bootstrapVenv(venv, runtimeSourceDir, runtimeIdentity, pythonSkills, options);
+		const generationPython = kernelVenvPython(generationDir);
+		try {
+			reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
+			// Build into the versioned sibling dir. The live venv is never removed here;
+			// for an identity change generationDir differs from the live dir, so the
+			// working venv stays intact until the new one is validated and published.
+			// Only a leftover/partial dir for THIS identity is cleared before rebuilding.
+			if (existsSync(generationDir)) {
+				reportProgress(options, "rebuilding kernel venv");
+				await rm(generationDir, { recursive: true, force: true });
+			}
+			await bootstrapVenv(generationDir, runtimeSourceDir, runtimeIdentity, pythonSkills, options);
+			// Validate the runtime is actually importable and the base version was recorded
+			// before publishing. Python skills are best-effort (a failed optional skill is
+			// tolerated by syncPythonSkills), so the gate is base readiness, not kernelReady.
+			if (!(await kernelBaseReady(generationPython, generationDir, runtimeIdentity))) {
+				throw new Error(`kernel venv failed its readiness check after bootstrap: ${generationDir}`);
+			}
+			// Atomic publish (single pointer write), then drop the backoff marker.
+			await publishGeneration(baseDir, generationDir);
+			await clearBootstrapFailure(baseDir);
+		} catch (error) {
+			await recordBootstrapFailure(baseDir, generationHash, error).catch(() => undefined);
+			throw error;
+		}
+		// Reclaim superseded generations only after a successful publish; best-effort.
+		await gcOldGenerations(baseDir);
+		reportProgress(options, "✓ ready");
+		return generationPython;
 	} catch (error) {
 		throw formatBootstrapFailure(error);
 	} finally {
 		await releaseLock().catch(() => undefined);
 	}
-
-	reportProgress(options, "✓ ready");
-	return python;
 }
 
 export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Promise<string> {
