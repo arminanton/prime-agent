@@ -41,19 +41,23 @@ describe("GitHub Copilot model catalog", () => {
 	});
 
 	it.each([
-		["claude-fable-5.1", 1_000_000, 872_000, 128_000],
+		// Server-enforced prompt caps from the live catalog; output = probed server cap
+		// (Claude 128K, haiku 64K) or the chosen client ceiling (Gemini 200K), never the
+		// catalog max_output_tokens hint.
+		["claude-fable-5", 1_000_000, 936_000, 128_000],
+		["claude-fable-5.1", 1_000_000, 936_000, 128_000],
 		["claude-opus-4.5", 200_000, 168_000, 32_000],
 		["claude-opus-4.6", 200_000, 168_000, 32_000],
-		["claude-opus-4.7", 1_000_000, 936_000, 64_000],
-		["claude-opus-4.8", 1_000_000, 936_000, 64_000],
-		["claude-opus-4.8-fast", 1_000_000, 936_000, 64_000],
-		["claude-opus-5", 1_000_000, 936_000, 64_000],
+		["claude-opus-4.7", 1_000_000, 936_000, 128_000],
+		["claude-opus-4.8", 1_000_000, 936_000, 128_000],
+		["claude-opus-4.8-fast", 1_000_000, 936_000, 128_000],
+		["claude-opus-5", 1_000_000, 936_000, 128_000],
 		["claude-sonnet-4.5", 200_000, 168_000, 32_000],
-		["claude-sonnet-5", 1_000_000, 936_000, 64_000],
-		["gemini-3.5-flash", 1_000_000, 936_000, 64_000],
-		["gemini-3.6-flash", 1_000_000, 936_000, 64_000],
-		["gemini-3.7-flash", 1_000_000, 936_000, 64_000],
-		["gemini-3.8-flash", 1_048_576, 983_040, 65_536],
+		["claude-sonnet-5", 1_000_000, 936_000, 128_000],
+		["gemini-3.5-flash", 1_000_000, 936_000, 200_000],
+		["gemini-3.6-flash", 1_000_000, 936_000, 200_000],
+		["gemini-3.7-flash", 1_000_000, 936_000, 200_000],
+		["gemini-3.8-flash", 1_048_576, 983_040, 200_000],
 		["gpt-4.1", 128_000, 64_000, 16_384],
 		["gpt-5.2", 400_000, 272_000, 128_000],
 		["gpt-5.3-codex", 400_000, 272_000, 128_000],

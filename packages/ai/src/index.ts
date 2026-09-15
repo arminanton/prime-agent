@@ -11,6 +11,7 @@ export type { AnthropicEffort, AnthropicOptions, AnthropicThinkingDisplay } from
 export type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses.js";
 export * from "./providers/faux.js";
 export {
+	buildCopilotCatalogHeaders,
 	buildCopilotDynamicHeaders,
 	copilotApiVersion,
 	copilotCliVersion,

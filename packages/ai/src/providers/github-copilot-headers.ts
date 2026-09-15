@@ -200,6 +200,71 @@ export function hasCopilotVisionInput(messages: Message[]): boolean {
  * `service_tier`. `long_context` is a client-side catalog/session tier and was
  * not observed as an inference header or body field.
  */
+/**
+ * The CLI keeps X-Interaction-Id and X-Agent-Task-Id constant for a whole user
+ * turn: the first request (initiator "user") mints them and every tool-result
+ * follow-up (initiator "agent") repeats them. Track that per conversation.
+ */
+const turnIdsBySession = new Map<string, { interactionId: string; taskId: string }>();
+const MAX_TRACKED_TURN_SESSIONS = 512;
+
+function copilotTurnIds(
+	sessionId: string | undefined,
+	initiator: "user" | "agent",
+): { interactionId: string; taskId: string } {
+	if (!sessionId) return { interactionId: randomId(), taskId: randomId() };
+	const current = turnIdsBySession.get(sessionId);
+	if (initiator === "agent" && current) return current;
+	const fresh = { interactionId: randomId(), taskId: randomId() };
+	if (!turnIdsBySession.has(sessionId) && turnIdsBySession.size >= MAX_TRACKED_TURN_SESSIONS) {
+		const oldest = turnIdsBySession.keys().next().value;
+		if (oldest !== undefined) turnIdsBySession.delete(oldest);
+	}
+	turnIdsBySession.set(sessionId, fresh);
+	return fresh;
+}
+
+/** Test hook. */
+export function resetCopilotTurnIds(): void {
+	turnIdsBySession.clear();
+}
+
+/**
+ * Catalog (`GET /models`) identity: the CLI sends a smaller header set than on
+ * inference and a User-Agent without the `client/github/cli` suffix. No
+ * session, task, repository, or SDK marker headers.
+ */
+export function buildCopilotCatalogHeaders(): Record<string, string> {
+	return {
+		"User-Agent": copilotControlPlaneUserAgent(),
+		"Copilot-Integration-Id": copilotIntegrationId(),
+		"Editor-Version": `copilot/${copilotCliVersion()}`,
+		"X-GitHub-Api-Version": copilotApiVersion(),
+		"Copilot-Harness-Id": COPILOT_HARNESS_ID,
+		"X-Client-Machine-Id": copilotMachineId(),
+		"X-Interaction-Id": randomId(),
+		"X-Initiator": "user",
+		"Openai-Intent": COPILOT_INTENT_DEFAULT,
+		Accept: "application/json",
+	};
+}
+
+/**
+ * The Anthropic and OpenAI SDKs stamp X-Stainless-* fingerprint headers on every
+ * request. The CLI sends only X-Stainless-Helper-Method, so null the rest for
+ * Copilot hosts. Returns header overrides for the SDK client's defaultHeaders.
+ */
+export const COPILOT_SDK_HEADER_OVERRIDES: Readonly<Record<string, string | null>> = {
+	"X-Stainless-Lang": null,
+	"X-Stainless-Package-Version": null,
+	"X-Stainless-OS": null,
+	"X-Stainless-Arch": null,
+	"X-Stainless-Runtime": null,
+	"X-Stainless-Runtime-Version": null,
+	"X-Stainless-Retry-Count": null,
+	"X-Stainless-Timeout": null,
+};
+
 export function buildCopilotDynamicHeaders(params: {
 	messages: Message[];
 	hasImages: boolean;
@@ -209,6 +274,7 @@ export function buildCopilotDynamicHeaders(params: {
 }): Record<string, string> {
 	const initiator = inferCopilotInitiator(params.messages);
 
+	const turnIds = copilotTurnIds(params.sessionId, initiator);
 	const headers: Record<string, string> = {
 		"User-Agent": copilotUserAgent(),
 		"Copilot-Integration-Id": copilotIntegrationId(),
@@ -218,9 +284,9 @@ export function buildCopilotDynamicHeaders(params: {
 		"X-Interaction-Type": COPILOT_INTERACTION_TYPE,
 		"Copilot-Harness-Id": COPILOT_HARNESS_ID,
 		"X-Client-Machine-Id": copilotMachineId(),
-		"X-Interaction-Id": randomId(),
+		"X-Interaction-Id": turnIds.interactionId,
 		"X-Client-Session-Id": params.sessionId || randomId(),
-		"X-Agent-Task-Id": randomId(),
+		"X-Agent-Task-Id": turnIds.taskId,
 		"X-GitHub-Repository-Nwo": "__no_repository__",
 		"X-GitHub-Repository-Host": "__no_repository__",
 	};

@@ -98,9 +98,10 @@ describe("Copilot Claude via Anthropic Messages", () => {
 		expect(Array.isArray(params.messages)).toBe(true);
 	});
 
-	it("includes interleaved-thinking beta when reasoning is enabled", async () => {
-		// claude-haiku-4.5: the beta header is only sent for non-adaptive-thinking models,
-		// and haiku is the only remaining non-adaptive Claude in the Copilot catalog.
+	it("sends no anthropic-beta or browser-access header and nulls SDK fingerprints on Copilot", async () => {
+		// The official CLI carries no anthropic-beta on ordinary Copilot requests (CAPI
+		// ignores or denylists them), uses accept */* on /v1/messages, and sends only
+		// X-Stainless-Helper-Method from the SDK fingerprint set.
 		const model = getModel("github-copilot", "claude-haiku-4.5");
 		const { streamAnthropic } = await import("../src/providers/anthropic.js");
 		const s = streamAnthropic(model, context, {
@@ -111,7 +112,12 @@ describe("Copilot Claude via Anthropic Messages", () => {
 			if (event.type === "error") break;
 		}
 
-		const headers = mockState.constructorOpts!.defaultHeaders as Record<string, string>;
-		expect(headers["anthropic-beta"]).toContain("interleaved-thinking-2025-05-14");
+		const headers = mockState.constructorOpts!.defaultHeaders as Record<string, string | null>;
+		expect(headers["anthropic-beta"]).toBeUndefined();
+		expect(headers["anthropic-dangerous-direct-browser-access"]).toBeUndefined();
+		expect(headers.accept).toBe("*/*");
+		expect(headers["X-Stainless-Lang"]).toBeNull();
+		expect(headers["X-Stainless-Runtime-Version"]).toBeNull();
+		expect(headers["X-Stainless-Helper-Method"]).toBe("stream");
 	});
 });

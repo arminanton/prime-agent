@@ -37,6 +37,7 @@ import {
 	type CopilotModelCapabilities,
 	copilotPinnedBaseUrl,
 	fetchCopilotCatalogInfo,
+	refreshCopilotApiEndpoint,
 } from "./copilot-credentials.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
@@ -1225,6 +1226,15 @@ export class ModelRegistry {
 			// Copilot is not configured, or its credential source cannot be safely
 			// identified for an account-scoped cache.
 			return;
+		}
+		if (copilotPinnedBaseUrl() !== undefined) {
+			// Plan-aware host for pinned accounts: business/enterprise plans serve from
+			// their own endpoint; the front door remains the fallback while unresolved.
+			const before = copilotPinnedBaseUrl();
+			await refreshCopilotApiEndpoint(token);
+			if (copilotPinnedBaseUrl() !== before) {
+				this.reloadModelsAfterCatalogChange();
+			}
 		}
 		const cached = this.readCopilotEntitlementCache();
 		if (cached && cached.fingerprint === fingerprint) {

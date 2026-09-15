@@ -25,7 +25,7 @@
  *                         (also selects the enterprise Copilot domain)
  */
 
-import { copilotApiVersion, copilotCliVersion, copilotIntegrationId, copilotUserAgent } from "@earendil-works/pi-ai";
+import { buildCopilotCatalogHeaders } from "@earendil-works/pi-ai";
 import { spawnSync } from "child_process";
 
 const COPILOT_PIN_TOKEN_ENV = "COPILOT_GITHUB_TOKEN";
@@ -88,11 +88,76 @@ export function copilotPinnedBaseUrl(): string | undefined {
 	if (!hasCopilotPin() && !isUsableCopilotToken(readEnv(COPILOT_PIN_TOKEN_ENV))) {
 		return undefined;
 	}
+	const resolved = resolvedCopilotApiEndpoint();
+	if (resolved) return resolved;
 	const host = copilotPinnedHost();
 	if (host && host !== "github.com") {
 		return `https://copilot-api.${host}`;
 	}
 	return "https://api.githubcopilot.com";
+}
+
+/**
+ * Plan-aware inference host. The official CLI resolves it from
+ * `GET api.github.com/copilot_internal/user` -> `endpoints.api`
+ * (business accounts: https://api.business.githubcopilot.com), so the
+ * per-plan host is never guessed from a token or baked catalog row. The
+ * front door keeps serving the account when the lookup has not completed.
+ */
+let resolvedApiEndpoint: { identity: string; endpoint: string | undefined; expiresAt: number } | undefined;
+const COPILOT_ENDPOINT_TTL_MS = 60 * 60_000;
+
+export function resolvedCopilotApiEndpoint(): string | undefined {
+	const identity = copilotPinIdentity();
+	if (resolvedApiEndpoint && resolvedApiEndpoint.identity === identity && resolvedApiEndpoint.expiresAt > Date.now()) {
+		return resolvedApiEndpoint.endpoint;
+	}
+	return undefined;
+}
+
+/**
+ * Resolve and cache the account's Copilot API endpoint for the pinned identity.
+ * Returns the endpoint (or undefined when the lookup fails) without throwing.
+ */
+export async function refreshCopilotApiEndpoint(
+	token: string,
+	options?: { fetchFn?: typeof fetch; timeoutMs?: number },
+): Promise<string | undefined> {
+	const identity = copilotPinIdentity();
+	const cached = resolvedCopilotApiEndpoint();
+	if (cached) return cached;
+	const host = copilotPinnedHost() || "github.com";
+	const url =
+		host === "github.com"
+			? "https://api.github.com/copilot_internal/user"
+			: `https://api.${host}/copilot_internal/user`;
+	const fetchFn = options?.fetchFn ?? fetch;
+	try {
+		const resp = await fetchFn(url, {
+			headers: { ...buildCopilotCatalogHeaders(), Authorization: `Bearer ${token}` },
+			signal: AbortSignal.timeout(options?.timeoutMs ?? 6000),
+		});
+		if (!resp.ok) return undefined;
+		const payload = (await resp.json()) as { endpoints?: { api?: unknown } };
+		const endpoint =
+			typeof payload.endpoints?.api === "string" ? payload.endpoints.api.replace(/\/+$/, "") : undefined;
+		const isCopilotHost =
+			endpoint !== undefined &&
+			(/^https:\/\/[a-z0-9.-]+\.githubcopilot\.com$/i.test(endpoint) ||
+				/^https:\/\/copilot-api\.[a-z0-9.-]+$/i.test(endpoint));
+		if (!isCopilotHost) {
+			return undefined;
+		}
+		resolvedApiEndpoint = { identity, endpoint, expiresAt: Date.now() + COPILOT_ENDPOINT_TTL_MS };
+		return endpoint;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Test hook. */
+export function resetCopilotApiEndpoint(): void {
+	resolvedApiEndpoint = undefined;
 }
 
 function isUsableCopilotToken(token: string): boolean {
@@ -312,13 +377,7 @@ export async function fetchCopilotCatalogInfo(
 	const timeoutMs = options?.timeoutMs ?? 6000;
 	try {
 		const resp = await fetchFn(`${base}/models`, {
-			headers: {
-				Authorization: `Bearer ${token}`,
-				"User-Agent": copilotUserAgent(),
-				"Editor-Version": `copilot/${copilotCliVersion()}`,
-				"Copilot-Integration-Id": copilotIntegrationId(),
-				"X-GitHub-Api-Version": copilotApiVersion(),
-			},
+			headers: { ...buildCopilotCatalogHeaders(), Authorization: `Bearer ${token}` },
 			signal: AbortSignal.timeout(timeoutMs),
 		});
 		if (!resp.ok) {

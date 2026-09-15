@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	buildCopilotCatalogHeaders,
 	buildCopilotDynamicHeaders,
 	copilotCliVersion,
 	copilotControlPlaneUserAgent,
 	copilotIntegrationId,
 	copilotUserAgent,
 	inferCopilotInitiator,
+	resetCopilotTurnIds,
 	sanitizeCopilotModelHeaders,
 } from "../src/providers/github-copilot-headers.js";
 import type { Message } from "../src/types.js";
@@ -68,11 +70,44 @@ describe("copilot dynamic headers", () => {
 		expect(headers["X-Client-Session-Id"]).toBe("sess-abc");
 	});
 
-	it("keeps a stable machine id across calls but rotates the interaction id", () => {
+	it("keeps a stable machine id across calls but rotates the interaction id per user turn", () => {
 		const a = buildCopilotDynamicHeaders({ messages: userTurn, hasImages: false });
 		const b = buildCopilotDynamicHeaders({ messages: userTurn, hasImages: false });
 		expect(a["X-Client-Machine-Id"]).toBe(b["X-Client-Machine-Id"]);
 		expect(a["X-Interaction-Id"]).not.toBe(b["X-Interaction-Id"]);
+	});
+
+	it("keeps interaction and task ids constant across the tool follow-ups of one turn", () => {
+		resetCopilotTurnIds();
+		const first = buildCopilotDynamicHeaders({ messages: userTurn, hasImages: false, sessionId: "session-1" });
+		const followUp = buildCopilotDynamicHeaders({ messages: agentTurn, hasImages: false, sessionId: "session-1" });
+		expect(followUp["X-Initiator"]).toBe("agent");
+		expect(followUp["X-Interaction-Id"]).toBe(first["X-Interaction-Id"]);
+		expect(followUp["X-Agent-Task-Id"]).toBe(first["X-Agent-Task-Id"]);
+		const nextTurn = buildCopilotDynamicHeaders({ messages: userTurn, hasImages: false, sessionId: "session-1" });
+		expect(nextTurn["X-Interaction-Id"]).not.toBe(first["X-Interaction-Id"]);
+		expect(nextTurn["X-Agent-Task-Id"]).not.toBe(first["X-Agent-Task-Id"]);
+		const otherSession = buildCopilotDynamicHeaders({
+			messages: agentTurn,
+			hasImages: false,
+			sessionId: "session-2",
+		});
+		expect(otherSession["X-Interaction-Id"]).not.toBe(nextTurn["X-Interaction-Id"]);
+		resetCopilotTurnIds();
+	});
+
+	it("builds the smaller catalog identity without session, task, or SDK headers", () => {
+		const headers = buildCopilotCatalogHeaders();
+		expect(headers["User-Agent"]).toMatch(/^copilot\/1\.0\.84-5 \(.+\) term\/.+$/);
+		expect(headers["User-Agent"]).not.toContain("client/github/cli");
+		expect(headers["Copilot-Integration-Id"]).toBe("copilot-developer-cli");
+		expect(headers["X-Initiator"]).toBe("user");
+		expect(headers["Openai-Intent"]).toBe("conversation-agent");
+		expect(headers.Accept).toBe("application/json");
+		expect(headers["X-Client-Session-Id"]).toBeUndefined();
+		expect(headers["X-Agent-Task-Id"]).toBeUndefined();
+		expect(headers["X-Stainless-Helper-Method"]).toBeUndefined();
+		expect(headers["X-GitHub-Repository-Nwo"]).toBeUndefined();
 	});
 
 	it("marks the initiator as user for a user turn and agent for an assistant-led turn", () => {

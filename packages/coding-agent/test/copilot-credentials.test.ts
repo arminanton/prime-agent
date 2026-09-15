@@ -8,6 +8,8 @@ import {
 	copilotPinnedUser,
 	fetchCopilotCatalogInfo,
 	hasCopilotPin,
+	refreshCopilotApiEndpoint,
+	resetCopilotApiEndpoint,
 	resolvePinnedCopilotToken,
 } from "../src/core/copilot-credentials.js";
 
@@ -243,5 +245,87 @@ describe("fetchCopilotCatalogInfo", () => {
 		});
 		expect([...info.ids]).toEqual(["some-model"]);
 		expect(info.apiById.has("some-model")).toBe(false);
+	});
+});
+
+describe("Copilot live capabilities and plan endpoint", () => {
+	afterEach(() => {
+		resetCopilotApiEndpoint();
+	});
+
+	it("reads capability limits and reasoning efforts from the live catalog", async () => {
+		let requestHeaders: Record<string, string> = {};
+		const info = await fetchCopilotCatalogInfo("gho_test", {
+			baseUrl: "https://api.githubcopilot.com",
+			fetchFn: (async (_input: string | URL | Request, init?: RequestInit) => {
+				requestHeaders = Object.fromEntries(new Headers(init?.headers).entries());
+				return new Response(
+					JSON.stringify({
+						data: [
+							{
+								id: "claude-fable-5.1",
+								supported_endpoints: ["/v1/messages"],
+								capabilities: {
+									limits: {
+										max_context_window_tokens: 1_000_000,
+										max_prompt_tokens: 936_000,
+										max_output_tokens: 64_000,
+										vision: { max_prompt_images: 1 },
+									},
+									supports: { reasoning_effort: ["low", "medium", "high", "xhigh", "max"], tool_calls: true },
+								},
+							},
+							{ id: "gpt-4.1", supported_endpoints: ["/chat/completions"], capabilities: { limits: {} } },
+						],
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}) as typeof fetch,
+		});
+		expect(info.capabilitiesById.get("claude-fable-5.1")).toEqual({
+			contextWindow: 1_000_000,
+			maxPromptTokens: 936_000,
+			maxOutputTokens: 64_000,
+			vision: true,
+			reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+		});
+		expect(info.capabilitiesById.has("gpt-4.1")).toBe(false);
+		// Catalog GET carries the CLI catalog identity, not the inference identity.
+		expect(requestHeaders["copilot-integration-id"]).toBe("copilot-developer-cli");
+		expect(requestHeaders["user-agent"]).not.toContain("client/github/cli");
+		expect(requestHeaders["x-initiator"]).toBe("user");
+		expect(requestHeaders["x-client-session-id"]).toBeUndefined();
+		expect(requestHeaders.authorization).toBe("Bearer gho_test");
+	});
+
+	it("resolves the plan-aware endpoint from copilot_internal/user for a pinned account", async () => {
+		vi.stubEnv("COPILOT_GH_USER", "pinned-user");
+		vi.stubEnv("COPILOT_GH_HOST", "github.com");
+		mockGhToken("gho_pinned");
+		expect(copilotPinnedBaseUrl()).toBe("https://api.githubcopilot.com");
+		let requestedUrl = "";
+		const endpoint = await refreshCopilotApiEndpoint("gho_pinned", {
+			fetchFn: (async (input: string | URL | Request) => {
+				requestedUrl = String(input);
+				return new Response(JSON.stringify({ endpoints: { api: "https://api.business.githubcopilot.com/" } }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}) as typeof fetch,
+		});
+		expect(requestedUrl).toBe("https://api.github.com/copilot_internal/user");
+		expect(endpoint).toBe("https://api.business.githubcopilot.com");
+		expect(copilotPinnedBaseUrl()).toBe("https://api.business.githubcopilot.com");
+		// A non-Copilot host is never adopted.
+		resetCopilotApiEndpoint();
+		const rejected = await refreshCopilotApiEndpoint("gho_pinned", {
+			fetchFn: (async () =>
+				new Response(JSON.stringify({ endpoints: { api: "https://evil.example.com" } }), {
+					status: 200,
+				})) as typeof fetch,
+		});
+		expect(rejected).toBeUndefined();
+		expect(copilotPinnedBaseUrl()).toBe("https://api.githubcopilot.com");
+		vi.unstubAllEnvs();
 	});
 });

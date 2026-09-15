@@ -38,7 +38,13 @@ import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import {
+	applyCopilotRequestAdjustment,
+	classifyCopilotRequestError,
+	isAdjustableCopilotError,
+} from "./copilot-request-adjust.js";
+import {
 	buildCopilotDynamicHeaders,
+	COPILOT_SDK_HEADER_OVERRIDES,
 	hasCopilotVisionInput,
 	sanitizeCopilotModelHeaders,
 } from "./github-copilot-headers.js";
@@ -140,6 +146,30 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 		return "long";
 	}
 	return "short";
+}
+
+async function createCompletionWithCopilotAdjustment(
+	client: OpenAI,
+	model: Model<"openai-completions">,
+	params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+	requestOptions: { signal?: AbortSignal; timeout?: number },
+	compat: ResolvedOpenAICompletionsCompat,
+): Promise<{ data: AsyncIterable<ChatCompletionChunk>; response: Response }> {
+	const send = (body: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming) =>
+		compat.nonStreaming
+			? createNonStreamingChunkSource(client, body, requestOptions)
+			: client.chat.completions.create(body, requestOptions).withResponse();
+	try {
+		return await send(params);
+	} catch (error) {
+		if (model.provider !== "github-copilot" || !isAdjustableCopilotError(error)) throw error;
+		const adjustment = classifyCopilotRequestError(error instanceof Error ? error.message : String(error));
+		const adjusted = adjustment
+			? applyCopilotRequestAdjustment(params as unknown as Record<string, unknown>, adjustment)
+			: undefined;
+		if (!adjusted) throw error;
+		return await send(adjusted as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming);
+	}
 }
 
 /**
@@ -262,9 +292,13 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 			};
-			const { data: openaiStream, response } = compat.nonStreaming
-				? await createNonStreamingChunkSource(client, params, requestOptions)
-				: await client.chat.completions.create(params, requestOptions).withResponse();
+			const { data: openaiStream, response } = await createCompletionWithCopilotAdjustment(
+				client,
+				model,
+				params,
+				requestOptions,
+				compat,
+			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
@@ -657,7 +691,9 @@ function createClient(
 					Authorization: headers.Authorization ?? null,
 					"cf-aig-authorization": `Bearer ${apiKey}`,
 				}
-			: headers;
+			: model.provider === "github-copilot"
+				? { ...COPILOT_SDK_HEADER_OVERRIDES, ...headers }
+				: headers;
 
 	return new OpenAI({
 		apiKey,

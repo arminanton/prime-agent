@@ -28,6 +28,7 @@ import type {
 	StreamOptions,
 	TextContent,
 	ThinkingContent,
+	ThinkingLevel,
 	Tool,
 	ToolCall,
 	ToolResultMessage,
@@ -49,17 +50,24 @@ import {
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import {
 	estimatePromptTokens,
+	knownCopilotClaudeOutputCap,
 	parseCopilotOutputCapError,
 	rememberCopilotClaudeOutputCap,
 	resolveCopilotClaudeMaxTokens,
 } from "./copilot-output-caps.js";
 import {
+	applyCopilotRequestAdjustment,
+	classifyCopilotRequestError,
+	isAdjustableCopilotError,
+} from "./copilot-request-adjust.js";
+import {
 	buildCopilotDynamicHeaders,
+	COPILOT_SDK_HEADER_OVERRIDES,
 	hasCopilotVisionInput,
 	sanitizeCopilotModelHeaders,
 } from "./github-copilot-headers.js";
 import { withOpenCodeHeaders } from "./opencode-headers.js";
-import { adjustMaxTokensForThinking, buildBaseOptions } from "./simple-options.js";
+import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
 /**
@@ -479,13 +487,22 @@ async function createWithOutputCapRetry(
 	try {
 		return await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
 	} catch (error) {
-		if (model.provider !== "github-copilot") throw error;
-		const status = (error as { status?: unknown }).status;
+		if (model.provider !== "github-copilot" || !isAdjustableCopilotError(error)) throw error;
 		const message = error instanceof Error ? error.message : String(error);
-		const cap = status === 400 ? parseCopilotOutputCapError(message) : undefined;
-		if (cap === undefined || params.max_tokens <= cap) throw error;
-		rememberCopilotClaudeOutputCap(model, cap);
-		return await client.messages.create({ ...params, max_tokens: cap, stream: true }, requestOptions).asResponse();
+		const cap = parseCopilotOutputCapError(message);
+		if (cap !== undefined) {
+			if (params.max_tokens <= cap) throw error;
+			rememberCopilotClaudeOutputCap(model, cap);
+			return await client.messages.create({ ...params, max_tokens: cap, stream: true }, requestOptions).asResponse();
+		}
+		const adjustment = classifyCopilotRequestError(message);
+		const adjusted = adjustment
+			? applyCopilotRequestAdjustment(params as unknown as Record<string, unknown>, adjustment)
+			: undefined;
+		if (!adjusted) throw error;
+		return await client.messages
+			.create({ ...(adjusted as unknown as MessageCreateParamsStreaming), stream: true }, requestOptions)
+			.asResponse();
 	}
 }
 
@@ -857,6 +874,12 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
+	// Copilot-served Claude: leave max_tokens to the provider's probed server cap
+	// (clamped to the remaining context) unless the caller asked for a value.
+	const isCopilot = model.provider === "github-copilot";
+	if (isCopilot && options?.maxTokens === undefined) {
+		base.maxTokens = undefined;
+	}
 	if (!options?.reasoning || options.reasoning === "off") {
 		return streamAnthropic(model, context, { ...base, thinkingEnabled: false } satisfies AnthropicOptions);
 	}
@@ -869,6 +892,27 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 			...base,
 			thinkingEnabled: true,
 			effort,
+		} satisfies AnthropicOptions);
+	}
+
+	if (isCopilot) {
+		// Manual-thinking models on Copilot (haiku) follow the CLI budget ladder:
+		// low 1024, medium 2048, high 4096, xhigh/max 32000, clamped under max_tokens.
+		const cap = knownCopilotClaudeOutputCap(model) ?? model.maxTokens;
+		const maxTokens = options.maxTokens ?? cap;
+		const budget = Math.min(
+			Math.max(
+				1024,
+				options.thinkingBudgets?.[clampReasoning(options.reasoning)!] ??
+					copilotCliThinkingBudget(options.reasoning),
+			),
+			Math.max(1024, maxTokens - 1),
+		);
+		return streamAnthropic(model, context, {
+			...base,
+			maxTokens,
+			thinkingEnabled: true,
+			thinkingBudgetTokens: budget,
 		} satisfies AnthropicOptions);
 	}
 
@@ -886,6 +930,22 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 		thinkingBudgetTokens: adjusted.thinkingBudget,
 	} satisfies AnthropicOptions);
 };
+
+/** Budget the official Copilot CLI sends for manual-thinking Claude models per effort level. */
+function copilotCliThinkingBudget(level: ThinkingLevel): number {
+	switch (level) {
+		case "minimal":
+		case "low":
+			return 1024;
+		case "medium":
+			return 2048;
+		case "xhigh":
+		case "max":
+			return 32_000;
+		default:
+			return 4096;
+	}
+}
 
 function isOAuthToken(apiKey: string): boolean {
 	return apiKey.includes("sk-ant-oat");
@@ -936,6 +996,9 @@ function createClient(
 	}
 
 	if (model.provider === "github-copilot") {
+		// Wire parity with the official CLI on /v1/messages: `accept: */*`, no
+		// anthropic-beta (CAPI ignores or denylists them), no browser-access
+		// header, and no SDK fingerprint headers beyond X-Stainless-Helper-Method.
 		const client = new Anthropic({
 			maxRetries: 0,
 			apiKey: null,
@@ -943,11 +1006,7 @@ function createClient(
 			baseURL: model.baseUrl,
 			dangerouslyAllowBrowser: true,
 			defaultHeaders: mergeHeaders(
-				{
-					accept: "application/json",
-					"anthropic-dangerous-direct-browser-access": "true",
-					...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
-				},
+				{ accept: "*/*", ...COPILOT_SDK_HEADER_OVERRIDES },
 				sanitizeCopilotModelHeaders(model.headers, model.api),
 				dynamicHeaders,
 				optionsHeaders,

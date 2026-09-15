@@ -40,6 +40,7 @@ const OVERFLOW_PATTERNS = [
 	/maximum context length is \d+ tokens/i, // OpenRouter (all backends)
 	/exceeds the model's maximum context length/i, // LiteLLM (input + requested output)
 	/exceeds the limit of \d+/i, // GitHub Copilot
+	/model_max_prompt_tokens_exceeded/i, // GitHub Copilot /responses error code (grok and other CAPI-fronted models)
 	/exceeds the available context size/i, // llama.cpp server
 	/greater than the context length/i, // LM Studio
 	/context window exceeds limit/i, // MiniMax

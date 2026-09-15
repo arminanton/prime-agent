@@ -176,6 +176,47 @@ describe("openai-responses provider defaults", () => {
 		expect(capturedPayload).not.toHaveProperty("service_tier");
 	});
 
+	it("never sends temperature to a Copilot reasoning model on /responses", async () => {
+		const model = getModel("github-copilot", "gpt-6-astra");
+		let capturedPayload: Record<string, unknown> | undefined;
+		let capturedHeaders: CapturedHeaders;
+
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+			capturedHeaders = init?.headers as CapturedHeaders;
+			return new Response("data: [DONE]\n\n", {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		});
+
+		const stream = streamOpenAIResponses(
+			model,
+			{
+				systemPrompt: "sys",
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			},
+			{
+				apiKey: "test-key",
+				temperature: 0.2,
+				reasoningEffort: "high",
+				onPayload: (payload) => {
+					capturedPayload = payload as Record<string, unknown>;
+				},
+			},
+		);
+
+		for await (const event of stream) {
+			if (event.type === "done" || event.type === "error") break;
+		}
+
+		expect(capturedPayload).toBeDefined();
+		expect(capturedPayload).not.toHaveProperty("temperature");
+		expect(capturedPayload).toMatchObject({ reasoning: { effort: "high" } });
+		// SDK fingerprint headers are nulled; only the helper marker remains.
+		expect(getHeader(capturedHeaders, "X-Stainless-Lang")).toBeNull();
+		expect(getHeader(capturedHeaders, "X-Stainless-Helper-Method")).toBe("stream");
+	});
+
 	it.each(["gpt-5.1", "gpt-5.2", "gpt-5.3-codex", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.5"] as const)(
 		"sends none reasoning effort for OpenAI %s when no reasoning is requested",
 		async (modelId) => {

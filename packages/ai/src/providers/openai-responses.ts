@@ -23,7 +23,13 @@ import {
 } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
 import {
+	applyCopilotRequestAdjustment,
+	classifyCopilotRequestError,
+	isAdjustableCopilotError,
+} from "./copilot-request-adjust.js";
+import {
 	buildCopilotDynamicHeaders,
+	COPILOT_SDK_HEADER_OVERRIDES,
 	hasCopilotVisionInput,
 	sanitizeCopilotModelHeaders,
 } from "./github-copilot-headers.js";
@@ -67,6 +73,27 @@ export interface OpenAIResponsesOptions extends StreamOptions {
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 }
 
+async function createResponseWithCopilotAdjustment(
+	client: OpenAI,
+	model: Model<"openai-responses">,
+	params: ResponseCreateParamsStreaming,
+	requestOptions: { signal?: AbortSignal; timeout?: number },
+) {
+	try {
+		return await client.responses.create(params, requestOptions).withResponse();
+	} catch (error) {
+		if (model.provider !== "github-copilot" || !isAdjustableCopilotError(error)) throw error;
+		const adjustment = classifyCopilotRequestError(error instanceof Error ? error.message : String(error));
+		const adjusted = adjustment
+			? applyCopilotRequestAdjustment(params as unknown as Record<string, unknown>, adjustment)
+			: undefined;
+		if (!adjusted) throw error;
+		return await client.responses
+			.create(adjusted as unknown as ResponseCreateParamsStreaming, requestOptions)
+			.withResponse();
+	}
+}
+
 export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIResponsesOptions> = (
 	model: Model<"openai-responses">,
 	context: Context,
@@ -107,7 +134,12 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 			};
-			const { data: openaiStream, response } = await client.responses.create(params, requestOptions).withResponse();
+			const { data: openaiStream, response } = await createResponseWithCopilotAdjustment(
+				client,
+				model,
+				params,
+				requestOptions,
+			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			const requestId = response.headers.get("x-request-id") ?? undefined;
 			stream.push({ type: "start", partial: output });
@@ -216,7 +248,9 @@ function createClient(
 					Authorization: headers.Authorization ?? null,
 					"cf-aig-authorization": `Bearer ${apiKey}`,
 				}
-			: headers;
+			: model.provider === "github-copilot"
+				? { ...COPILOT_SDK_HEADER_OVERRIDES, ...headers }
+				: headers;
 
 	return new OpenAI({
 		apiKey,
@@ -248,7 +282,10 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.max_output_tokens = options?.maxTokens;
 	}
 
-	if (options?.temperature !== undefined) {
+	// Copilot /responses rejects sampling parameters on reasoning models with a 400
+	// ("Unsupported parameter: 'temperature'"); the CLI never sends them.
+	const copilotReasoning = model.provider === "github-copilot" && model.reasoning;
+	if (options?.temperature !== undefined && !copilotReasoning) {
 		params.temperature = options?.temperature;
 	}
 

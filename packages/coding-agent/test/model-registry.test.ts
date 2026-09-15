@@ -134,6 +134,96 @@ describe("ModelRegistry", () => {
 		expect(otherAccount.find("github-copilot", "gemini-3.1-pro-preview")).toBeUndefined();
 	});
 
+	test("overlays live Copilot capability limits and efforts on the baked catalog rows", async () => {
+		vi.stubEnv("COPILOT_GH_USER", "");
+		vi.stubEnv("COPILOT_GH_HOST", "");
+		authStorage.set("github-copilot", {
+			type: "oauth",
+			refresh: "stored-refresh-token",
+			access: "tid=test;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com;",
+			expires: Date.now() + 60_000,
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(
+				async () =>
+					new Response(
+						JSON.stringify({
+							data: [
+								{
+									id: "claude-fable-5.1",
+									policy: { state: "enabled" },
+									supported_endpoints: ["/v1/messages"],
+									capabilities: {
+										limits: {
+											max_context_window_tokens: 1_000_000,
+											max_prompt_tokens: 900_000,
+											max_output_tokens: 64_000,
+										},
+										supports: { reasoning_effort: ["medium", "high"] },
+									},
+								},
+								{
+									id: "grok-4.6",
+									policy: { state: "enabled" },
+									supported_endpoints: ["/responses"],
+									capabilities: { limits: { max_context_window_tokens: 500_000, max_prompt_tokens: 372_000 } },
+								},
+							],
+						}),
+						{ status: 200, headers: { "content-type": "application/json" } },
+					),
+			),
+		);
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		await registry.refreshAvailableModels();
+
+		const fable = registry.find("github-copilot", "claude-fable-5.1")!;
+		expect(fable.contextWindow).toBe(1_000_000);
+		expect(fable.maxInputTokens).toBe(900_000);
+		// The catalog output hint never overrides the baked (probed) output cap.
+		expect(fable.maxTokens).toBe(128_000);
+		expect(fable.thinkingLevelMap).toEqual({
+			off: null,
+			minimal: null,
+			low: null,
+			medium: "medium",
+			high: "high",
+			xhigh: null,
+			max: null,
+		});
+		const grok = registry.find("github-copilot", "grok-4.6")!;
+		expect(grok.api).toBe("openai-responses");
+		expect(grok.maxInputTokens).toBe(372_000);
+		// Unlisted models are scoped out once the live catalog is known.
+		expect(registry.find("github-copilot", "gpt-5.6-sol")).toBeUndefined();
+
+		// A fresh registry seeds the same overlay from the on-disk cache without a fetch.
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => {
+				throw new Error("offline");
+			}),
+		);
+		const reloaded = ModelRegistry.create(authStorage, modelsJsonPath);
+		expect(reloaded.find("github-copilot", "claude-fable-5.1")?.maxInputTokens).toBe(900_000);
+	});
+
+	test("keeps Amazon Bedrock registered but does not treat ambient AWS env as configured auth", () => {
+		vi.stubEnv("AWS_ACCESS_KEY_ID", "AKIA_TEST");
+		vi.stubEnv("AWS_SECRET_ACCESS_KEY", "secret");
+		vi.stubEnv("AWS_REGION", "us-east-1");
+		vi.stubEnv("PRIME_ENABLE_BEDROCK", "");
+		const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+		const bedrock = registry.getAll().find((model) => model.provider === "amazon-bedrock");
+		expect(bedrock).toBeDefined();
+		expect(registry.getAvailable().some((model) => model.provider === "amazon-bedrock")).toBe(false);
+
+		vi.stubEnv("PRIME_ENABLE_BEDROCK", "1");
+		const optedIn = ModelRegistry.create(authStorage, modelsJsonPath);
+		expect(optedIn.getAvailable().some((model) => model.provider === "amazon-bedrock")).toBe(true);
+	});
+
 	test("treats a valid live catalog with only blocked policies as known empty", async () => {
 		vi.stubEnv("COPILOT_GH_USER", "");
 		vi.stubEnv("COPILOT_GH_HOST", "");
