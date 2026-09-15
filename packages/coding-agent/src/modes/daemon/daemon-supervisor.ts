@@ -170,6 +170,9 @@ import { SNAPSHOT_TARGET_CHUNK_BYTES, SnapshotTranscriptCache } from "./snapshot
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
+// Verdict on whether a pid is still the process we launched. Also used as the value type of a
+// per-scan identity cache so one scheduled-wake scan probes each worker's identity at most once.
+type ProcessIdentityVerdict = "current" | "replaced" | "gone" | "unknown";
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 
 const structuredLog = getLogger("coding-agent.daemon-supervisor");
@@ -870,7 +873,7 @@ export class DaemonSupervisor {
 			// An unowned one is a stale descriptor: reclaim it here so it does not mask a
 			// scheduled wake or block a fenced update restart. The schedule persists on disk,
 			// so the next due wake re-creates a worker from it.
-			this.reclaimStaleDeadWorkers();
+			await this.reclaimStaleDeadWorkers();
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}
@@ -981,6 +984,8 @@ export class DaemonSupervisor {
 			infoBySessionId.set(info.id, info);
 		}
 		if (infoBySessionId.size === 0) return [];
+		// One identity probe per worker for the whole scan, not once per chain step per job.
+		const identityCache = new Map<string, ProcessIdentityVerdict>();
 		const uncoveredRootFor = (info: SessionInfo): string | undefined => {
 			let current = info;
 			const visited = new Set([canonicalSessionPath(current.path)]);
@@ -988,7 +993,7 @@ export class DaemonSupervisor {
 				try {
 					// Wake-eligibility, not bare ownership: a failed/stopping/dead owner must
 					// not count as coverage, or this root's scheduled wake is silently skipped.
-					if (this.findWakeableWorkerBySessionFile(current.path)) return undefined;
+					if (this.findWakeableWorkerBySessionFile(current.path, identityCache)) return undefined;
 				} catch {
 					return undefined;
 				}
@@ -4090,6 +4095,9 @@ export class DaemonSupervisor {
 						worker.descriptor.lastError = "Waiting for a client with fresh runtime context";
 						this.persistWorker(worker);
 						this.markWorkerRosterEntries(worker, "failed");
+						// Parking failed drops this worker's coverage of its root; rearm the wake scan
+						// now so a newly-uncovered scheduled root gets a timer immediately.
+						this.scheduleScheduledSessionWakeRecompute();
 						return;
 					}
 					await this.recoverUncertainWorkerOperations(worker);
@@ -4140,6 +4148,9 @@ export class DaemonSupervisor {
 			worker.descriptor.lifecycle = "failed";
 			this.persistWorker(worker);
 			this.markWorkerRosterEntries(worker, "failed");
+			// Parking failed drops this worker's coverage of its root; rearm the wake scan now so a
+			// newly-uncovered scheduled root gets a timer immediately.
+			this.scheduleScheduledSessionWakeRecompute();
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
 		})().finally(() => {
 			worker.recovery = undefined;
@@ -5148,15 +5159,32 @@ export class DaemonSupervisor {
 	 * wake for its root is silently skipped. starting/recovering workers are mid-launch and
 	 * keep coverage so a wake is not duplicated on top of them.
 	 */
-	private coversScheduledWake(worker: ResidentWorker): boolean {
+	private coversScheduledWake(
+		worker: ResidentWorker,
+		identityCache?: Map<string, ProcessIdentityVerdict>,
+	): boolean {
 		if (this.isWorkerStopping(worker)) return false;
-		if (worker.descriptor.lifecycle === "failed" || worker.descriptor.lifecycle === "stopping") return false;
-		if (
-			worker.descriptor.lifecycle === "ready" &&
-			this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId) === "gone"
-		) {
-			return false;
+		if (worker.descriptor.lifecycle === "stopping") return false;
+		const identity = this.processIdentityCached(
+			worker.descriptor.pid,
+			worker.descriptor.processStartId,
+			identityCache,
+		);
+		const processGone = identity === "gone" || identity === "replaced";
+		if (worker.descriptor.lifecycle === "failed") {
+			// A failed descriptor un-covers its root ONLY when its process is confirmed dead
+			// (gone/replaced) - the 7-stale-descriptor bug. A failed-but-ALIVE (current) or
+			// unverifiable (unknown) worker stays covered: it is still running, so scheduling a
+			// second wake on top would race it, and because wakeDueScheduledSessions is
+			// sequential one wedged live worker would head-of-line-block every other due wake.
+			return !processGone;
 		}
+		if (worker.descriptor.lifecycle === "ready") {
+			// A ready descriptor whose process vanished OR was replaced no longer covers its
+			// root (replaced is symmetric with gone here); an unknown identity is fail-closed.
+			return !processGone;
+		}
+		// starting/recovering workers are mid-launch and keep coverage so a wake is not duplicated.
 		return true;
 	}
 
@@ -5165,10 +5193,13 @@ export class DaemonSupervisor {
 	 * scheduled-wake scan only when it can actually be woken now. A failed or dead owner
 	 * returns undefined so its root becomes wake-eligible again.
 	 */
-	private findWakeableWorkerBySessionFile(sessionFile: string): ResidentWorker | undefined {
+	private findWakeableWorkerBySessionFile(
+		sessionFile: string,
+		identityCache?: Map<string, ProcessIdentityVerdict>,
+	): ResidentWorker | undefined {
 		const owner = this.findWorkerBySessionFile(sessionFile);
 		if (!owner) return undefined;
-		return this.coversScheduledWake(owner) ? owner : undefined;
+		return this.coversScheduledWake(owner, identityCache) ? owner : undefined;
 	}
 
 	/**
@@ -5191,25 +5222,32 @@ export class DaemonSupervisor {
 		return identity === "gone" || identity === "replaced";
 	}
 
-	/** Remove a worker registration + roster rows + on-disk descriptor (the reclaim path). */
-	private removeStaleWorkerDescriptor(worker: ResidentWorker): void {
-		this.workers.delete(worker.descriptor.workerId);
-		this.flipWorkerRosterEntriesInactive(worker);
-		this.deleteWorkerDescriptor(worker);
-	}
-
 	/**
 	 * Remove every confirmed-dead, unowned stale descriptor (predicate c). A
 	 * live-but-unreachable worker is left registered (fail-closed) so callers that require
 	 * it can still fail on it. Returns the removed workers.
 	 */
-	private reclaimStaleDeadWorkers(): ResidentWorker[] {
+	private async reclaimStaleDeadWorkers(): Promise<ResidentWorker[]> {
 		const removed: ResidentWorker[] = [];
 		for (const worker of [...this.workers.values()]) {
 			if (!this.isReclaimableDeadDescriptor(worker)) continue;
-			this.removeStaleWorkerDescriptor(worker);
-			this.log(`Removed stale descriptor for confirmed-dead worker ${worker.descriptor.workerId}`);
-			removed.push(worker);
+			// Reuse the identity-verified reclaim path (not a bare descriptor delete) so a worker
+			// that died AFTER being parked failed still runs the settling work - orphan-kernel
+			// reaping via recoverUncertainWorkerOperations and input-pause invalidation - before
+			// its descriptor and journal are deleted.
+			try {
+				if (await this.reclaimStaleWorkerRegistration(worker)) {
+					this.log(`Removed stale descriptor for confirmed-dead worker ${worker.descriptor.workerId}`);
+					removed.push(worker);
+				}
+			} catch (error) {
+				this.log(
+					`Deferred reclaim of stale worker ${worker.descriptor.workerId}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
+		if (removed.length > 0 && !this.shuttingDown) {
+			this.broadcastHeartbeatsChanged();
 		}
 		return removed;
 	}
@@ -6496,7 +6534,7 @@ export class DaemonSupervisor {
 		// Reclaim confirmed-dead, unowned stale descriptors first so they cannot block the
 		// fenced restart (they otherwise force a cold restart). A live-but-unreachable
 		// worker is left in place and still blocks below (fail-closed).
-		this.reclaimStaleDeadWorkers();
+		await this.reclaimStaleDeadWorkers();
 		const residents = [...this.workers.values()];
 		const unavailable = residents.find(
 			(worker) =>
@@ -6680,10 +6718,7 @@ export class DaemonSupervisor {
 	 * "gone"/"replaced" (never orphan a live worker because a transient
 	 * identity lookup failed).
 	 */
-	private processIdentity(
-		pid: number,
-		processStartId: string | undefined,
-	): "current" | "replaced" | "gone" | "unknown" {
+	private processIdentity(pid: number, processStartId: string | undefined): ProcessIdentityVerdict {
 		if (!isProcessAlive(pid)) {
 			return "gone";
 		}
@@ -6695,6 +6730,24 @@ export class DaemonSupervisor {
 			return "unknown";
 		}
 		return observed === processStartId ? "current" : "replaced";
+	}
+
+	// processIdentity, memoized within a single scheduled-wake scan. processIdentity does a sync
+	// kill(0) + readFileSync of /proc/<pid>/stat (and a sync `ps` spawn for a vanished pid), so the
+	// per-scan cache keeps a large passive tree from re-probing the same owner on every chain step
+	// of every job (the known event-loop-lag hotspot).
+	private processIdentityCached(
+		pid: number,
+		processStartId: string | undefined,
+		cache?: Map<string, ProcessIdentityVerdict>,
+	): ProcessIdentityVerdict {
+		if (!cache) return this.processIdentity(pid, processStartId);
+		const key = `${pid}\u0000${processStartId ?? ""}`;
+		const cached = cache.get(key);
+		if (cached !== undefined) return cached;
+		const identity = this.processIdentity(pid, processStartId);
+		cache.set(key, identity);
+		return identity;
 	}
 
 	/**
