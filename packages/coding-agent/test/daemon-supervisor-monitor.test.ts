@@ -305,6 +305,7 @@ function createHarness(canConnect: () => Promise<boolean>): SupervisorMonitorHar
 		clients: new Set<{ authenticated: boolean }>(),
 		supervisorClaims: new Map<object, object>(),
 		shuttingDown: false,
+		supervisorProbeFailures: 0,
 		canConnectToSupervisor: vi.fn(canConnect),
 		launchReplacementSupervisor: vi.fn(async () => undefined),
 	}) as SupervisorMonitorHarness;
@@ -1239,11 +1240,12 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(daemon.canConnectToSupervisor).not.toHaveBeenCalled();
 	});
 
-	it("keeps the supervisor monitor armed after a replacement binds but exits before claiming", async () => {
+	it("waits for consecutive failures, then keeps the monitor armed after a replacement binds", async () => {
 		vi.useFakeTimers();
-		// The supervisor socket is dead, comes up with the replacement launch,
-		// then dies again before the replacement ever claims the worker.
-		const probeResults = [false, true, false, false];
+		// Three consecutive failures are required before a replacement launches. The socket
+		// then comes up with the launch (the 4th probe) and dies again before it ever claims
+		// the worker, so three more failures are needed before the next launch.
+		const probeResults = [false, false, false, true, false, false, false, false];
 		let probeCount = 0;
 		const daemon = createHarness(async () => {
 			const result = probeResults[Math.min(probeCount, probeResults.length - 1)];
@@ -1253,24 +1255,32 @@ describe("daemon worker supervisor monitoring", () => {
 		// Drive the fake clock until the expected number of probes have run;
 		// one advance alone does not flush the availability check chain.
 		const advanceUntilProbes = async (expected: number) => {
-			for (let step = 0; probeCount < expected && step < 200; step++) {
+			for (let step = 0; probeCount < expected && step < 600; step++) {
 				await vi.advanceTimersByTimeAsync(100);
 			}
 			expect(probeCount).toBe(expected);
 		};
 
 		daemon.scheduleSupervisorAvailabilityCheck("/tmp/supervisor.sock", 1500);
+		// One or two consecutive failures never launch a replacement or orphan the worker.
 		await advanceUntilProbes(2);
-		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledOnce();
-		// The replacement binding mid-launch restarts the orphan window...
+		expect(daemon.launchReplacementSupervisor).not.toHaveBeenCalled();
 		expect(daemon.supervisorAbsentSince).toBeUndefined();
-		// ...but a bind is not an authenticated claim: the monitor must stay armed
-		// instead of orphaning the worker if the replacement exits unclaimed.
 		expect(daemon.supervisorMonitorTimer).toBeDefined();
 
+		// The third consecutive failure launches one replacement; its recheck probe (the 4th)
+		// sees the replacement bound, so the orphan window restarts.
 		await advanceUntilProbes(4);
+		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledOnce();
+		expect(daemon.supervisorAbsentSince).toBeUndefined();
+		// A bind is not an authenticated claim: the monitor must stay armed instead of
+		// orphaning the worker if the replacement exits unclaimed.
+		expect(daemon.supervisorMonitorTimer).toBeDefined();
+
+		// Three more failures are needed before the second launch.
+		await advanceUntilProbes(8);
 		expect(daemon.launchReplacementSupervisor).toHaveBeenCalledTimes(2);
-		expect(daemon.canConnectToSupervisor).toHaveBeenCalledTimes(4);
+		expect(daemon.canConnectToSupervisor).toHaveBeenCalledTimes(8);
 		expect(daemon.supervisorMonitorTimer).toBeDefined();
 	});
 

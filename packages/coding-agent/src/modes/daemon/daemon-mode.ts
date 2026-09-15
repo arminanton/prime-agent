@@ -281,12 +281,21 @@ const MAX_SESSION_SNAPSHOT_STABILIZATION_RETRIES = 3;
 // Sessions persist on disk, and a later supervisor spawns fresh workers on
 // demand, so an unreachable-supervisor worker serves nothing by lingering.
 const WORKER_SUPERVISOR_LOST_EXIT_MS_ENV = "PRIME_AGENT_INTERNAL_WORKER_SUPERVISOR_LOST_EXIT_MS";
+// Operator knob for the orphan self-exit window (see exitIfSupervisorOrphanedForTooLong).
+// 0 exits a supervisor-orphaned worker immediately; a large value effectively disables
+// self-exit (recommended until Deploy B lands completion-based termination). Default 5 min.
 const DEFAULT_WORKER_SUPERVISOR_LOST_EXIT_MS = 5 * 60_000;
 
 function workerSupervisorLostExitMs(): number {
 	const raw = Number(process.env[WORKER_SUPERVISOR_LOST_EXIT_MS_ENV]);
 	return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_WORKER_SUPERVISOR_LOST_EXIT_MS;
 }
+
+// A supervisor is only treated as lost after this many CONSECUTIVE probe failures, each
+// with a generous connect timeout, so one transient or slow probe never spawns a
+// replacement daemon or self-exits the worker (a freeze-day trigger).
+const SUPERVISOR_PROBE_TIMEOUT_MS = 3_000;
+const SUPERVISOR_LOST_PROBE_THRESHOLD = 3;
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -596,6 +605,11 @@ export class AgentDaemon {
 	private supervisorFenceTimer?: ReturnType<typeof setTimeout>;
 	private supervisorLaunchInProgress = false;
 	private supervisorAbsentSince?: number;
+	// Consecutive failed supervisor probes; reset by any successful connect or a live owner.
+	private supervisorProbeFailures = 0;
+	// Last supervisor identity that authenticated to this worker, kept after the connection
+	// drops so a probe failure can be checked against the ownership record on disk.
+	private lastKnownSupervisorClaim?: SupervisorGenerationClaim;
 	private readonly supervisorClaims = new Map<DaemonSocketClient, BoundSupervisorGenerationClaim>();
 	private readonly peerGrants = new Map<string, DaemonWorkerPeerGrant>();
 	private readonly peerClaims = new Map<DaemonSocketClient, DaemonWorkerPeerGrant>();
@@ -853,33 +867,93 @@ export class AgentDaemon {
 	private async checkSupervisorAvailability(supervisorSocketPath: string): Promise<void> {
 		if (this.shuttingDown || this.hasAuthenticatedSupervisorConnection()) {
 			this.supervisorAbsentSince = undefined;
+			this.supervisorProbeFailures = 0;
 			return;
 		}
 		if (await isDaemonShutdownAdmissionActive()) {
 			this.supervisorAbsentSince = undefined;
+			this.supervisorProbeFailures = 0;
 			this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
 			return;
 		}
-		if (await this.canConnectToSupervisor(supervisorSocketPath)) {
+		const connected = await this.canConnectToSupervisor(supervisorSocketPath);
+		// A single failed socket probe is not proof the supervisor is gone: it can be busy or
+		// slow. Only a missing/replaced/dead ownership record, confirmed over several
+		// consecutive probes, counts as lost.
+		const ownershipAlive = connected ? false : await this.isSupervisorOwnershipAlive();
+		const decision = this.evaluateSupervisorProbe(connected, ownershipAlive);
+		if (decision === "connected") {
 			this.supervisorAbsentSince = undefined;
 			return;
 		}
-		// The supervisor socket is unreachable; remember when the worker last
-		// saw it so the orphan window below stays bounded.
+		if (decision !== "lost") {
+			// "owner-alive" or "wait": the supervisor is (probably) up, or we have not seen
+			// enough consecutive failures yet. Nothing destructive; just keep watching.
+			this.supervisorAbsentSince = undefined;
+			if (!this.shuttingDown && !this.hasAuthenticatedSupervisorConnection()) {
+				this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
+			}
+			return;
+		}
+		// The supervisor socket is unreachable and its ownership record is not alive across
+		// enough consecutive probes; remember when the worker last saw it so the orphan
+		// window below stays bounded.
 		this.supervisorAbsentSince ??= Date.now();
 		await this.launchReplacementSupervisor(supervisorSocketPath);
 		if (await this.canConnectToSupervisor(supervisorSocketPath)) {
-			// A replacement came up during the launch: the orphan window must
-			// restart instead of exiting the worker. The monitor must stay
-			// armed, though — a replacement can bind and then exit before it
-			// ever claims the worker, and only an authenticated claim (or its
-			// later close) re-arms the monitor. Falling through reschedules
-			// the next availability check below.
+			// A replacement came up during the launch: the orphan window must restart instead
+			// of exiting the worker. The monitor stays armed, though: a replacement can bind
+			// and then exit before it ever claims the worker, and only an authenticated claim
+			// (or its later close) re-arms the monitor. Falling through reschedules below.
 			this.supervisorAbsentSince = undefined;
+			this.supervisorProbeFailures = 0;
 		}
 		await this.exitIfSupervisorOrphanedForTooLong(supervisorSocketPath);
 		if (!this.shuttingDown && !this.hasAuthenticatedSupervisorConnection()) {
 			this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
+		}
+	}
+
+	/**
+	 * Decide the outcome of a supervisor probe and advance the consecutive-failure counter.
+	 * A connected probe or a live owner resets the counter; otherwise the supervisor is only
+	 * reported "lost" once enough consecutive probes have failed.
+	 */
+	private evaluateSupervisorProbe(
+		probeConnected: boolean,
+		ownershipAlive: boolean,
+	): "connected" | "owner-alive" | "wait" | "lost" {
+		if (probeConnected) {
+			this.supervisorProbeFailures = 0;
+			return "connected";
+		}
+		if (ownershipAlive) {
+			this.supervisorProbeFailures = 0;
+			return "owner-alive";
+		}
+		this.supervisorProbeFailures += 1;
+		return this.supervisorProbeFailures >= SUPERVISOR_LOST_PROBE_THRESHOLD ? "lost" : "wait";
+	}
+
+	/**
+	 * Whether the last supervisor that authenticated to this worker still owns its registry
+	 * entry with a live process. Distinguishes a busy/slow supervisor (socket probe fails but
+	 * the owner is alive) from a genuinely gone one, so a replacement daemon is never spawned
+	 * on top of a live owner.
+	 */
+	private async isSupervisorOwnershipAlive(): Promise<boolean> {
+		const claim = this.lastKnownSupervisorClaim;
+		if (!claim) return false;
+		try {
+			await assertDaemonSupervisorOwnerCurrent({
+				generation: claim.supervisorGeneration,
+				pid: claim.supervisorPid,
+				...(claim.supervisorProcessStartId ? { processStartId: claim.supervisorProcessStartId } : {}),
+				socketPath: claim.supervisorSocketPath,
+			});
+			return true;
+		} catch {
+			return false;
 		}
 	}
 
@@ -997,7 +1071,7 @@ export class AgentDaemon {
 		);
 	}
 
-	private canConnectToSupervisor(socketPath: string): Promise<boolean> {
+	private canConnectToSupervisor(socketPath: string, timeoutMs = SUPERVISOR_PROBE_TIMEOUT_MS): Promise<boolean> {
 		return new Promise((resolveConnect) => {
 			const socket = createConnection(socketPath);
 			let settled = false;
@@ -1011,7 +1085,7 @@ export class AgentDaemon {
 				socket.destroy();
 				resolveConnect(connected);
 			};
-			const timeout = setTimeout(() => finish(false), 250);
+			const timeout = setTimeout(() => finish(false), timeoutMs);
 			socket.once("connect", () => finish(true));
 			socket.once("error", () => finish(false));
 		});
@@ -1039,6 +1113,11 @@ export class AgentDaemon {
 				return;
 			}
 			if (await this.canConnectToSupervisor(supervisorSocketPath)) {
+				return;
+			}
+			// Never spawn a second daemon on top of a live owner: if the ownership record
+			// still names a live supervisor process, the socket probe merely flaked.
+			if (await this.isSupervisorOwnershipAlive()) {
 				return;
 			}
 			if (await isDaemonShutdownAdmissionActive()) {
@@ -3952,6 +4031,8 @@ export class AgentDaemon {
 				client.authenticated = true;
 				client.authenticationRole = "supervisor";
 				this.supervisorClaims.set(client, { claim, ownerFingerprint });
+				this.lastKnownSupervisorClaim = claim;
+				this.supervisorProbeFailures = 0;
 				this.clearSupervisorAvailabilityCheck();
 				this.scheduleSupervisorFenceCheck();
 				this.write(client, {
