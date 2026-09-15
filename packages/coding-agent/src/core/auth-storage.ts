@@ -500,6 +500,9 @@ export class AuthStorage {
 		const environmentCandidate = isEnvironmentAuthOptInProvider(provider)
 			? undefined
 			: this.getEnvironmentAuthCandidate(provider);
+		// A pinned Copilot identity is the effective credential (see getApiKeyWithSourceToken),
+		// so auth presence and the account-scoped cache key must see it first.
+		const pinnedCandidate = provider === "github-copilot" ? this.getCopilotPinAuthCandidate() : undefined;
 		const candidates =
 			provider === PRIME_INFERENCE_PROVIDER_ID
 				? [
@@ -510,6 +513,7 @@ export class AuthStorage {
 					]
 				: [
 						this.getRuntimeAuthCandidate(provider),
+						pinnedCandidate,
 						this.getStoredAuthCandidate(provider),
 						environmentCandidate,
 						fallbackCandidate,
@@ -601,15 +605,12 @@ export class AuthStorage {
 		});
 	}
 
+	private getCopilotPinAuthCandidate(): AuthSourceCandidate | undefined {
+		const pinnedToken = resolvePinnedCopilotToken();
+		return pinnedToken ? this.createCopilotPinAuthCandidate(pinnedToken) : undefined;
+	}
+
 	getCurrentAuthSourceToken(provider: string): AuthSourceToken | undefined {
-		// A pinned Copilot identity wins over every stored/env candidate (see
-		// getApiKeyWithSourceToken), so the account-scoped cache key must follow it.
-		if (provider === "github-copilot") {
-			const pinnedToken = resolvePinnedCopilotToken();
-			if (pinnedToken) {
-				return this.getAuthSourceTokenForCandidate(provider, this.createCopilotPinAuthCandidate(pinnedToken));
-			}
-		}
 		const { candidate } = this.getAvailableAuthCandidate(provider);
 		if (!candidate) {
 			return undefined;

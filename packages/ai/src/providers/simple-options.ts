@@ -3,7 +3,16 @@ import type { Api, Model, SimpleStreamOptions, StreamOptions, ThinkingBudgets, T
 export function buildBaseOptions(model: Model<Api>, options?: SimpleStreamOptions, apiKey?: string): StreamOptions {
 	return {
 		temperature: options?.temperature,
-		maxTokens: options?.maxTokens ?? (model.maxTokens > 0 ? Math.min(model.maxTokens, 32000) : undefined),
+		// GitHub Copilot: the official CLI sends no output cap on /responses and
+		// /chat/completions (the server applies its own), and the Anthropic path
+		// resolves the probed server cap itself; a 32K default would only truncate.
+		maxTokens:
+			options?.maxTokens ??
+			(model.provider === "github-copilot"
+				? undefined
+				: model.maxTokens > 0
+					? Math.min(model.maxTokens, 32000)
+					: undefined),
 		signal: options?.signal,
 		apiKey: apiKey || options?.apiKey,
 		transport: options?.transport,

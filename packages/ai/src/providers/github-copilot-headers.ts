@@ -51,6 +51,15 @@ export function copilotApiVersion(): string {
 	return env("COPILOT_API_VERSION") || COPILOT_API_VERSION_FALLBACK;
 }
 
+// Baked catalog identity fields. The live per-request identity (User-Agent with
+// platform/node/term, Editor-Version, integration id) must win over these even
+// when the registry folds model.headers into the per-request option headers.
+const STATIC_IDENTITY_HEADERS: ReadonlySet<string> = new Set([
+	"user-agent",
+	"editor-version",
+	"copilot-integration-id",
+]);
+
 /** Remove stale static headers before overlaying the current CLI identity. */
 export function sanitizeCopilotModelHeaders(
 	headers: Record<string, string> | undefined,
@@ -60,6 +69,7 @@ export function sanitizeCopilotModelHeaders(
 		Object.entries(headers ?? {}).filter(([name]) => {
 			const normalized = name.toLowerCase();
 			if (normalized === "editor-plugin-version") return false;
+			if (STATIC_IDENTITY_HEADERS.has(normalized)) return false;
 			return api !== "anthropic-messages" || normalized !== "openai-intent";
 		}),
 	);
@@ -246,6 +256,7 @@ export function buildCopilotCatalogHeaders(): Record<string, string> {
 		"X-Initiator": "user",
 		"Openai-Intent": COPILOT_INTENT_DEFAULT,
 		Accept: "application/json",
+		"Content-Type": "application/json",
 	};
 }
 

@@ -874,12 +874,7 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
-	// Copilot-served Claude: leave max_tokens to the provider's probed server cap
-	// (clamped to the remaining context) unless the caller asked for a value.
 	const isCopilot = model.provider === "github-copilot";
-	if (isCopilot && options?.maxTokens === undefined) {
-		base.maxTokens = undefined;
-	}
 	if (!options?.reasoning || options.reasoning === "off") {
 		return streamAnthropic(model, context, { ...base, thinkingEnabled: false } satisfies AnthropicOptions);
 	}
@@ -1004,12 +999,14 @@ function createClient(
 			apiKey: null,
 			authToken: apiKey,
 			baseURL: model.baseUrl,
-			dangerouslyAllowBrowser: true,
+			// Node is never a browser; leaving this on makes the SDK add the
+			// anthropic-dangerous-direct-browser-access header the CLI does not send.
+			dangerouslyAllowBrowser: false,
 			defaultHeaders: mergeHeaders(
 				{ accept: "*/*", ...COPILOT_SDK_HEADER_OVERRIDES },
 				sanitizeCopilotModelHeaders(model.headers, model.api),
+				sanitizeCopilotModelHeaders(optionsHeaders, model.api),
 				dynamicHeaders,
-				optionsHeaders,
 			),
 		});
 
@@ -1119,6 +1116,10 @@ function buildParams(
 	// and always-on models reject sampling params outright.
 	if (options?.temperature !== undefined && !options?.thinkingEnabled && !isAlwaysOnAdaptiveThinkingModel(model.id)) {
 		params.temperature = options.temperature;
+	} else if (model.provider === "github-copilot") {
+		// The official CLI sends temperature 1 on every Copilot /v1/messages request;
+		// CAPI accepts it alongside adaptive and always-on thinking.
+		params.temperature = 1;
 	}
 
 	if (context.tools && context.tools.length > 0) {

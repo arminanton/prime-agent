@@ -164,6 +164,9 @@ describe("AuthStorage", () => {
 		});
 
 		test("ambient environment credentials count as available auth", async () => {
+			// Bedrock ambient credentials are opt-in on this fork (PRIME_ENABLE_BEDROCK=1).
+			const originalEnableBedrock = process.env.PRIME_ENABLE_BEDROCK;
+			process.env.PRIME_ENABLE_BEDROCK = "1";
 			const originalAwsProfile = process.env.AWS_PROFILE;
 			process.env.AWS_PROFILE = "pi-test-profile";
 
@@ -183,10 +186,18 @@ describe("AuthStorage", () => {
 				} else {
 					process.env.AWS_PROFILE = originalAwsProfile;
 				}
+				if (originalEnableBedrock === undefined) {
+					delete process.env.PRIME_ENABLE_BEDROCK;
+				} else {
+					process.env.PRIME_ENABLE_BEDROCK = originalEnableBedrock;
+				}
 			}
 		});
 
 		test("changed ambient environment credential no longer matches stale auth marker", async () => {
+			// Bedrock ambient credentials are opt-in on this fork (PRIME_ENABLE_BEDROCK=1).
+			const originalEnableBedrock = process.env.PRIME_ENABLE_BEDROCK;
+			process.env.PRIME_ENABLE_BEDROCK = "1";
 			const originalAwsProfile = process.env.AWS_PROFILE;
 			process.env.AWS_PROFILE = "stale-profile";
 
@@ -205,6 +216,11 @@ describe("AuthStorage", () => {
 					delete process.env.AWS_PROFILE;
 				} else {
 					process.env.AWS_PROFILE = originalAwsProfile;
+				}
+				if (originalEnableBedrock === undefined) {
+					delete process.env.PRIME_ENABLE_BEDROCK;
+				} else {
+					process.env.PRIME_ENABLE_BEDROCK = originalEnableBedrock;
 				}
 			}
 		});

@@ -155,6 +155,18 @@ export async function refreshCopilotApiEndpoint(
 	}
 }
 
+/** Seed the resolved endpoint from a trusted cache written by a sibling process. */
+export function seedCopilotApiEndpoint(endpoint: string): void {
+	if (resolvedCopilotApiEndpoint()) return;
+	if (
+		!/^https:\/\/[a-z0-9.-]+\.githubcopilot\.com$/i.test(endpoint) &&
+		!/^https:\/\/copilot-api\.[a-z0-9.-]+$/i.test(endpoint)
+	) {
+		return;
+	}
+	resolvedApiEndpoint = { identity: copilotPinIdentity(), endpoint, expiresAt: Date.now() + COPILOT_ENDPOINT_TTL_MS };
+}
+
 /** Test hook. */
 export function resetCopilotApiEndpoint(): void {
 	resolvedApiEndpoint = undefined;

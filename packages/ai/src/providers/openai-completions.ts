@@ -681,7 +681,10 @@ function createClient(
 	}
 
 	if (optionsHeaders) {
-		Object.assign(headers, optionsHeaders);
+		Object.assign(
+			headers,
+			model.provider === "github-copilot" ? sanitizeCopilotModelHeaders(optionsHeaders, model.api) : optionsHeaders,
+		);
 	}
 
 	const defaultHeaders =

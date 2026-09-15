@@ -38,6 +38,8 @@ import {
 	copilotPinnedBaseUrl,
 	fetchCopilotCatalogInfo,
 	refreshCopilotApiEndpoint,
+	resolvedCopilotApiEndpoint,
+	seedCopilotApiEndpoint,
 } from "./copilot-credentials.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
@@ -463,6 +465,8 @@ interface CopilotEntitlementCache {
 	apiById?: Record<string, string>;
 	/** id -> live capability limits and reasoning efforts. */
 	capabilitiesById?: Record<string, CopilotModelCapabilities>;
+	/** Plan-aware inference host resolved from copilot_internal/user for this identity. */
+	apiEndpoint?: string;
 	refreshedAt: number;
 }
 
@@ -1161,6 +1165,7 @@ export class ModelRegistry {
 					parsed.capabilitiesById && typeof parsed.capabilitiesById === "object"
 						? parsed.capabilitiesById
 						: undefined,
+				apiEndpoint: typeof parsed.apiEndpoint === "string" ? parsed.apiEndpoint : undefined,
 				refreshedAt: parsed.refreshedAt,
 			};
 		} catch {
@@ -1194,6 +1199,7 @@ export class ModelRegistry {
 			this.copilotApiById = apiByIdFromRecord(cached.apiById);
 			this.copilotCapabilitiesById = capabilitiesByIdFromRecord(cached.capabilitiesById);
 			this.copilotEntitlementKnown = true;
+			if (cached.apiEndpoint) seedCopilotApiEndpoint(cached.apiEndpoint);
 		} else {
 			this.copilotEntitledModelIds = new Set();
 			this.copilotApiById = new Map();
@@ -1227,16 +1233,22 @@ export class ModelRegistry {
 			// identified for an account-scoped cache.
 			return;
 		}
+		const cached = this.readCopilotEntitlementCache();
+		if (cached && cached.fingerprint === fingerprint && cached.apiEndpoint) {
+			seedCopilotApiEndpoint(cached.apiEndpoint);
+		}
 		if (copilotPinnedBaseUrl() !== undefined) {
 			// Plan-aware host for pinned accounts: business/enterprise plans serve from
 			// their own endpoint; the front door remains the fallback while unresolved.
 			const before = copilotPinnedBaseUrl();
-			await refreshCopilotApiEndpoint(token);
+			const endpoint = await refreshCopilotApiEndpoint(token);
 			if (copilotPinnedBaseUrl() !== before) {
 				this.reloadModelsAfterCatalogChange();
 			}
+			if (endpoint && cached && cached.fingerprint === fingerprint && cached.apiEndpoint !== endpoint) {
+				this.writeCopilotEntitlementCache({ ...cached, apiEndpoint: endpoint });
+			}
 		}
-		const cached = this.readCopilotEntitlementCache();
 		if (cached && cached.fingerprint === fingerprint) {
 			this.copilotEntitledModelIds = new Set(cached.modelIds);
 			this.copilotApiById = apiByIdFromRecord(cached.apiById);
@@ -1265,6 +1277,7 @@ export class ModelRegistry {
 			modelIds: [...info.ids],
 			apiById: apiByIdToRecord(info.apiById),
 			capabilitiesById: capabilitiesByIdToRecord(info.capabilitiesById),
+			apiEndpoint: resolvedCopilotApiEndpoint(),
 			refreshedAt: Date.now(),
 		});
 	}
@@ -1291,6 +1304,7 @@ export class ModelRegistry {
 					modelIds: [...info.ids],
 					apiById: apiByIdToRecord(info.apiById),
 					capabilitiesById: capabilitiesByIdToRecord(info.capabilitiesById),
+					apiEndpoint: resolvedCopilotApiEndpoint(),
 					refreshedAt: Date.now(),
 				});
 				// The scoped catalog changed underneath the loaded model list.

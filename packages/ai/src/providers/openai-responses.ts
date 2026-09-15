@@ -230,7 +230,9 @@ function createClient(
 		Object.assign(headers, copilotHeaders);
 	}
 
-	if (cacheSessionId) {
+	// Copilot's front door has no OpenAI cache-affinity routing; the CLI sends
+	// neither header, and X-Client-Session-Id already carries the session.
+	if (cacheSessionId && model.provider !== "github-copilot") {
 		if (compat.sendSessionIdHeader) {
 			headers.session_id = cacheSessionId;
 		}
@@ -238,7 +240,10 @@ function createClient(
 	}
 
 	if (optionsHeaders) {
-		Object.assign(headers, optionsHeaders);
+		Object.assign(
+			headers,
+			model.provider === "github-copilot" ? sanitizeCopilotModelHeaders(optionsHeaders, model.api) : optionsHeaders,
+		);
 	}
 
 	const defaultHeaders =
@@ -270,7 +275,9 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		model: model.id,
 		input: messages,
 		stream: true,
-		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
+		// Copilot never sees prompt_cache_key: the CLI omits it and CAPI ignores it.
+		prompt_cache_key:
+			cacheRetention === "none" || model.provider === "github-copilot" ? undefined : options?.sessionId,
 		prompt_cache_retention: getPromptCacheRetention(compat, cacheRetention),
 		store: false,
 	};
