@@ -14,6 +14,7 @@ import {
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
 import { isProcessAlive, spawnHidden } from "../utils/child-process.js";
+import { settleWithinBudget } from "../utils/settle-within-budget.js";
 import { createUpdatedCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
 export const DAEMON_UPDATE_RESTART_COORDINATOR_FLAG = "--internal-update-restart-coordinator";
@@ -40,6 +41,8 @@ export interface DaemonUpdateRestartCounts {
 export interface DaemonUpdateRestartFailure {
 	sessionFile: string;
 	message: string;
+	/** Local retry classification; older readers ignore it. */
+	kind?: "held" | "degraded" | "create_failed";
 }
 
 export interface DaemonUpdateRestartProcessIdentity {
@@ -71,6 +74,8 @@ export interface DaemonUpdateRestartStatus {
 	predecessor?: DaemonUpdateRestartProcessIdentity;
 	successor?: DaemonUpdateRestartProcessIdentity;
 	escalation?: DaemonUpdateRestartEscalation;
+	/** Local checkpoint binding for recovery retries; not a daemon wire field. */
+	manifestCreatedAt?: string;
 	counts: DaemonUpdateRestartCounts;
 	failures?: DaemonUpdateRestartFailure[];
 	message?: string;
@@ -342,7 +347,7 @@ async function withCoordinatorRegistryGuard<T>(registryDir: string, action: () =
 	const assertGuardHeld = () => {
 		if (compromisedError) throw new Error(`Coordinator registry guard was compromised: ${compromisedError.message}`);
 	};
-	const release = await lockfile.lock(registryDir, {
+	const acquiring = lockfile.lock(registryDir, {
 		realpath: false,
 		lockfilePath: resolve(registryDir, ".guard"),
 		stale: COORDINATOR_REGISTRY_LOCK_STALE_MS,
@@ -357,14 +362,20 @@ async function withCoordinatorRegistryGuard<T>(registryDir: string, action: () =
 			maxTimeout: COORDINATOR_REGISTRY_LOCK_RETRY_MS,
 		},
 	});
+	const acquisition = await settleWithinBudget("coordinator registry guard acquisition", 6_000, acquiring);
+	if (!acquisition.ok) {
+		void acquiring.then((release) => release()).catch(() => undefined);
+		throw acquisition.error;
+	}
+	const release = acquisition.value;
 	try {
 		assertGuardHeld();
 		const result = await action();
 		assertGuardHeld();
 		return result;
 	} finally {
-		if (compromisedError) await release().catch(() => undefined);
-		else await release();
+		const released = await settleWithinBudget("coordinator registry guard release", 1000, release);
+		if (!released.ok && !compromisedError) throw released.error;
 	}
 }
 

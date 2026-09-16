@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { VERSION } from "../../config.js";
 import type { DaemonRuntimeIdentity } from "./daemon-protocol.js";
@@ -20,4 +21,23 @@ export function getDaemonRuntimeIdentity(environment: NodeJS.ProcessEnv = proces
 		...(entrypoint ? { entrypointPath: resolve(entrypoint) } : {}),
 		...(launcher ? { launcherPath: resolve(launcher) } : {}),
 	};
+}
+
+export const DAEMON_ADMISSION_TICKET_ENV = "PRIME_AGENT_INTERNAL_DAEMON_ADMISSION_TICKET";
+
+export interface DaemonReplacementIdentity {
+	buildId: string;
+	entrypointRealPath: string;
+}
+
+export function getDaemonReplacementIdentity(): DaemonReplacementIdentity {
+	const runtime = getDaemonRuntimeIdentity();
+	if (!runtime.buildId.trim() || !runtime.entrypointPath) throw new Error("Replacement target is missing its build or entrypoint identity");
+	return { buildId: runtime.buildId, entrypointRealPath: realpathSync(runtime.entrypointPath) };
+}
+
+export function matchesDaemonReplacementIdentity(runtime: DaemonRuntimeIdentity | undefined, expected: DaemonReplacementIdentity): boolean {
+	if (!runtime?.entrypointPath || runtime.buildId !== expected.buildId) return false;
+	try { return realpathSync(runtime.entrypointPath) === expected.entrypointRealPath; }
+	catch { return false; }
 }

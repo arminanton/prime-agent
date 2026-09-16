@@ -1,8 +1,9 @@
 import type { ImageContent, TextContent, UserMessage } from "@earendil-works/pi-ai";
 import chalk from "chalk";
+import { createHash } from "node:crypto";
 import { spawn } from "child_process";
-import { readFileSync, rmSync, statSync } from "fs";
-import { resolve, sep } from "path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "fs";
+import { join, resolve, sep } from "path";
 import { selectConfig } from "./cli/config-selector.js";
 import {
 	canConnectToDaemon,
@@ -33,11 +34,12 @@ import {
 	type DaemonUpdateRestartStatus,
 	DaemonUpdateRestartStatusWriter,
 	launchDaemonUpdateRestartCoordinator,
+	readDaemonUpdateRestartStatus,
 	waitForActiveDaemonUpdateRestartCoordinator,
 } from "./cli/daemon-update-restart.js";
 import {
 	captureCommittedEpochWorkers, escalateCommittedEpochWorkers, escalateExactProcess, evaluatePredecessorEscalationGate,
-	type ManifestProvenance, UPDATE_RESTART_NO_ESCALATION_ENV,
+	heldManifestSessionIds, type ManifestProvenance, UPDATE_RESTART_NO_ESCALATION_ENV,
 } from "./cli/daemon-update-retirement.js";
 import { getNativeUpdatePlan, NativeReleaseUnavailableError } from "./cli/native-update.js";
 import {
@@ -61,7 +63,7 @@ import type { AgentSessionRuntimeMetadata } from "./core/agent-session-runtime.j
 import { type CustomMessage, isSessionSlashCommand } from "./core/messages.js";
 import { DefaultPackageManager } from "./core/package-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
-import { getProcessStartId } from "./core/session-lease.js";
+import { canonicalSessionPath, getProcessStartId } from "./core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "./modes/daemon/daemon-client.js";
 import {
 	DAEMON_PROTOCOL_VERSION,
@@ -84,7 +86,10 @@ import {
 } from "./modes/daemon/daemon-worker-protocol.js";
 import { isProcessAlive, shouldUseWindowsShell } from "./utils/child-process.js";
 import { settleWithinBudget } from "./utils/settle-within-budget.js";
-import { scanLiveWorkerProcesses, type WorkerDescriptorInventoryEntry } from "./modes/daemon/daemon-worker-descriptors.js";
+import { writeFileAtomicSync } from "./utils/atomic-file.js";
+import { defaultWorkerDescriptorDir, readWorkerDescriptorInventory, scanLiveWorkerProcesses, type WorkerDescriptorInventoryEntry } from "./modes/daemon/daemon-worker-descriptors.js";
+import { readDaemonWorkerRecoveryHold } from "./modes/daemon/daemon-worker-recovery-hold.js";
+import { type DaemonReplacementIdentity, getDaemonReplacementIdentity, matchesDaemonReplacementIdentity } from "./modes/daemon/daemon-runtime-identity.js";
 import {
 	getLatestPiRelease,
 	isBaseVersionDowngrade,
@@ -896,8 +901,8 @@ function clearPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: 
 	}
 }
 
-function readPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: string): DaemonUpdateRestartManifest | undefined {
-	for (const path of [getDaemonUpdateRestartManifestPath(socketPath, agentDir), getLegacyDaemonUpdateRestartManifestPath(agentDir)]) {
+function readPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: string, includeLegacy = true): DaemonUpdateRestartManifest | undefined {
+	for (const path of [getDaemonUpdateRestartManifestPath(socketPath, agentDir), ...(includeLegacy ? [getLegacyDaemonUpdateRestartManifestPath(agentDir)] : [])]) {
 		let text: string;
 		try { text = readFileSync(path, "utf8"); }
 		catch (error) {
@@ -953,6 +958,7 @@ interface PreparedDaemonUpdateRestart {
 	manifest: DaemonUpdateRestartManifest;
 	provenance: ManifestProvenance;
 	workers: WorkerDescriptorInventoryEntry[];
+	heldActiveSessionIds?: Set<string>;
 }
 
 function isPredecessorIdentityGone(identity: FixedDaemonSupervisorOwnerIdentity): boolean {
@@ -961,9 +967,28 @@ function isPredecessorIdentityGone(identity: FixedDaemonSupervisorOwnerIdentity)
 	return observed !== undefined && observed !== identity.supervisorProcessStartId;
 }
 
-function assertNoUncommittedLiveWorkers(agentDir: string, socketPath: string): void {
+function scanManifestRecoveryHolds(agentDir: string, socketPath: string, manifest: DaemonUpdateRestartManifest) {
 	const live = scanLiveWorkerProcesses(agentDir, socketPath);
-	if (live.length > 0) throw new Error(`blocked: predecessor unavailable with ${live.length} live worker process(es) and no successful PREPARE inventory; pending manifest retained`);
+	const livePaths = new Set(live.map((worker) => worker.descriptorPath));
+	const roots = new Set([...manifest.sessions.map((session) => session.activeSessionId), ...(manifest.discardedActiveSessionIds ?? [])]);
+	const heldRoots = new Set<string>();
+	const heldPaths = new Set<string>();
+	for (const entry of readWorkerDescriptorInventory(agentDir, socketPath)) {
+		if (!livePaths.has(entry.descriptorPath) || !roots.has(entry.descriptor.rootActiveSessionId)) continue;
+		try {
+			const hold = readDaemonWorkerRecoveryHold(entry.descriptor);
+			if (hold?.manifestCreatedAt !== manifest.createdAt) continue;
+			heldRoots.add(entry.descriptor.rootActiveSessionId); heldPaths.add(entry.descriptorPath);
+		} catch { /* Invalid annotations do not grant recovery or signal authority. */ }
+	}
+	return { live, heldPaths, held: heldManifestSessionIds(manifest, heldRoots) };
+}
+
+function assertNoUncommittedLiveWorkers(agentDir: string, socketPath: string, manifest: DaemonUpdateRestartManifest): Set<string> {
+	const { live, heldPaths, held } = scanManifestRecoveryHolds(agentDir, socketPath, manifest);
+	const uncommitted = live.filter((worker) => !heldPaths.has(worker.descriptorPath));
+	if (uncommitted.length > 0) throw new Error(`blocked: predecessor unavailable with ${uncommitted.length} live worker process(es) and no successful PREPARE inventory; pending manifest retained`);
+	return held;
 }
 
 async function prepareConnectedDaemonUpdateRestart(
@@ -997,9 +1022,9 @@ async function prepareConnectedDaemonUpdateRestart(
 	} catch (error) {
 		if (fencePersistenceStarted) throw error;
 		if (fixedOwnerIdentity && isPredecessorIdentityGone(fixedOwnerIdentity)) {
-			assertNoUncommittedLiveWorkers(agentDir, socketPath);
 			const pending = tryReadPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
-			if (pending) return { manifest: pending, provenance: "pending_manifest_predecessor_dead", workers: [] };
+			if (pending) return { manifest: pending, provenance: "pending_manifest_predecessor_dead", workers: [],
+				heldActiveSessionIds: assertNoUncommittedLiveWorkers(agentDir, socketPath, pending) };
 		}
 		throw error;
 	}
@@ -1019,7 +1044,7 @@ export async function prepareDaemonUpdateRestart(
 		return (await prepareConnectedDaemonUpdateRestart(client, socketPath, agentDir, hello)).manifest;
 	} catch (error) {
 		if (!connected && pendingManifest && pendingManifest.sessions.length > 0) {
-			assertNoUncommittedLiveWorkers(agentDir, socketPath);
+			assertNoUncommittedLiveWorkers(agentDir, socketPath, pendingManifest);
 			return pendingManifest;
 		}
 		throw error;
@@ -1059,6 +1084,7 @@ interface RestoreDaemonUpdateRestartSessionResult {
 	restored: boolean;
 	resumed: boolean;
 	failureMessage?: string;
+	failureKind?: DaemonUpdateRestartFailure["kind"];
 }
 
 interface RestoreDaemonUpdateRestartResult extends DaemonUpdateRestartCounts {
@@ -1105,102 +1131,109 @@ async function restoreDaemonUpdateRestartSession(
 	);
 	if (!createResponse.success) {
 		console.error(chalk.yellow(`Warning: could not restore ${session.sessionFile}: ${createResponse.error}`));
-		return { restored: false, resumed: false, failureMessage: createResponse.error };
+		return { restored: false, resumed: false, failureMessage: createResponse.error, failureKind: "create_failed" };
 	}
-	const activeSessionId = readCreatedActiveSessionId(createResponse.data);
-	restoredActiveSessionIds.set(session.activeSessionId, activeSessionId);
-	if (session.activeSessionId === restartOriginActiveSessionId) {
-		try {
-			const noticeResponse = await client.request(
-				{
-					type: "append_custom_message",
-					activeSessionId,
-					message: {
-						customType: "prime-agent.update_complete",
-						content: `[update-complete]\n\nPrime Agent updated to v${VERSION}. This daemon session was restored after the update.`,
-						display: true,
-						details: { version: VERSION },
+	try {
+		const activeSessionId = readCreatedActiveSessionId(createResponse.data);
+		restoredActiveSessionIds.set(session.activeSessionId, activeSessionId);
+		if (session.activeSessionId === restartOriginActiveSessionId) {
+			try {
+				const noticeResponse = await client.request(
+					{
+						type: "append_custom_message",
+						activeSessionId,
+						message: {
+							customType: "prime-agent.update_complete",
+							content: `[update-complete]\n\nPrime Agent updated to v${VERSION}. This daemon session was restored after the update.`,
+							display: true,
+							details: { version: VERSION },
+						},
 					},
-				},
-				30000,
-			);
-			if (!noticeResponse.success) {
+					30000,
+				);
+				if (!noticeResponse.success) {
+					console.error(
+						chalk.yellow(
+							`Warning: could not record update completion in ${session.sessionFile}: ${noticeResponse.error}`,
+						),
+					);
+				}
+			} catch (error: unknown) {
 				console.error(
 					chalk.yellow(
-						`Warning: could not record update completion in ${session.sessionFile}: ${noticeResponse.error}`,
+						`Warning: could not record update completion in ${session.sessionFile}: ${formatUnknownError(error)}`,
 					),
 				);
 			}
-		} catch (error: unknown) {
-			console.error(
-				chalk.yellow(
-					`Warning: could not record update completion in ${session.sessionFile}: ${formatUnknownError(error)}`,
-				),
-			);
 		}
-	}
-	const restoreFailures: string[] = [];
-	if (!(await restoreNextTurnMessages(client, activeSessionId, session.sessionFile, session.queue.nextTurn))) restoreFailures.push("pending context restore failed");
-	if (!session.shouldResume) return { restored: restoreFailures.length === 0, resumed: false, failureMessage: restoreFailures.join("; ") || undefined };
+		const restoreFailures: string[] = [];
+		if (!(await restoreNextTurnMessages(client, activeSessionId, session.sessionFile, session.queue.nextTurn))) restoreFailures.push("pending context restore failed");
+		if (!session.shouldResume) return { restored: restoreFailures.length === 0, resumed: false, failureMessage: restoreFailures.length > 0 ? `degraded: ${restoreFailures.join("; ")}` : undefined, failureKind: restoreFailures.length > 0 ? "degraded" : undefined };
 
-	const needsContinuationPrompt =
-		session.wasStreaming ||
-		session.wasCompacting ||
-		session.wasBashRunning ||
-		session.hadRunningRlmChildren ||
-		session.wasRetrying ||
-		session.hadAcceptedPromptInFlight;
-	let resumedSession = false;
-	let restoredQueuedWork = false;
-	if (session.queue.actions.actions.length > 0) {
-		const response = await client.request(
-			{ type: "restore_actions", activeSessionId, snapshot: session.queue.actions },
-			30000,
-		);
-		if (response.success) {
-			restoredQueuedWork = true;
-		} else {
-			restoreFailures.push(`queued action restore failed: ${response.error}`);
-			console.error(
-				chalk.yellow(`Warning: could not restore queued actions for ${session.sessionFile}: ${response.error}`),
+		const needsContinuationPrompt =
+			session.wasStreaming ||
+			session.wasCompacting ||
+			session.wasBashRunning ||
+			session.hadRunningRlmChildren ||
+			session.wasRetrying ||
+			session.hadAcceptedPromptInFlight;
+		let resumedSession = false;
+		let restoredQueuedWork = false;
+		if (session.queue.actions.actions.length > 0) {
+			const response = await client.request(
+				{ type: "restore_actions", activeSessionId, snapshot: session.queue.actions },
+				30000,
 			);
+			if (response.success) {
+				restoredQueuedWork = true;
+			} else {
+				restoreFailures.push(`queued action restore failed: ${response.error}`);
+				console.error(
+					chalk.yellow(`Warning: could not restore queued actions for ${session.sessionFile}: ${response.error}`),
+				);
+			}
 		}
-	}
-	const restoredAcceptedTurn =
-		restoredQueuedWork &&
-		session.queue.actions.actions.some(
-			(action) =>
-				action.payload.kind === "turn" && !action.payload.queueVisible && action.payload.acceptedBeforeCompletion,
-		);
-	if (needsContinuationPrompt && !restoredAcceptedTurn) {
-		const promptResponse = await client.request(
-			{
-				type: "prompt",
-				activeSessionId,
-				message: UPDATE_RESTART_CONTINUATION_PROMPT,
-				expandPromptTemplates: false,
-			},
-			120000,
-		);
-		if (!promptResponse.success) {
-			console.error(chalk.yellow(`Warning: could not resume ${session.sessionFile}: ${promptResponse.error}`));
-		} else {
-			resumedSession = true;
-		}
-	}
-	if (!resumedSession && restoredQueuedWork) {
-		const response = await client.request({ type: "resume_queue", activeSessionId }, 30000);
-		if (response.success) {
-			resumedSession = true;
-		} else {
-			console.error(
-				chalk.yellow(`Warning: could not resume queued work for ${session.sessionFile}: ${response.error}`),
+		const restoredAcceptedTurn =
+			restoredQueuedWork &&
+			session.queue.actions.actions.some(
+				(action) =>
+					action.payload.kind === "turn" && !action.payload.queueVisible && action.payload.acceptedBeforeCompletion,
 			);
+		if (needsContinuationPrompt && !restoredAcceptedTurn) {
+			const promptResponse = await client.request(
+				{
+					type: "prompt",
+					activeSessionId,
+					message: UPDATE_RESTART_CONTINUATION_PROMPT,
+					expandPromptTemplates: false,
+				},
+				120000,
+			);
+			if (!promptResponse.success) {
+				console.error(chalk.yellow(`Warning: could not resume ${session.sessionFile}: ${promptResponse.error}`));
+			} else {
+				resumedSession = true;
+			}
 		}
+		if (!resumedSession && restoredQueuedWork) {
+			const response = await client.request({ type: "resume_queue", activeSessionId }, 30000);
+			if (response.success) {
+				resumedSession = true;
+			} else {
+				console.error(
+					chalk.yellow(`Warning: could not resume queued work for ${session.sessionFile}: ${response.error}`),
+				);
+			}
+		}
+		if (session.shouldResume && !resumedSession) restoreFailures.push("interrupted session activation failed");
+		return { restored: restoreFailures.length === 0, resumed: resumedSession, failureMessage: restoreFailures.length > 0 ? `degraded: ${restoreFailures.join("; ")}` : undefined, failureKind: restoreFailures.length > 0 ? "degraded" : undefined };
+	} catch (error) {
+		return { restored: false, resumed: false, failureKind: "degraded",
+			failureMessage: `degraded: recovery after create is uncertain: ${formatUnknownError(error)}` };
 	}
-	if (session.shouldResume && !resumedSession) restoreFailures.push("interrupted session activation failed");
-	return { restored: restoreFailures.length === 0, resumed: resumedSession, failureMessage: restoreFailures.join("; ") || undefined };
 }
+
+class DaemonRestoreHeldError extends Error {}
 
 async function restoreDaemonUpdateRestart(
 	socketPath: string,
@@ -1208,20 +1241,22 @@ async function restoreDaemonUpdateRestart(
 	restartOriginActiveSessionId?: string,
 	onProgress?: (progress: RestoreDaemonUpdateRestartResult) => void,
 	heldActiveSessionIds: ReadonlySet<string> = new Set(),
+	alreadyRestored: ReadonlyMap<string, string> = new Map(),
 ): Promise<RestoreDaemonUpdateRestartResult> {
-	const restoredActiveSessionIds = new Map<string, string>();
+	const restoredActiveSessionIds = new Map(alreadyRestored);
 	if (manifest.sessions.length === 0) {
 		return { total: 0, restored: 0, resumed: 0, failed: 0, failures: [] };
 	}
 	const client = new DaemonClient(socketPath);
-	let restored = 0;
+	let restored = manifest.sessions.filter((session) => alreadyRestored.has(session.activeSessionId)).length;
 	let resumed = 0;
 	const failures: DaemonUpdateRestartFailure[] = [];
 	try {
 		await client.connect(10000);
 		for (const session of manifest.sessions) {
+			if (alreadyRestored.has(session.activeSessionId)) continue;
 			try {
-				if (heldActiveSessionIds.has(session.activeSessionId)) throw new Error("recovery-uncertain: committed worker has not retired; session lease and checkpoint are retained until it exits");
+				if (heldActiveSessionIds.has(session.activeSessionId)) throw new DaemonRestoreHeldError("recovery-uncertain: committed worker has not retired; session lease and checkpoint are retained until it exits");
 				const result = await restoreDaemonUpdateRestartSession(
 					client,
 					session,
@@ -1238,12 +1273,14 @@ async function restoreDaemonUpdateRestart(
 					failures.push({
 						sessionFile: session.sessionFile,
 						message: result.failureMessage ?? "unknown restore error",
+						kind: result.failureKind ?? "degraded",
 					});
 				}
 			} catch (error: unknown) {
 				const message = formatUnknownError(error);
 				console.error(chalk.yellow(`Warning: could not restore ${session.sessionFile}: ${message}`));
-				failures.push({ sessionFile: session.sessionFile, message });
+				failures.push({ sessionFile: session.sessionFile, message,
+					kind: error instanceof DaemonRestoreHeldError ? "held" : "create_failed" });
 			}
 			onProgress?.({
 				total: manifest.sessions.length,
@@ -1287,10 +1324,11 @@ function processIdentityFromDaemonHello(
 	};
 }
 
-function validateReplacementDaemon(
+export function validateReplacementDaemon(
 	socketPath: string,
 	hello: DaemonHello,
 	predecessor: DaemonUpdateRestartProcessIdentity | undefined,
+	expected: DaemonReplacementIdentity,
 ): DaemonUpdateRestartProcessIdentity {
 	if (
 		hello.protocol.version !== DAEMON_PROTOCOL_VERSION ||
@@ -1324,7 +1362,142 @@ function validateReplacementDaemon(
 	) {
 		throw new Error(`Replacement daemon on ${socketPath} still has the predecessor identity`);
 	}
+	if (!matchesDaemonReplacementIdentity(hello.runtime, expected)) {
+		throw new Error(`Replacement daemon on ${socketPath} is build ${hello.runtime?.buildId ?? "unknown"} at ${hello.runtime?.entrypointPath ?? "unknown"}; expected build ${expected.buildId} at ${expected.entrypointRealPath}`);
+	}
 	return successor;
+}
+
+async function listActiveRestoreMappings(client: DaemonClient, manifest: DaemonUpdateRestartManifest): Promise<Map<string, string>> {
+	const response = await client.request({ type: "list", includeClientOwned: true }, 30_000);
+	if (!response.success) throw new Error(response.error);
+	if (!isRecord(response.data) || !Array.isArray(response.data.sessions)) throw new Error("Invalid active session list during restore continuation");
+	const active = new Map<string, string>();
+	for (const row of response.data.sessions) {
+		if (!isRecord(row) || typeof row.activeSessionId !== "string" || typeof row.sessionFile !== "string" ||
+			(row.workerState !== undefined && row.workerState !== "ready")) continue;
+		const file = canonicalSessionPath(row.sessionFile);
+		if (active.has(file) && active.get(file) !== row.activeSessionId) throw new Error("Multiple active owners for a restore checkpoint");
+		active.set(file, row.activeSessionId);
+	}
+	return new Map(manifest.sessions.flatMap((session) => {
+		const currentId = active.get(canonicalSessionPath(session.sessionFile));
+		return currentId ? [[session.activeSessionId, currentId] as const] : [];
+	}));
+}
+
+function preservePriorRestoreStatus(agentDir: string, statusPath: string): void {
+	const prior = readDaemonUpdateRestartStatus(statusPath);
+	if (!prior) {
+		if (existsSync(statusPath)) throw new Error("Existing update status is invalid; refusing to overwrite recovery evidence");
+		return;
+	}
+	const content = `${JSON.stringify(prior, null, 2)}\n`;
+	const key = createHash("sha256").update(content).digest("hex");
+	const directory = join(agentDir, "update-restarts");
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	let path = join(directory, `retained-${key}.json`);
+	if (resolve(path) === resolve(statusPath)) path = join(directory, `retained-${key}-prior.json`);
+	// Same v1 status format, not a new command receipt. Do not erase the
+	// latest result merely because the operator reused a status pathname.
+	writeFileAtomicSync(path, content, { mode: 0o600 });
+}
+
+function readPriorRestoreStatuses(agentDir: string, currentStatusPath: string): DaemonUpdateRestartStatus[] {
+	const paths = new Set([currentStatusPath]);
+	try {
+		for (const name of readdirSync(join(agentDir, "update-restarts"))) {
+			if (name.endsWith(".json")) paths.add(join(agentDir, "update-restarts", name));
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	const statuses: DaemonUpdateRestartStatus[] = [];
+	for (const path of paths) {
+		try { const status = readDaemonUpdateRestartStatus(path); if (status) statuses.push(status); }
+		catch { /* An invalid local record supplies no retry authority. */ }
+	}
+	return statuses;
+}
+
+interface DaemonRestoreContinuationPlan {
+	failedFiles: Map<string, DaemonUpdateRestartFailure>;
+	previouslyResolved: number;
+}
+
+function latestRestoreStatus(statuses: readonly DaemonUpdateRestartStatus[]): DaemonUpdateRestartStatus | undefined {
+	if (statuses.some((status) => !Number.isFinite(Date.parse(status.startedAt)) || !Number.isFinite(Date.parse(status.updatedAt)))) {
+		throw new Error("Prior restore status timestamps are invalid; manifest retained");
+	}
+	const sorted = [...statuses].sort((left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt) || Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+	const previous = sorted[0];
+	const next = sorted[1];
+	if (previous && next && next.startedAt === previous.startedAt && next.updatedAt === previous.updatedAt &&
+		JSON.stringify([next.counts, next.failures]) !== JSON.stringify([previous.counts, previous.failures])) {
+		throw new Error("Prior restore status ordering is ambiguous; manifest retained");
+	}
+	return previous;
+}
+
+export function planDaemonRestoreContinuation(
+	statuses: readonly DaemonUpdateRestartStatus[], socketPath: string, successor: DaemonUpdateRestartProcessIdentity,
+	manifest: DaemonUpdateRestartManifest,
+): DaemonRestoreContinuationPlan {
+	const previous = latestRestoreStatus(statuses.filter((status) => {
+		const previous = status.successor;
+		return previous && status.manifestCreatedAt === manifest.createdAt &&
+			normalizeSocketPath(status.socketPath) === normalizeSocketPath(socketPath) &&
+			previous.pid === successor.pid && previous.processStartId === successor.processStartId &&
+			previous.supervisorGeneration === successor.supervisorGeneration && previous.supervisorOwnerToken === successor.supervisorOwnerToken;
+	}));
+	if (!previous) throw new Error("Pending manifest is not bound to this live target; automatic continuation refused; manifest retained");
+	const files = new Set(manifest.sessions.map((session) => canonicalSessionPath(session.sessionFile)));
+	const failedFiles = new Map<string, DaemonUpdateRestartFailure>();
+	for (const failure of previous.failures ?? []) {
+		const file = canonicalSessionPath(failure.sessionFile);
+		if (!files.has(file) || failedFiles.has(file)) throw new Error("Prior restore status has conflicting session results; manifest retained");
+		failedFiles.set(file, failure);
+	}
+	// A progress count is written AFTER effects. An incomplete record cannot
+	// prove that the first unreported session was never created or activated.
+	if (files.size !== manifest.sessions.length || previous.counts.total !== manifest.sessions.length ||
+		previous.counts.failed !== failedFiles.size || previous.counts.restored + previous.counts.failed !== previous.counts.total) {
+		throw new Error("Prior restore status has incomplete per-session results; automatic continuation is ambiguous; manifest retained");
+	}
+	return { failedFiles, previouslyResolved: previous.counts.restored };
+}
+
+function planPreviouslyRestoredCheckpoint(
+	statuses: readonly DaemonUpdateRestartStatus[], socketPath: string, manifest: DaemonUpdateRestartManifest,
+): DaemonRestoreContinuationPlan | undefined {
+	const previous = latestRestoreStatus(statuses.filter((status) => status.successor &&
+		status.manifestCreatedAt === manifest.createdAt && normalizeSocketPath(status.socketPath) === normalizeSocketPath(socketPath)));
+	if (!previous?.successor) return undefined; // No prior restoration: preserve v1 first-handoff recovery.
+	return planDaemonRestoreContinuation([previous], socketPath, previous.successor, manifest);
+}
+
+async function restorePlannedDaemonCheckpoint(
+	socketPath: string, manifest: DaemonUpdateRestartManifest, plan: DaemonRestoreContinuationPlan,
+	origin: string | undefined, onProgress: (progress: RestoreDaemonUpdateRestartResult) => void,
+	holds: ReadonlySet<string>, active: ReadonlyMap<string, string>,
+): Promise<RestoreDaemonUpdateRestartResult> {
+	const residual: DaemonUpdateRestartManifest = { ...manifest, sessions: [] };
+	const manual: DaemonUpdateRestartFailure[] = [];
+	for (const session of manifest.sessions) {
+		const failure = plan.failedFiles.get(canonicalSessionPath(session.sessionFile));
+		if (!failure) continue; // Resolved, then user-closed, stays closed.
+		if ((failure.kind !== "held" && failure.kind !== "create_failed") || active.has(session.activeSessionId)) {
+			manual.push({ sessionFile: session.sessionFile, kind: "degraded",
+				message: "degraded: prior recovery may already have activated this session; automatic replay refused" });
+		} else residual.sessions.push(session);
+	}
+	const combine = (progress: RestoreDaemonUpdateRestartResult): RestoreDaemonUpdateRestartResult => ({
+		total: manifest.sessions.length, restored: plan.previouslyResolved + progress.restored, resumed: progress.resumed,
+		failed: manual.length + progress.failed, failures: [...manual, ...progress.failures],
+	});
+	onProgress(combine({ total: 0, restored: 0, resumed: 0, failed: 0, failures: [] }));
+	return combine(await restoreDaemonUpdateRestart(socketPath, residual, origin,
+		(progress) => onProgress(combine(progress)), holds, active));
 }
 
 async function retirePreparedPredecessor(context: {
@@ -1351,7 +1524,7 @@ async function retirePreparedPredecessor(context: {
 		await waitForDaemonStartupFence(context.socketPath, 10_000);
 	}
 	const prepared = context.prepared;
-	if (!prepared || prepared.provenance !== "prepare_rpc" || prepared.workers.length === 0) return new Set();
+	if (!prepared || prepared.provenance !== "prepare_rpc" || prepared.workers.length === 0) return prepared?.heldActiveSessionIds ?? new Set();
 	const predecessor = context.predecessor;
 	if (!predecessor?.processStartId || (isProcessAlive(predecessor.pid) &&
 		(getProcessStartId(predecessor.pid) === undefined || getProcessStartId(predecessor.pid) === predecessor.processStartId))) {
@@ -1376,40 +1549,43 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 	statusPath: string;
 	originActiveSessionId?: string;
 }): Promise<DaemonUpdateRestartStatus> {
-	const statusWriter = new DaemonUpdateRestartStatusWriter(
-		options.statusPath,
-		`${process.pid}-${Date.now()}`,
-		options.socketPath,
-	);
+	const requestId = `${process.pid}-${Date.now()}`;
+	let lease: Awaited<ReturnType<typeof acquireDaemonUpdateRestartCoordinator>>;
+	try {
+		lease = await acquireDaemonUpdateRestartCoordinator({ requestId, socketPath: options.socketPath, statusPath: options.statusPath });
+	} catch (error) {
+		if (!(error instanceof DaemonUpdateRestartCoordinatorAlreadyRunningError)) throw error;
+		const active = await waitForActiveDaemonUpdateRestartCoordinator(error.record);
+		if (resolve(options.statusPath) === resolve(error.record.statusPath)) return active;
+		const joined = new DaemonUpdateRestartStatusWriter(options.statusPath, requestId, options.socketPath);
+		// A mirror is informational, not a new effect receipt. Omitting successor
+		// and checkpoint identity prevents it from authorizing a later retry.
+		joined.update({ phase: active.phase, counts: active.counts, failures: active.failures,
+			message: `Joined coordinator ${active.requestId}. ${active.message ?? ""}` });
+		return joined.current();
+	}
+	let priorStatuses: DaemonUpdateRestartStatus[];
+	let statusWriter: DaemonUpdateRestartStatusWriter;
+	try {
+		priorStatuses = readPriorRestoreStatuses(options.agentDir, options.statusPath);
+		preservePriorRestoreStatus(options.agentDir, options.statusPath);
+		statusWriter = new DaemonUpdateRestartStatusWriter(options.statusPath, requestId, options.socketPath);
+	} catch (error) {
+		await settleWithinBudget("coordinator initialization cleanup", 5_000, () => lease.release());
+		throw error;
+	}
 	const stopStatusHeartbeat = statusWriter.startHeartbeat();
-	let lease: Awaited<ReturnType<typeof acquireDaemonUpdateRestartCoordinator>> | undefined;
 	let shutdownAdmission: Awaited<ReturnType<typeof acquireDaemonShutdownAdmission>> | undefined;
 	let connectedClient: DaemonClient | undefined;
 	let manifest: DaemonUpdateRestartManifest | undefined;
 	let prepared: PreparedDaemonUpdateRestart | undefined;
 	let shutdownAccepted = false;
+	let pendingHolds = new Set<string>();
+	let validatedSuccessor: DaemonUpdateRestartProcessIdentity | undefined;
+	let checkpointPlan: DaemonRestoreContinuationPlan | undefined;
+	let restoreStarted = false;
 	try {
-		try {
-			lease = await acquireDaemonUpdateRestartCoordinator({
-				requestId: statusWriter.current().requestId,
-				socketPath: options.socketPath,
-				statusPath: options.statusPath,
-			});
-		} catch (error: unknown) {
-			if (!(error instanceof DaemonUpdateRestartCoordinatorAlreadyRunningError)) {
-				throw error;
-			}
-			const activeStatus = await waitForActiveDaemonUpdateRestartCoordinator(error.record);
-			statusWriter.update({
-				phase: activeStatus.phase,
-				counts: activeStatus.counts,
-				...(activeStatus.predecessor ? { predecessor: activeStatus.predecessor } : {}),
-				...(activeStatus.successor ? { successor: activeStatus.successor } : {}),
-				...(activeStatus.failures ? { failures: activeStatus.failures } : {}),
-				...(activeStatus.message ? { message: activeStatus.message } : {}),
-			});
-			return statusWriter.current();
-		}
+		const expected = getDaemonReplacementIdentity();
 		shutdownAdmission = await acquireDaemonShutdownAdmission();
 		const daemonProbe = await probeRunningDaemonSessions(options.socketPath);
 		const reportRestoreProgress = (progress: RestoreDaemonUpdateRestartResult) => {
@@ -1422,6 +1598,28 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 			await connectedClient.connect(1000);
 			const hello = await connectedClient.waitForHello(2000);
 			predecessor = processIdentityFromDaemonHello(hello);
+			if (matchesDaemonReplacementIdentity(hello.runtime, expected) && process.env.PRIME_AGENT_UPDATE_RESTART_ALLOW_SAME_BUILD !== "1") {
+				const successor = validateReplacementDaemon(options.socketPath, hello, undefined, expected);
+				const pending = readPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir, false);
+				if (!pending || pending.sessions.length === 0) {
+					statusWriter.update({ phase: "skipped", successor, message: `Target build ${expected.buildId} is already the live daemon` });
+					return statusWriter.current();
+				}
+				const plan = planDaemonRestoreContinuation(priorStatuses, options.socketPath, successor, pending);
+				// There is no launch gap: this exact target already owns the socket.
+				await shutdownAdmission.assertOrRenew();
+				await shutdownAdmission.release();
+				shutdownAdmission = undefined;
+				const active = await listActiveRestoreMappings(connectedClient, pending);
+				const holds = scanManifestRecoveryHolds(options.agentDir, options.socketPath, pending).held;
+				statusWriter.update({ phase: "restoring", successor, manifestCreatedAt: pending.createdAt });
+				const { failures, ...counts } = await restorePlannedDaemonCheckpoint(options.socketPath, pending, plan,
+					options.originActiveSessionId, reportRestoreProgress, holds, active);
+				if (counts.failed === 0) clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+				statusWriter.update({ phase: "complete", counts, failures,
+					message: `Retried only failed checkpoints; ${plan.previouslyResolved} previously resolved checkpoint(s) were not replayed` });
+				return statusWriter.current();
+			}
 			statusWriter.update({ phase: "preparing", ...(predecessor ? { predecessor } : {}) });
 			try {
 				prepared = await prepareConnectedDaemonUpdateRestart(
@@ -1431,6 +1629,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 					hello,
 				);
 				manifest = prepared.manifest;
+				if (prepared.provenance !== "prepare_rpc") checkpointPlan = planPreviouslyRestoredCheckpoint(priorStatuses, options.socketPath, manifest);
 			} catch (error: unknown) {
 				const daemonLacksPrepareCommand = isUnknownDaemonCommandError(error, "prepare_update_restart");
 				if (daemonProbeMayHaveBusySessions(daemonProbe) || !daemonLacksPrepareCommand) {
@@ -1441,6 +1640,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 			}
 			statusWriter.update({
 				phase: "stopping",
+				...(manifest ? { manifestCreatedAt: manifest.createdAt } : {}),
 				counts: {
 					total: manifest?.sessions.length ?? 0,
 					restored: 0,
@@ -1457,26 +1657,36 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 			}
 		} else {
 			manifest = readPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
-			if (manifest) assertNoUncommittedLiveWorkers(options.agentDir, options.socketPath);
+			if (manifest) {
+				checkpointPlan = planPreviouslyRestoredCheckpoint(priorStatuses, options.socketPath, manifest);
+				pendingHolds = assertNoUncommittedLiveWorkers(options.agentDir, options.socketPath, manifest);
+			}
 			if (!hasRestorableDaemonUpdateRestart(manifest)) {
 				statusWriter.update({ phase: "skipped", message: "No running daemon needed to be restarted" });
 				return statusWriter.current();
 			}
 		}
 
-		statusWriter.update({ phase: "starting_daemon" });
-		const held = await retirePreparedPredecessor({ socketPath: options.socketPath, agentDir: options.agentDir,
-			predecessor, prepared, shutdownAccepted, statusWriter, assertAdmission: () => shutdownAdmission!.assertOrRenew() });
+		statusWriter.update({ phase: "starting_daemon", ...(manifest ? { manifestCreatedAt: manifest.createdAt } : {}) });
+		const held = new Set([...pendingHolds, ...await retirePreparedPredecessor({ socketPath: options.socketPath, agentDir: options.agentDir,
+			predecessor, prepared, shutdownAccepted, statusWriter, assertAdmission: () => shutdownAdmission!.assertOrRenew() })]);
 		await shutdownAdmission.assertOrRenew();
-		await shutdownAdmission.release();
-		shutdownAdmission = undefined;
-		await ensureInteractiveDaemonRunning(options.socketPath);
+		const admissionTicket = await shutdownAdmission.grantTargetTicket({ ...expected, socketPath: options.socketPath,
+			agentDir: options.agentDir, descriptorDir: defaultWorkerDescriptorDir(options.agentDir, options.socketPath) });
+		await ensureInteractiveDaemonRunning(options.socketPath, undefined, { target: expected, admissionTicket });
 		const successorClient = new DaemonClient(options.socketPath);
+		let activeForRetry = new Map<string, string>();
 		let successor: DaemonUpdateRestartProcessIdentity;
 		try {
 			await successorClient.connect(1000);
 			const successorHello = await successorClient.waitForHello(60000);
-			successor = validateReplacementDaemon(options.socketPath, successorHello, predecessor);
+			successor = validateReplacementDaemon(options.socketPath, successorHello, predecessor, expected);
+			validatedSuccessor = successor;
+			statusWriter.update({ successor });
+			await shutdownAdmission.assertTargetClaim(successorHello);
+			await shutdownAdmission.release();
+			shutdownAdmission = undefined;
+			if (checkpointPlan && manifest) activeForRetry = await listActiveRestoreMappings(successorClient, manifest);
 		} finally {
 			successorClient.close();
 		}
@@ -1485,13 +1695,11 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 		let counts: DaemonUpdateRestartCounts = { total: 0, restored: 0, resumed: 0, failed: 0 };
 		let failures: DaemonUpdateRestartFailure[] = [];
 		if (manifest) {
-			const restoreResult = await restoreDaemonUpdateRestart(
-				options.socketPath,
-				manifest,
-				options.originActiveSessionId,
-				reportRestoreProgress,
-				held,
-			);
+			restoreStarted = true;
+			const restoreResult = checkpointPlan
+				? await restorePlannedDaemonCheckpoint(options.socketPath, manifest, checkpointPlan,
+					options.originActiveSessionId, reportRestoreProgress, held, activeForRetry)
+				: await restoreDaemonUpdateRestart(options.socketPath, manifest, options.originActiveSessionId, reportRestoreProgress, held);
 			counts = {
 				total: restoreResult.total,
 				restored: restoreResult.restored,
@@ -1511,6 +1719,17 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 					: "Restarted the daemon after the update",
 		});
 	} catch (error: unknown) {
+		// A validated successor with no restore dispatch has unambiguous failed
+		// checkpoints (for example a lost target claim). A later bound retry is safe.
+		if (validatedSuccessor && manifest && !restoreStarted) {
+			const failures: DaemonUpdateRestartFailure[] = checkpointPlan
+				? [...checkpointPlan.failedFiles.values()].map((failure) =>
+					failure.kind === "held" || failure.kind === "create_failed" ? { ...failure, message: "Restore was not started" }
+						: { ...failure, kind: "degraded" })
+				: manifest.sessions.map((session) => ({ sessionFile: session.sessionFile, kind: "create_failed", message: "Restore was not started" }));
+			statusWriter.update({ successor: validatedSuccessor, manifestCreatedAt: manifest.createdAt,
+				counts: { total: manifest.sessions.length, restored: checkpointPlan?.previouslyResolved ?? 0, resumed: 0, failed: failures.length }, failures });
+		}
 		statusWriter.update({ phase: "failed", message: formatUnknownError(error) });
 	} finally {
 		stopStatusHeartbeat();
@@ -1520,7 +1739,10 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 			["coordinator lease release", () => lease?.release()],
 		] as const) {
 			const result = await settleWithinBudget(stage, 5_000, async () => { await release(); });
-			if (!result.ok) statusWriter.update({ phase: "failed", message: `${stage} failed: ${formatUnknownError(result.error)}` });
+			if (!result.ok) {
+				const previous = statusWriter.current();
+				statusWriter.update({ message: `${previous.message ?? ""}; warning: ${stage} failed: ${formatUnknownError(result.error)}` });
+			}
 		}
 	}
 	return statusWriter.current();

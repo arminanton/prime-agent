@@ -12,7 +12,7 @@ import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_QUIET_STDERR_ENV, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
-import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
+import { DAEMON_ADMISSION_TICKET_ENV, type DaemonReplacementIdentity, getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
@@ -413,7 +413,12 @@ export function buildDaemonScopeInvocation(command: string, args: readonly strin
 	return { command: systemdRun, args: scopeArgs, scoped: true };
 }
 
-async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promise<void> {
+export interface ReplacementDaemonLaunch {
+	target: DaemonReplacementIdentity;
+	admissionTicket: string;
+}
+
+async function ensureDaemonRunning(socketPath: string, spawnCwd?: string, replacement?: ReplacementDaemonLaunch): Promise<void> {
 	const probeStartedAt = Date.now();
 	let probe = await probeDaemonVersion(socketPath);
 	if (probe.status === "unresponsive") {
@@ -440,7 +445,7 @@ Then retry the original command.`,
 		if (disposition === "busy") throw new StaleDaemonError(socketPath, probe.hello);
 	}
 
-	const entrypoint = process.argv[1];
+	const entrypoint = replacement?.target.entrypointRealPath ?? process.argv[1];
 	if (!entrypoint) {
 		throw new Error("Cannot determine current CLI entrypoint for daemon launch");
 	}
@@ -451,6 +456,8 @@ Then retry the original command.`,
 	// Agent daemon) would launch the supervisor in worker mode, which listens
 	// on the socket but never sends the daemon_hello handshake.
 	const env = createCliSubprocessEnv();
+	delete env[DAEMON_ADMISSION_TICKET_ENV];
+	if (replacement) env[DAEMON_ADMISSION_TICKET_ENV] = replacement.admissionTicket;
 	delete env[DAEMON_WORKER_ROLE_ENV];
 	delete env[DAEMON_WORKER_TOKEN_ENV];
 	delete env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];
@@ -661,7 +668,8 @@ const ensurePromises = new Map<string, Promise<void>>();
  * main.ts share one probe/spawn; failed attempts are forgotten so a later call
  * retries (and surfaces the real error at its await site).
  */
-export function ensureInteractiveDaemonRunning(socketPath: string, spawnCwd?: string): Promise<void> {
+export function ensureInteractiveDaemonRunning(socketPath: string, spawnCwd?: string, replacement?: ReplacementDaemonLaunch): Promise<void> {
+	if (replacement) return ensureDaemonRunning(socketPath, spawnCwd, replacement);
 	let promise = ensurePromises.get(socketPath);
 	if (!promise) {
 		promise = ensureDaemonRunning(socketPath, spawnCwd);

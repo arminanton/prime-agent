@@ -8,6 +8,7 @@ import { writeFileAtomicSync } from "../../utils/atomic-file.js";
 import { isProcessAlive, isZombieProcess, processIdExists } from "../../utils/child-process.js";
 import { settleWithinBudget } from "../../utils/settle-within-budget.js";
 import { defaultDaemonSocketDir, normalizeSocketPath } from "./daemon-socket.js";
+import { type DaemonReplacementIdentity, getDaemonReplacementIdentity } from "./daemon-runtime-identity.js";
 
 const DAEMON_SUPERVISOR_REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 
@@ -39,8 +40,18 @@ interface DaemonSupervisorOwnerRecord extends ProcessIdentity {
 	agentDir: string;
 	appVersion: string;
 	phase: DaemonSupervisorOwnerPhase;
+	/** Local startup authorization, never sent in hello or worker authentication. */
+	admissionTicketToken?: string;
 	createdAt: string;
 	updatedAt: string;
+}
+
+interface DaemonShutdownTargetTicket extends DaemonReplacementIdentity {
+	token: string;
+	socketPath: string;
+	agentDir: string;
+	descriptorDir: string;
+	issuedAt: string;
 }
 
 interface DaemonShutdownAdmissionRecord extends ProcessIdentity {
@@ -49,6 +60,7 @@ interface DaemonShutdownAdmissionRecord extends ProcessIdentity {
 	createdAt: string;
 	updatedAt: string;
 	expiresAt: string;
+	targetTicket?: DaemonShutdownTargetTicket;
 }
 
 interface DaemonSupervisorOwnerScope {
@@ -99,6 +111,7 @@ interface AcquireDaemonSupervisorOwnershipOptions {
 	generation: string;
 	appVersion: string;
 	registryDir?: string;
+	admissionTicket?: string;
 }
 
 class DaemonSupervisorAlreadyRunningError extends Error {
@@ -199,6 +212,7 @@ class DaemonSupervisorOwnership {
 		readonly record: DaemonSupervisorOwnerRecord,
 		private readonly registryDir: string,
 		private readonly ownerDirectory: string,
+		readonly claimedAdmissionTicket?: string,
 	) {}
 
 	async assertCurrent(): Promise<void> {
@@ -281,6 +295,31 @@ class DaemonShutdownAdmission {
 			throw new DaemonShutdownAdmissionError("Daemon shutdown admission was lost");
 		}
 		await this.renewal.assertOrRenew();
+	}
+
+	async grantTargetTicket(target: DaemonReplacementIdentity & { socketPath: string; agentDir: string; descriptorDir: string }): Promise<string> {
+		await this.assertOrRenew();
+		const ticket: DaemonShutdownTargetTicket = { ...target, token: randomUUID(), socketPath: normalizeSocketPath(target.socketPath),
+			agentDir: canonicalizeFilesystemPath(target.agentDir), descriptorDir: canonicalizeFilesystemPath(target.descriptorDir),
+			entrypointRealPath: realpathSync(target.entrypointRealPath), issuedAt: new Date().toISOString() };
+		await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
+			if (this.released) throw new DaemonShutdownAdmissionError("Daemon shutdown admission was lost");
+			this.record.targetTicket = ticket;
+			this.renewUnderGuard();
+		});
+		return ticket.token;
+	}
+
+	async assertTargetClaim(hello: DaemonSupervisorHelloIdentity): Promise<void> {
+		await this.assertOrRenew();
+		await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
+			const admission = readActiveShutdownAdmission(this.registryDir);
+			const owner = hello.supervisorGeneration ? readOwnerRecord(ownerDirectoryPath(this.registryDir, hello.supervisorGeneration)) : undefined;
+			if (!admission || admission.token !== this.record.token || !owner || owner.pid !== hello.supervisorPid ||
+				owner.processStartId !== hello.supervisorProcessStartId || owner.token !== hello.supervisorOwnerToken ||
+				owner.socketPath !== hello.supervisorSocketPath || !ticketMatchesClaim(admission, owner, this.record.targetTicket?.token) ||
+				!isProcessIdentityAlive(owner)) throw new DaemonShutdownAdmissionError("Replacement daemon did not claim the target admission ticket");
+		});
 	}
 
 	private renewUnderGuard(): void {
@@ -487,12 +526,17 @@ export async function acquireDaemonSupervisorOwnership(
 	const ownerDirectory = ownerDirectoryPath(registryDir, options.generation);
 	mkdirSync(candidateDirectory, { mode: 0o700 });
 	const staleDirectories: string[] = [];
+	let claimedAdmissionTicket: string | undefined;
 	try {
 		writeOwnerScope(candidateDirectory, record);
 		writeOwnerRecord(candidateDirectory, record);
 		await withDaemonSupervisorRegistryGuard(registryDir, () => {
-			if (readActiveShutdownAdmission(registryDir)) {
-				throw new DaemonShutdownAdmissionError();
+			const admission = readActiveShutdownAdmission(registryDir);
+			if (admission) {
+				if (!targetTicketAuthorizes(admission, options.admissionTicket, record)) throw new DaemonShutdownAdmissionError();
+				claimedAdmissionTicket = options.admissionTicket;
+				record.admissionTicketToken = claimedAdmissionTicket;
+				writeOwnerRecord(candidateDirectory, record);
 			}
 			for (const directory of listOwnerDirectories(registryDir)) {
 				const owner = readOwnerRecordForScope(directory, (scope) => ownerConflicts(scope, record));
@@ -519,7 +563,7 @@ export async function acquireDaemonSupervisorOwnership(
 			rmSync(directory, { recursive: true, force: true });
 		}
 	}
-	return new DaemonSupervisorOwnership(record, registryDir, ownerDirectory);
+	return new DaemonSupervisorOwnership(record, registryDir, ownerDirectory, claimedAdmissionTicket);
 }
 
 // The 250ms fence poll must not spawn `ps` (macOS/BSD zombie check) per tick; existence stays kill(0)-checked every tick.
@@ -610,9 +654,31 @@ export async function acquireDaemonShutdownAdmission(timeoutMs = 60_000): Promis
 	}
 }
 
-export async function isDaemonShutdownAdmissionActive(): Promise<boolean> {
+function targetTicketAuthorizes(admission: DaemonShutdownAdmissionRecord, token: string | undefined, owner: DaemonSupervisorOwnerRecord): boolean {
+	const ticket = admission.targetTicket;
+	if (!ticket || !token || ticket.token !== token || ticket.socketPath !== owner.socketPath || ticket.agentDir !== owner.agentDir || ticket.descriptorDir !== owner.descriptorDir) return false;
+	try {
+		const runtime = getDaemonReplacementIdentity();
+		return ticket.buildId === runtime.buildId && ticket.entrypointRealPath === runtime.entrypointRealPath;
+	} catch { return false; }
+}
+
+function ticketMatchesClaim(admission: DaemonShutdownAdmissionRecord, owner: DaemonSupervisorOwnerRecord, token: string | undefined): boolean {
+	const ticket = admission.targetTicket;
+	return !!ticket && !!token && ticket.token === token && owner.admissionTicketToken === token &&
+		ticket.socketPath === owner.socketPath && ticket.agentDir === owner.agentDir && ticket.descriptorDir === owner.descriptorDir;
+}
+
+export async function isDaemonShutdownAdmissionActive(options: { exceptOwner?: DaemonSupervisorOwnership } = {}): Promise<boolean> {
 	const registryDir = defaultDaemonSupervisorRegistryDir();
-	return withDaemonSupervisorRegistryGuard(registryDir, () => readActiveShutdownAdmission(registryDir) !== undefined);
+	return withDaemonSupervisorRegistryGuard(registryDir, () => {
+		const admission = readActiveShutdownAdmission(registryDir);
+		if (!admission) return false;
+		const owner = options.exceptOwner;
+		if (!owner) return true;
+		const current = readOwnerRecord(ownerDirectoryPath(registryDir, owner.record.generation));
+		return !current || !sameOwnerRecord(current, owner.record) || !ticketMatchesClaim(admission, current, owner.claimedAdmissionTicket);
+	});
 }
 
 export async function persistDaemonStartupFenceFromOwner(

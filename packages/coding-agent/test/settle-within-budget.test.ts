@@ -4,6 +4,11 @@ import { BudgetExceededError, settleWithinBudget } from "../src/utils/settle-wit
 afterEach(() => vi.useRealTimers());
 
 describe("settleWithinBudget", () => {
+	it("calls a zero-argument factory without forwarding a promise callback argument", async () => {
+		const factory = vi.fn(() => 42);
+		expect(await settleWithinBudget("factory", 100, factory)).toMatchObject({ ok: true, value: 42 });
+		expect(factory).toHaveBeenCalledWith();
+	});
 	it("returns a value and clears its timer", async () => {
 		vi.useFakeTimers();
 		expect(await settleWithinBudget("test", 100, Promise.resolve(42))).toMatchObject({ ok: true, value: 42 });

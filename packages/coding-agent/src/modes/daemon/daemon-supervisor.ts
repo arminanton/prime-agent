@@ -107,7 +107,7 @@ import {
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
-import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
+import { DAEMON_ADMISSION_TICKET_ENV, getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
 import { closeDaemonTransport } from "./daemon-transport-close.js";
 import { matchesSessionIdSuffix } from "./daemon-session-id.js";
 import {
@@ -789,6 +789,8 @@ export class DaemonSupervisor {
 	}
 
 	async start(): Promise<void> {
+		const admissionTicket = process.env[DAEMON_ADMISSION_TICKET_ENV];
+		delete process.env[DAEMON_ADMISSION_TICKET_ENV];
 		try {
 			const agentDir = this.defaultSessionConfig.agentDir;
 			if (!agentDir) {
@@ -805,6 +807,7 @@ export class DaemonSupervisor {
 				agentDir,
 				generation: this.generation,
 				appVersion: VERSION,
+				admissionTicket,
 			});
 			this.assertSocketLeaseHeld();
 			await prepareDaemonSocketPath(this.socketPath, this.socketLease);
@@ -1324,7 +1327,7 @@ export class DaemonSupervisor {
 
 	private async assertRecoveryAllowed(): Promise<void> {
 		await this.assertServingCurrentOwnership();
-		if (await isDaemonShutdownAdmissionActive()) {
+		if (await isDaemonShutdownAdmissionActive({ exceptOwner: this.ownership })) {
 			throw new SupervisorRecoveryCancelledError("Daemon shutdown admission cancelled worker recovery");
 		}
 	}

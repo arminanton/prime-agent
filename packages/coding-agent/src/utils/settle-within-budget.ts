@@ -27,7 +27,7 @@ export async function settleWithinBudget<T>(
 	});
 	let pending: Promise<T> | undefined;
 	try {
-		pending = typeof work === "function" ? Promise.resolve().then(work) : work;
+		pending = typeof work === "function" ? Promise.resolve().then(() => work()) : work;
 		const value = await Promise.race([pending, timeout]);
 		return { ok: true, value, elapsedMs: performance.now() - startedAt };
 	} catch (error) {

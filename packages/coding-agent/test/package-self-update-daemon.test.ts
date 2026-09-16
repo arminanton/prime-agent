@@ -1,3 +1,6 @@
+import type * as ChildProcessTypes from "../src/utils/child-process.js";
+import type * as DaemonSupervisorOwnershipTypes from "../src/modes/daemon/daemon-supervisor-ownership.js";
+import type * as SessionLeaseTypes from "../src/core/session-lease.js";
 import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +9,7 @@ import type * as DaemonUpdateRestartModule from "../src/cli/daemon-update-restar
 import {
 	acquireDaemonUpdateRestartCoordinator,
 	type DaemonUpdateRestartStatus,
+	type DaemonUpdateRestartFailure,
 	DaemonUpdateRestartStatusWriter,
 	waitForActiveDaemonUpdateRestartCoordinator,
 } from "../src/cli/daemon-update-restart.js";
@@ -23,7 +27,9 @@ import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/d
 import type * as DaemonSocketModule from "../src/modes/daemon/daemon-socket.js";
 import * as processFacts from "../src/utils/child-process.js";
 import * as retirement from "../src/cli/daemon-update-retirement.js";
-import { DaemonStartupFenceTimeoutError, waitForDaemonStartupFence } from "../src/modes/daemon/daemon-supervisor-ownership.js";
+import { getDaemonRuntimeIdentity } from "../src/modes/daemon/daemon-runtime-identity.js";
+import { defaultWorkerDescriptorDir } from "../src/modes/daemon/daemon-worker-descriptors.js";
+import { acquireDaemonShutdownAdmission, DaemonStartupFenceTimeoutError, waitForDaemonStartupFence } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 import {
 	handlePackageCommand,
 	prepareDaemonUpdateRestart,
@@ -139,6 +145,7 @@ const mockState = vi.hoisted(() => ({
 		supervisorPid?: number;
 		supervisorProcessStartId?: string;
 		supervisorSocketPath?: string;
+		runtime?: ReturnType<typeof getDaemonRuntimeIdentity>;
 	},
 	helloCount: 0,
 	lastCoordinatorStatus: undefined as DaemonUpdateRestartStatus | undefined,
@@ -168,6 +175,8 @@ const mockState = vi.hoisted(() => ({
 	shutdownResult: true,
 	shutdownAccepted: true,
 	predecessorAlive: true,
+	admissionActive: false,
+	successorRuntime: undefined as ReturnType<typeof getDaemonRuntimeIdentity> | undefined,
 }));
 
 function useFixedOwnerHello(): void {
@@ -231,15 +240,22 @@ vi.mock("../src/modes/daemon/daemon-socket.js", async (importOriginal) => ({
 }));
 
 vi.mock("../src/modes/daemon/daemon-supervisor-ownership.js", async (original) => ({
-	...await original<typeof import("../src/modes/daemon/daemon-supervisor-ownership.js")>(),
+	...await original<typeof DaemonSupervisorOwnershipTypes>(),
 	acquireDaemonShutdownAdmission: vi.fn(async () => {
 		mockState.calls.push("acquire-daemon-shutdown-admission");
+		mockState.admissionActive = true;
 		return {
+			grantTargetTicket: vi.fn(async () => {
+				expect(mockState.admissionActive).toBe(true); mockState.calls.push("grant-target-ticket"); return "target-ticket";
+			}),
+			assertTargetClaim: vi.fn(async () => {
+				expect(mockState.admissionActive).toBe(true); mockState.calls.push("validate-target-claim");
+			}),
 			assertOrRenew: vi.fn(async () => {
 				mockState.calls.push("renew-daemon-shutdown-admission");
 			}),
 			release: vi.fn(async () => {
-				mockState.calls.push("release-daemon-shutdown-admission");
+				mockState.calls.push("release-daemon-shutdown-admission"); mockState.admissionActive = false;
 			}),
 		};
 	}),
@@ -252,17 +268,18 @@ vi.mock("../src/modes/daemon/daemon-supervisor-ownership.js", async (original) =
 }));
 
 vi.mock("../src/core/session-lease.js", async (original) => ({
-	...await original<typeof import("../src/core/session-lease.js")>(),
+	...await original<typeof SessionLeaseTypes>(),
 	getProcessStartId: (pid: number) => pid === mockState.hello.supervisorPid ? "process-start" : "replacement-start",
 }));
 vi.mock("../src/utils/child-process.js", async (original) => ({
-	...await original<typeof import("../src/utils/child-process.js")>(),
+	...await original<typeof ChildProcessTypes>(),
 	isProcessAlive: vi.fn((pid: number) => pid !== 1001 || mockState.predecessorAlive),
 }));
 
 vi.mock("../src/cli/daemon-launch.js", () => ({
 	canConnectToDaemon: vi.fn(async () => mockState.daemonProbe.reachable),
-	ensureInteractiveDaemonRunning: vi.fn(async () => {
+	ensureInteractiveDaemonRunning: vi.fn(async (_socket: string, _cwd: unknown, replacement: { admissionTicket: string }) => {
+		expect(mockState.admissionActive).toBe(true); expect(replacement.admissionTicket).toBe("target-ticket");
 		mockState.calls.push("ensure-daemon");
 	}),
 	isDaemonSessionSummary: (value: unknown) => {
@@ -321,6 +338,7 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 			supervisorPid?: number;
 			supervisorProcessStartId?: string;
 			supervisorSocketPath?: string;
+			runtime?: ReturnType<typeof getDaemonRuntimeIdentity>;
 		}> {
 			if (mockState.helloWaitFailures > 0) {
 				mockState.helloWaitFailures--;
@@ -337,6 +355,7 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 							protocol: { version: DAEMON_PROTOCOL_VERSION },
 							schemaId: DAEMON_SCHEMA_ID,
 							appVersion: VERSION,
+							runtime: mockState.successorRuntime ?? getDaemonRuntimeIdentity(),
 							supervisorPid: 1002,
 							supervisorGeneration: "replacement-generation",
 							supervisorOwnerToken: "replacement-owner-token",
@@ -485,6 +504,16 @@ describe("self-update daemon restart", () => {
 		};
 	}
 
+	function writeBoundStatus(manifest: MockUpdateRestartManifest, failures: DaemonUpdateRestartFailure[], name = "previous-status.json") {
+		mkdirSync(join(agentDir, "update-restarts"), { recursive: true });
+		const writer = new DaemonUpdateRestartStatusWriter(join(agentDir, "update-restarts", name), "prior-run", mockState.socketPath);
+		writer.update({ phase: "complete", manifestCreatedAt: manifest.createdAt,
+			successor: { pid: mockState.hello.supervisorPid!, processStartId: mockState.hello.supervisorProcessStartId,
+				supervisorGeneration: mockState.hello.supervisorGeneration, supervisorOwnerToken: mockState.hello.supervisorOwnerToken },
+			counts: { total: manifest.sessions.length, restored: manifest.sessions.length - failures.length, resumed: 0, failed: failures.length }, failures });
+		return writer;
+	}
+
 	beforeEach(() => {
 		vi.spyOn(process, "kill").mockImplementation((_pid, signal) => {
 			if (signal === 0) return true;
@@ -525,6 +554,8 @@ describe("self-update daemon restart", () => {
 		mockState.shutdownResult = true;
 		mockState.shutdownAccepted = true;
 		mockState.predecessorAlive = true;
+		mockState.admissionActive = false;
+		mockState.successorRuntime = undefined;
 		mkdirSync(agentDir, { recursive: true });
 		mkdirSync(join(agentDir, "daemon-update-restarts"), { recursive: true });
 		mkdirSync(projectDir, { recursive: true });
@@ -773,7 +804,7 @@ describe("self-update daemon restart", () => {
 			await expect(loser).resolves.toMatchObject({
 				phase: "complete",
 				counts: { total: 1, restored: 1, resumed: 0, failed: 0 },
-				message: "active coordinator completed",
+				message: expect.stringContaining("active coordinator completed"),
 			});
 			expect(mockState.calls).not.toContain("probe-daemon");
 		} finally {
@@ -986,7 +1017,9 @@ describe("self-update daemon restart", () => {
 			expect(shutdownIndex).toBeGreaterThan(fenceIndex);
 			expect(startupFenceIndex).toBeGreaterThan(shutdownIndex);
 			expect(releaseAdmissionIndex).toBeGreaterThan(startupFenceIndex);
-			expect(ensureIndex).toBeGreaterThan(releaseAdmissionIndex);
+			expect(ensureIndex).toBeLessThan(releaseAdmissionIndex);
+			expect(mockState.calls.indexOf("grant-target-ticket")).toBeLessThan(ensureIndex);
+			expect(mockState.calls.indexOf("validate-target-claim")).toBeLessThan(releaseAdmissionIndex);
 			expect(ensureIndex).toBeGreaterThan(shutdownIndex);
 			expect(statSync(join(agentDir, "update-restarts", "test-status.json")).mode & 0o777).toBe(0o600);
 		} finally {
@@ -1246,7 +1279,7 @@ describe("self-update daemon restart", () => {
 				failed: 1,
 			});
 			expect(mockState.lastCoordinatorStatus?.failures).toEqual([
-				{ sessionFile: failedSessionFile, message: "create failed" },
+				{ sessionFile: failedSessionFile, message: "create failed", kind: "create_failed" },
 			]);
 		} finally {
 			errorSpy.mockRestore();
@@ -1567,6 +1600,202 @@ describe("self-update daemon restart", () => {
 		await performUpdateAndRunCoordinator();
 		expect(mockState.lastCoordinatorStatus?.counts.failed).toBe(1);
 		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+	});
+
+	it("skips an already-active exact target without preparing another cutover", async () => {
+		useFixedOwnerHello(); mockState.hello.runtime = getDaemonRuntimeIdentity();
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "skipped" });
+		expect(mockState.calls).not.toContain("daemon-request:prepare_update_restart");
+		expect(mockState.calls).not.toContain("shutdown-daemon");
+		expect(mockState.calls).not.toContain("ensure-daemon");
+	});
+
+	it("continues only missing sessions and keeps the remapped parent on an idempotent retry", async () => {
+		useFixedOwnerHello(); mockState.hello.runtime = getDaemonRuntimeIdentity();
+		const template = createAcceptedRecoveryManifest().sessions[0]!;
+		const sessions = ["parent", "other", "child"].map((name) => ({ ...template, activeSessionId: `old-${name}`,
+			sessionId: name, sessionFile: join(projectDir, `${name}.jsonl`), shouldResume: false,
+			queue: { actions: { formatVersion: 1 as const, actions: [] }, nextTurn: [] } }));
+		sessions[2]!.runtimeMetadata = { kind: "subagent", createdAt: 1, parentActiveSessionId: "old-parent", parentSessionId: "parent", parentSessionFile: sessions[0]!.sessionFile, rlmChildId: "child" };
+		mockState.prepareManifest = { formatVersion: 1, createdAt: new Date().toISOString(), sessions };
+		writeFileSync(mockState.preparedManifestPath, JSON.stringify(mockState.prepareManifest));
+		writeBoundStatus(mockState.prepareManifest, [{ sessionFile: sessions[2]!.sessionFile, kind: "create_failed", message: "create failed" }], "test-status.json");
+		mockState.listResponse = { success: true, data: { sessions: sessions.slice(0, 1).map((session) => ({ sessionFile: session.sessionFile, activeSessionId: `new-${session.sessionId}`, workerState: "ready" })) } };
+		// The other previously resolved session was closed by the user. It must stay closed.
+		await performUpdateAndRunCoordinator();
+		expect(mockState.calls).not.toContain("daemon-request:prepare_update_restart");
+		const creates = mockState.requestPayloads.filter((request) => request.type === "create");
+		expect(creates).toHaveLength(1);
+		expect(creates[0]).toMatchObject({ sessionPath: sessions[2]!.sessionFile, runtimeMetadata: { parentActiveSessionId: "new-parent" } });
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "complete", counts: { total: 3, restored: 3, failed: 0 } });
+		expect(existsSync(mockState.preparedManifestPath)).toBe(false);
+	});
+
+	it.each(["build", "slot"] as const)("retains the manifest and sends no restore command to a wrong %s successor", async (mismatch) => {
+		const runtime = getDaemonRuntimeIdentity();
+		const foreignEntry = join(tempDir, "foreign-entry.js"); writeFileSync(foreignEntry, "// foreign slot");
+		mockState.successorRuntime = mismatch === "build" ? { ...runtime, buildId: "foreign-build" } : { ...runtime, entrypointPath: foreignEntry };
+		mockState.prepareManifest = createAcceptedRecoveryManifest();
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "failed", message: expect.stringContaining("expected build") });
+		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+	});
+
+	it("permits a deliberate same-target restart only with explicit intent", async () => {
+		useFixedOwnerHello(); mockState.hello.runtime = getDaemonRuntimeIdentity();
+		const previous = process.env.PRIME_AGENT_UPDATE_RESTART_ALLOW_SAME_BUILD;
+		process.env.PRIME_AGENT_UPDATE_RESTART_ALLOW_SAME_BUILD = "1";
+		try {
+			await performUpdateAndRunCoordinator();
+			expect(mockState.calls).toContain("daemon-request:prepare_update_restart");
+			expect(mockState.calls).toContain("ensure-daemon");
+		} finally {
+			if (previous === undefined) delete process.env.PRIME_AGENT_UPDATE_RESTART_ALLOW_SAME_BUILD;
+			else process.env.PRIME_AGENT_UPDATE_RESTART_ALLOW_SAME_BUILD = previous;
+		}
+	});
+
+	it.each([true, false])("recognizes a prior held worker only when its manifest binding matches (%s)", async (matches) => {
+		useFixedOwnerHello(); mockState.hello.runtime = getDaemonRuntimeIdentity();
+		mockState.daemonProbe = { reachable: false };
+		mockState.prepareManifest = createAcceptedRecoveryManifest();
+		writeFileSync(mockState.preparedManifestPath, JSON.stringify(mockState.prepareManifest));
+		const directory = defaultWorkerDescriptorDir(agentDir, mockState.socketPath); mkdirSync(directory, { recursive: true });
+		const rootId = mockState.prepareManifest.sessions[0]!.activeSessionId;
+		writeFileSync(join(directory, "held.json"), JSON.stringify({ version: 2, workerId: "held", pid: 1337,
+			processStartId: "replacement-start", supervisorSocketPath: mockState.socketPath, socketPath: join(tempDir, "worker.sock"),
+			authenticationToken: "private", rootActiveSessionId: rootId, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+			consecutiveFailures: 0, lifecycle: "recovering", createCommand: { type: "create" },
+			updateRestartRecoveryHold: { reason: "update_restart_recovery_uncertain", pid: 1337, processStartId: "replacement-start",
+				rootActiveSessionId: rootId, activeSessionIds: [rootId], createdAt: new Date().toISOString(),
+				manifestCreatedAt: matches ? mockState.prepareManifest.createdAt : "2000-01-01T00:00:00.000Z" } }));
+		await performUpdateAndRunCoordinator();
+		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+		if (matches) expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "complete", counts: { failed: 1 } });
+		else {
+			expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "failed", message: expect.stringContaining("no successful PREPARE inventory") });
+			expect(mockState.calls).not.toContain("ensure-daemon");
+		}
+	});
+
+	it("refuses an unbound already-active continuation and keeps its checkpoint", async () => {
+		useFixedOwnerHello(); mockState.hello.runtime = getDaemonRuntimeIdentity();
+		mockState.prepareManifest = createAcceptedRecoveryManifest();
+		writeFileSync(mockState.preparedManifestPath, JSON.stringify(mockState.prepareManifest));
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "failed", message: expect.stringContaining("not bound") });
+		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+	});
+
+	it("does not automatically replay a degraded checkpoint even after its session was closed", async () => {
+		useFixedOwnerHello(); mockState.hello.runtime = getDaemonRuntimeIdentity();
+		mockState.prepareManifest = createAcceptedRecoveryManifest();
+		writeFileSync(mockState.preparedManifestPath, JSON.stringify(mockState.prepareManifest));
+		writeBoundStatus(mockState.prepareManifest, [{ sessionFile: mockState.prepareManifest.sessions[0]!.sessionFile, kind: "degraded", message: "action restore failed after activation" }]);
+		mockState.listResponse = { success: true, data: { sessions: [] } };
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "complete", counts: { failed: 1 }, failures: [{ kind: "degraded" }] });
+		expect(mockState.requestPayloads.some((request) => request.type === "create" || request.type === "prompt" || request.type === "resume_queue")).toBe(false);
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+	});
+
+	it("leaves every resolved-then-closed session closed on a bound retry", async () => {
+		useFixedOwnerHello(); mockState.hello.runtime = getDaemonRuntimeIdentity();
+		mockState.prepareManifest = createAcceptedRecoveryManifest();
+		writeFileSync(mockState.preparedManifestPath, JSON.stringify(mockState.prepareManifest));
+		writeBoundStatus(mockState.prepareManifest, [], "test-status.json");
+		mockState.listResponse = { success: true, data: { sessions: [] } };
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "complete", counts: { restored: 1, failed: 0 } });
+		expect(mockState.requestPayloads.some((request) => request.type === "create" || request.type === "prompt")).toBe(false);
+		expect(existsSync(mockState.preparedManifestPath)).toBe(false);
+	});
+
+	it("records a strict target-claim failure as never-started restores for an immediate bound retry", async () => {
+		mockState.prepareManifest = createAcceptedRecoveryManifest();
+		const acquire = vi.mocked(acquireDaemonShutdownAdmission);
+		acquire.mockImplementationOnce(async () => ({
+			assertOrRenew: async () => {}, release: async () => {}, grantTargetTicket: async () => "target-ticket",
+			assertTargetClaim: async () => { throw new Error("Replacement daemon did not claim the target admission ticket"); },
+		} as unknown as Awaited<ReturnType<typeof acquireDaemonShutdownAdmission>>));
+		mockState.admissionActive = true;
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "failed", counts: { restored: 0, failed: 1 },
+			failures: [{ kind: "create_failed", message: "Restore was not started" }] });
+		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+	});
+
+	it.each(["idle", "predecessor-dead", "no-daemon"] as const)("suppresses resolved checkpoints through the %s pending reuse route", async (route) => {
+		useFixedOwnerHello();
+		const template = createAcceptedRecoveryManifest().sessions[0]!;
+		const sessions = ["resolved", "failed"].map((name) => ({ ...template, activeSessionId: `old-${name}`, sessionId: name, sessionFile: join(projectDir, `${name}.jsonl`) }));
+		mockState.prepareManifest = { formatVersion: 1, createdAt: new Date().toISOString(), sessions };
+		writeFileSync(mockState.preparedManifestPath, JSON.stringify(mockState.prepareManifest));
+		writeBoundStatus(mockState.prepareManifest, [{ sessionFile: sessions[1]!.sessionFile, kind: "create_failed", message: "create failed" }]);
+		mockState.hello.runtime = { ...getDaemonRuntimeIdentity(), buildId: "previous-build" };
+		mockState.listResponse = { success: true, data: { sessions: [], busyClientOwnedSessionCount: 0 } };
+		if (route === "predecessor-dead") {
+			mockState.listResponse = { success: true, data: { sessions: [{ id: "preparing" }], busyClientOwnedSessionCount: 0 } };
+			mockState.requestThrowTypes = ["prepare_update_restart"]; mockState.predecessorAlive = false;
+			mockState.daemonProbeAfterShutdown = { reachable: false };
+		}
+		if (route === "no-daemon") {
+			mockState.daemonProbe = { reachable: false };
+			mockState.hello = { ...mockState.hello, supervisorPid: 2001, supervisorGeneration: "new-owner", supervisorOwnerToken: "new-token", runtime: getDaemonRuntimeIdentity() };
+		}
+		mockState.createActiveSessionIds = ["restored-failed"];
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "complete", counts: { total: 2, restored: 2, failed: 0 } });
+		expect(mockState.requestPayloads.filter((request) => request.type === "create").map((request) => request.sessionPath)).toEqual([sessions[1]!.sessionFile]);
+		expect(mockState.requestPayloads.filter((request) => request.type === "prompt" || request.type === "resume_queue").every((request) => request.activeSessionId === "restored-failed")).toBe(true);
+		if (route !== "predecessor-dead") expect(mockState.calls).not.toContain("daemon-request:prepare_update_restart");
+	});
+
+	it.each(["idle", "predecessor-dead", "no-daemon"] as const)("refuses incomplete restoration history through the %s pending reuse route", async (route) => {
+		useFixedOwnerHello();
+		const template = createAcceptedRecoveryManifest().sessions[0]!;
+		const sessions = ["resolved", "uncertain"].map((name) => ({ ...template, activeSessionId: name, sessionId: name, sessionFile: join(projectDir, `${name}.jsonl`) }));
+		mockState.prepareManifest = { formatVersion: 1, createdAt: new Date().toISOString(), sessions };
+		writeFileSync(mockState.preparedManifestPath, JSON.stringify(mockState.prepareManifest));
+		const prior = writeBoundStatus(mockState.prepareManifest, []);
+		prior.update({ phase: "restoring", counts: { total: 2, restored: 1, resumed: 0, failed: 0 } });
+		mockState.hello.runtime = { ...getDaemonRuntimeIdentity(), buildId: "previous-build" };
+		mockState.listResponse = { success: true, data: { sessions: [], busyClientOwnedSessionCount: 0 } };
+		if (route === "predecessor-dead") {
+			mockState.listResponse = { success: true, data: { sessions: [{ id: "preparing" }], busyClientOwnedSessionCount: 0 } };
+			mockState.requestThrowTypes = ["prepare_update_restart"]; mockState.predecessorAlive = false;
+		}
+		if (route === "no-daemon") mockState.daemonProbe = { reachable: false };
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "failed", message: expect.stringContaining("incomplete per-session") });
+		expect(mockState.calls).not.toContain("ensure-daemon");
+		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+	});
+
+	it("does not reclassify resolved checkpoints after a claim failure on a pending retry", async () => {
+		useFixedOwnerHello();
+		const template = createAcceptedRecoveryManifest().sessions[0]!;
+		const sessions = ["resolved", "failed"].map((name) => ({ ...template, activeSessionId: name, sessionId: name, sessionFile: join(projectDir, `${name}.jsonl`) }));
+		mockState.prepareManifest = { formatVersion: 1, createdAt: new Date().toISOString(), sessions };
+		writeFileSync(mockState.preparedManifestPath, JSON.stringify(mockState.prepareManifest));
+		writeBoundStatus(mockState.prepareManifest, [{ sessionFile: sessions[1]!.sessionFile, kind: "create_failed", message: "create failed" }]);
+		mockState.hello.runtime = { ...getDaemonRuntimeIdentity(), buildId: "previous-build" };
+		mockState.listResponse = { success: true, data: { sessions: [], busyClientOwnedSessionCount: 0 } };
+		vi.mocked(acquireDaemonShutdownAdmission).mockImplementationOnce(async () => ({
+			assertOrRenew: async () => {}, release: async () => {}, grantTargetTicket: async () => "target-ticket",
+			assertTargetClaim: async () => { throw new Error("target claim missing"); },
+		} as unknown as Awaited<ReturnType<typeof acquireDaemonShutdownAdmission>>));
+		mockState.admissionActive = true;
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "failed", counts: { total: 2, restored: 1, failed: 1 },
+			failures: [{ sessionFile: sessions[1]!.sessionFile, kind: "create_failed" }] });
+		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
 	});
 
 });
