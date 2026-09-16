@@ -137,9 +137,20 @@ Bootstrap: the first install still retires the unfixed `39ae91e6` daemon. Its al
 old clients can still go terminal on that cutover. Do not promise first-install seamlessness.
 A pre-updated client can resist the conflicting notice, but running old JavaScript cannot
 hot-load that client protection. Later cutovers gain the fixed predecessor notice.
-Local cleanup of streaming indicators during the reconnect gap is a separate client change;
-this core fix resumes from the restored snapshot and does not promise that gap has no stale
-indicator. Kernel RAM and mid-turn external effects remain best-effort, not zero-loss guarantees.
+Updated clients clear stale local working, compaction, refinement, retry and goal indicators
+when reconnect begins. They preserve drafts and queue edits, then restore local presentation
+from the existing resync and connected paths. After the gap, subagent counts use child
+snapshots until a roster callback after reconnection supplies fresh data. Missing child
+metadata can hide the count tile; it does not mark a child as stopped. Fresh events on a
+surviving direct link still reach the view.
+
+Reconnect aborts manual trace upload requests and prevents late progress, results or editor
+clears from changing the resumed view. The existing trace transport can detach its abort
+listener after response headers, so cancellation of an already-returned response body is
+not guaranteed; late body results are still ignored locally. Automatic uploads and the
+existing Ctrl+C policy are unchanged. Missing pre-gap retry countdown and refinement-progress details
+are not reconstructed from snapshots. Kernel RAM and mid-turn external effects remain
+best-effort, not zero-loss guarantees.
 
 Never signal or kill a TUI/client to release the daemon. The daemons close their own accepted socket ends.
 A stopped client is not a dead process. Zombies count as exited; stopped and unobservable processes do not.

@@ -580,6 +580,7 @@ const TRACES_ARGUMENT_COMPLETIONS: AutocompleteItem[] = [
 ];
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
+const TRACE_UPLOAD_RECONNECT_ABORT_REASON = new Error("Trace upload cancelled during daemon reconnect");
 
 // Cap on retained pasted-image bytes (base64). Images are resized below the
 // inline limit before storing, so this holds many recent pastes; the oldest are
@@ -1068,6 +1069,7 @@ export class InteractiveMode {
 	private subagentSummaryLine: SubagentSummaryLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private rlmNodeId: string | undefined;
+	private preferResyncedSubagentSnapshots = false;
 	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
 	private toolOutputExpanded = false;
@@ -1090,6 +1092,8 @@ export class InteractiveMode {
 	private inlineAuthPanelClosers: ((reason?: "reset") => void)[] = [];
 	private configurationModelSelection: Promise<void> | undefined;
 	private connectionState: AgentConnectionState | undefined;
+	private connectionReconnecting = false;
+	private connectionUiEpoch = 0;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
 	private heartbeatCatalog: AgentConnectionHeartbeat[] = [];
 	private heartbeatRefreshPromise: Promise<void> | undefined;
@@ -1125,6 +1129,7 @@ export class InteractiveMode {
 	private retryLoader: Loader | undefined = undefined;
 	private retryCountdown: CountdownTimer | undefined = undefined;
 	private traceUploadAllAbortController: AbortController | undefined = undefined;
+	private readonly currentTraceUploadAbortControllers = new Set<AbortController>();
 
 	private readonly queueSelection = new QueueSelection();
 	private isApplyingQueueSelectionText = false;
@@ -3165,6 +3170,7 @@ export class InteractiveMode {
 	}
 
 	private resetCurrentSessionRenderState(options?: { clearPromptStash?: boolean }): void {
+		this.connectionReconnecting = false;
 		this.chatContainer.clear();
 		this.shortcutGuideContainer.clear();
 		this.pendingMessagesContainer.clear();
@@ -3526,6 +3532,7 @@ export class InteractiveMode {
 	}
 
 	private updateWorkingLoaderMessage(): void {
+		if (this.connectionReconnecting) return;
 		this.loadingAnimation?.setMessage(this.getWorkingLoaderMessage());
 	}
 
@@ -3577,6 +3584,10 @@ export class InteractiveMode {
 	}
 
 	private updateWorkingPulse(): void {
+		if (this.connectionReconnecting) {
+			this.stopWorkingPulse();
+			return;
+		}
 		const active =
 			this.isAgentStreaming() ||
 			this.chatContainer.children.some(
@@ -3674,6 +3685,7 @@ export class InteractiveMode {
 	}
 
 	private syncWorkingLoader(): void {
+		if (this.connectionReconnecting) return;
 		// A compaction that started before this client attached (or while another
 		// view was open) has no start-event edge; restore its loader from state.
 		if (!this.autoCompactionLoader && this.isAgentCompacting()) {
@@ -5012,8 +5024,11 @@ export class InteractiveMode {
 					return;
 				}
 				if (commandName === "traces") {
+					const epoch = this.connectionUiEpoch;
+					const editorTextBefore = this.editor.getText();
 					await this.handleTracesCommand(canonicalCommandText);
-					this.editor.setText("");
+					if (epoch === this.connectionUiEpoch && this.editor.getText() === editorTextBefore)
+						this.editor.setText("");
 					return;
 				}
 				if (commandName === "context") {
@@ -5440,6 +5455,7 @@ export class InteractiveMode {
 		if (!this.agentConnection.subscribeAgentRoster) return;
 		try {
 			this.rosterBar = await this.agentConnection.subscribeAgentRoster(() => {
+				if (!this.connectionReconnecting) this.preferResyncedSubagentSnapshots = false;
 				this.updateSubagentSummaryLine();
 				this.ui.requestRender();
 			});
@@ -5505,16 +5521,61 @@ export class InteractiveMode {
 				} else if (event.type === "extension_ui_request") {
 					await this.handleConnectionExtensionUiRequest(event.request);
 				} else if (event.type === "connection_status") {
+					if (event.status === "reconnecting") {
+						this.connectionReconnecting = true;
+						this.connectionUiEpoch++;
+						this.traceUploadAllAbortController?.abort(TRACE_UPLOAD_RECONNECT_ABORT_REASON);
+						for (const controller of this.currentTraceUploadAbortControllers)
+							controller.abort(TRACE_UPLOAD_RECONNECT_ABORT_REASON);
+						this.subagentSummaryLine.setReconnecting(true);
+						this.updateSubagentSummaryLine();
+						this.stopGoalTrayTimer();
+						if (this.settingsManager.getShowTerminalProgress()) this.ui.terminal.setProgress(false);
+						this.stopWorkingLoader();
+						this.stopWorkingPulse();
+						this.autoCompactionLoader?.stop();
+						this.autoCompactionLoader = undefined;
+						this.discardRefineLoader();
+						this.retryCountdown?.dispose();
+						this.retryCountdown = undefined;
+						this.retryLoader?.stop();
+						this.retryLoader = undefined;
+					}
 					this.showStatus(
 						event.status === "connected" ? "Daemon reconnected" : "Daemon connection lost; reconnecting…",
 						event.status === "reconnecting" ? "warning" : "dim",
 					);
 					if (event.status === "connected") {
+						const generation = this.sessionEventGeneration;
+						const epoch = this.connectionUiEpoch;
+						// The adapter emits connected without awaiting its queued resync render.
+						await this.sessionEventQueue;
+						if (
+							generation !== this.sessionEventGeneration ||
+							epoch !== this.connectionUiEpoch ||
+							!this.isInitialized ||
+							this.isShuttingDown ||
+							this.isReturningToAgentsView
+						)
+							return;
+						// A callback during the gap may have been queued by the old roster.
+						if (this.connectionReconnecting) this.preferResyncedSubagentSnapshots = true;
+						this.connectionReconnecting = false;
+						this.subagentSummaryLine.setReconnecting(false);
+						this.updateSubagentSummaryLine();
+						this.syncWorkingLoader();
+						this.updateWorkingPulse();
+						this.updateWorkingLoaderMessage();
+						this.syncGoalTray(this.getGoalState());
+						if (this.settingsManager.getShowTerminalProgress()) {
+							this.ui.terminal.setProgress(this.isAgentStreaming() || this.isAgentCompacting());
+						}
 						await this.refreshHeartbeatCatalog();
 					}
 				} else if (event.type === "heartbeats_changed") {
 					await this.refreshHeartbeatCatalog();
 				} else if (event.type === "closed") {
+					this.connectionUiEpoch++;
 					this.showError(event.error ?? "Agent connection closed");
 				}
 			} catch (error) {
@@ -6180,7 +6241,7 @@ export class InteractiveMode {
 	}
 
 	private updateGoalTrayTimer(goal: GoalState): void {
-		if (goal.status === "active") {
+		if (goal.status === "active" && !this.connectionReconnecting) {
 			if (!this.goalTrayTimer) {
 				this.goalTrayTimer = setInterval(() => {
 					this.subagentSummaryLine.invalidate();
@@ -6336,9 +6397,10 @@ export class InteractiveMode {
 	}
 
 	private updateSubagentSummaryLine(): void {
-		const rosterSummaries = this.rosterBar?.summaries();
-		// A client-owned session has no row on the public roster; only then do the
-		// snapshots carry the bar. A public parent with zero roster children shows zero.
+		const rosterSummaries = this.preferResyncedSubagentSnapshots ? undefined : this.rosterBar?.summaries();
+		// Without a confirmed roster refresh, use the session's child snapshots.
+		// Otherwise a public parent with zero roster children shows zero; a
+		// client-owned session absent from the roster uses the snapshot fallback.
 		const sessionOnRoster =
 			rosterSummaries?.some((row) => row.sessionId === this.connectionState?.sessionId) === true;
 		this.subagentSummaryLine.setSubagentCounts(
@@ -6361,6 +6423,8 @@ export class InteractiveMode {
 	}
 
 	private resetSubagentSummary(): void {
+		this.subagentSummaryLine.setReconnecting(false);
+		this.preferResyncedSubagentSnapshots = false;
 		this.subagentSnapshots.clear();
 		this.rlmNodeId = undefined;
 		this.updateSubagentSummaryLine();
@@ -6504,6 +6568,7 @@ export class InteractiveMode {
 	}
 
 	private getTrayGoalLabel(): string | undefined {
+		if (this.connectionReconnecting) return undefined;
 		const goal = this.getGoalState();
 		switch (goal.status) {
 			case "active":
@@ -9900,15 +9965,27 @@ export class InteractiveMode {
 		}
 	}
 
-	private async uploadCurrentTraceOnce(): Promise<AgentTraceUploadResult> {
-		const state = await this.agentConnection.getState();
-		return uploadAgentTraceFile({
-			sessionFile: state.sessionFile,
-			authStorage: this.modelRegistry.authStorage,
-			settingsManager: this.settingsManager,
-			requireEnabled: false,
-			reloadConfig: false,
-		});
+	private async uploadCurrentTraceOnce(): Promise<AgentTraceUploadResult | undefined> {
+		const controller = new AbortController();
+		this.currentTraceUploadAbortControllers.add(controller);
+		try {
+			const state = await this.agentConnection.getState();
+			if (controller.signal.aborted) return undefined;
+			const result = await uploadAgentTraceFile({
+				sessionFile: state.sessionFile,
+				authStorage: this.modelRegistry.authStorage,
+				settingsManager: this.settingsManager,
+				requireEnabled: false,
+				reloadConfig: false,
+				signal: controller.signal,
+			});
+			return controller.signal.aborted ? undefined : result;
+		} catch (error) {
+			if (controller.signal.aborted) return undefined;
+			throw error;
+		} finally {
+			this.currentTraceUploadAbortControllers.delete(controller);
+		}
 	}
 
 	private async previewCurrentTrace(): Promise<void> {
@@ -9969,6 +10046,7 @@ export class InteractiveMode {
 	}
 
 	private async uploadAllTraces(sessionDir?: string, signal?: AbortSignal): Promise<AgentTraceUploadAllResult> {
+		const epoch = this.connectionUiEpoch;
 		return uploadAllAgentTraces({
 			authStorage: this.modelRegistry.authStorage,
 			settingsManager: this.settingsManager,
@@ -9977,6 +10055,7 @@ export class InteractiveMode {
 			reloadConfig: false,
 			signal,
 			onProgress: ({ completed, total }) => {
+				if (signal?.aborted || epoch !== this.connectionUiEpoch) return;
 				if (total > 0 && (completed === 0 || completed === total || completed % 10 === 0)) {
 					this.showStatus(
 						`Uploading traces: ${completed.toLocaleString()}/${total.toLocaleString()} (${keyText("app.clear")} to cancel)`,
@@ -9987,6 +10066,11 @@ export class InteractiveMode {
 	}
 
 	private async handleTracesCommand(text: string): Promise<void> {
+		const epoch = this.connectionUiEpoch;
+		const ignoreStaleFailure = (error: unknown): undefined => {
+			if (epoch !== this.connectionUiEpoch) return undefined;
+			throw error;
+		};
 		const command =
 			text
 				.replace(/^\/traces\b/, "")
@@ -10034,13 +10118,13 @@ export class InteractiveMode {
 		}
 
 		if (command === "on" || command === "enable") {
-			let credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
+			let credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage).catch(ignoreStaleFailure);
+			if (epoch !== this.connectionUiEpoch) return;
 			if (!credential) {
-				const authResult = await this.createAuthFlows().runPrimeAgentTracesLogin();
-				if (authResult.status !== "success") {
-					return;
-				}
-				credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
+				const authResult = await this.createAuthFlows().runPrimeAgentTracesLogin().catch(ignoreStaleFailure);
+				if (epoch !== this.connectionUiEpoch || authResult?.status !== "success") return;
+				credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage).catch(ignoreStaleFailure);
+				if (epoch !== this.connectionUiEpoch) return;
 			}
 			if (!credential) {
 				this.showError("Trace sharing needs a Prime API key.");
@@ -10048,8 +10132,10 @@ export class InteractiveMode {
 			}
 
 			this.settingsManager.setAgentTracesEnabled(true);
-			await this.settingsManager.flush();
-			const uploadResult = await this.uploadCurrentTraceOnce();
+			await this.settingsManager.flush().catch(ignoreStaleFailure);
+			if (epoch !== this.connectionUiEpoch) return;
+			const uploadResult = await this.uploadCurrentTraceOnce().catch(ignoreStaleFailure);
+			if (!uploadResult || epoch !== this.connectionUiEpoch) return;
 			const uploadMessage =
 				uploadResult.status === "no_session_file" || uploadResult.status === "empty_session"
 					? "Current session will upload after the first assistant response."
@@ -10059,12 +10145,16 @@ export class InteractiveMode {
 		}
 
 		if (command === "upload" || command === "upload-current") {
-			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
+			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage).catch(
+				ignoreStaleFailure,
+			);
+			if (epoch !== this.connectionUiEpoch) return;
 			if (!credential) {
 				this.showError("Trace sharing needs a Prime API key. Run /traces login.");
 				return;
 			}
-			const uploadResult = await this.uploadCurrentTraceOnce();
+			const uploadResult = await this.uploadCurrentTraceOnce().catch(ignoreStaleFailure);
+			if (!uploadResult || epoch !== this.connectionUiEpoch) return;
 			const message = this.formatTraceUploadResult(uploadResult);
 			if (uploadResult.status === "failed") {
 				this.showError(message);
@@ -10075,7 +10165,10 @@ export class InteractiveMode {
 		}
 
 		if (command === "upload-all") {
-			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
+			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage).catch(
+				ignoreStaleFailure,
+			);
+			if (epoch !== this.connectionUiEpoch) return;
 			if (!credential) {
 				this.showError("Trace sharing needs a Prime API key. Run /traces login.");
 				return;
@@ -10084,17 +10177,27 @@ export class InteractiveMode {
 				this.showWarning("A trace upload is already running. Cancel it before starting another.");
 				return;
 			}
-			const state = await this.agentConnection.getState();
 			const abortController = new AbortController();
 			this.traceUploadAllAbortController = abortController;
 			let result: AgentTraceUploadAllResult;
 			try {
+				const state = await this.agentConnection.getState();
+				if (epoch !== this.connectionUiEpoch) return;
+				if (abortController.signal.aborted) {
+					this.showStatus("Trace upload cancelled.");
+					return;
+				}
 				result = await this.uploadAllTraces(state.sessionDir, abortController.signal);
+			} catch (error) {
+				if (epoch !== this.connectionUiEpoch) return;
+				throw error;
 			} finally {
 				if (this.traceUploadAllAbortController === abortController) {
 					this.traceUploadAllAbortController = undefined;
 				}
 			}
+			if (epoch !== this.connectionUiEpoch || abortController.signal.reason === TRACE_UPLOAD_RECONNECT_ABORT_REASON)
+				return;
 			if (abortController.signal.aborted) {
 				this.showStatus("Trace upload cancelled.");
 				return;

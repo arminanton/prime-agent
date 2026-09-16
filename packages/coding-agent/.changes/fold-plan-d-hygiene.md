@@ -1,0 +1,3 @@
+- Fixed stale status indicators during client reconnects while preserving drafts and queue edits.
+- Fixed stale subagent running and inactive counts after reconnection.
+- Fixed late progress, results and editor changes from manual trace uploads interrupted by reconnect.
