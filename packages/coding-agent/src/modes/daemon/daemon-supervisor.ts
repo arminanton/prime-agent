@@ -7566,9 +7566,13 @@ export class DaemonSupervisor {
 			this.clearScheduledWakeTimer();
 			this.clearRosterWatchdogTimer();
 			await this.drainIdleEvictionSweep();
-			if (closingReason) {
+			const terminalStop = this.updateRestartPhase !== "prepared";
+			// PREPARE committed the manifest. Any later stop, including --force,
+			// must keep reconnecting clients on the update path until its deadline.
+			const effectiveClosingReason = terminalStop ? closingReason : "update";
+			if (effectiveClosingReason) {
 				for (const client of this.clients) {
-					try { this.write(client, { type: "daemon_closing", reason: closingReason }); }
+					try { this.write(client, { type: "daemon_closing", reason: effectiveClosingReason }); }
 					catch (error) { this.reportCleanupFailure("daemon closing notice", error); }
 				}
 			}
@@ -7576,7 +7580,6 @@ export class DaemonSupervisor {
 				// Every prepared participant belongs to the saved manifest. Neither
 				// archive nor descriptor removal (including ephemeral cron cancel)
 				// is allowed to turn that preservation stop into terminal deletion.
-				const terminalStop = this.updateRestartPhase !== "prepared";
 				await this.shutdownStage("worker stop", SUPERVISOR_SHUTDOWN_WORKER_STOP_BUDGET_MS, Promise.all(
 					[...this.workers.values()].map(async (worker) => {
 						try { await this.stopWorker(worker, terminalStop, forceWorkers, terminalStop); }

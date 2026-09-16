@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 
 interface SupervisorHandle {
-	shutdown(exitCode: number, stopWorkers: boolean, relaunch?: boolean, forceWorkers?: boolean): Promise<never>;
+	shutdown(exitCode: number, stopWorkers: boolean, relaunch?: boolean, forceWorkers?: boolean, closingReason?: "shutdown" | "update"): Promise<never>;
 	installCrashHandlers(): void;
 	signalCleanupHandlers: Array<() => void>;
 	log: ReturnType<typeof vi.fn>;
@@ -37,6 +37,39 @@ function makeSupervisor(): SupervisorHandle {
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe("supervisor shutdown failures", () => {
+
+	it.each([undefined, "draining", "fencing", "prepared"])("labels shutdown from phase %s consistently with preservation", async (phase) => {
+		vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
+		const supervisor = makeSupervisor();
+		const client = {};
+		const write = vi.fn();
+		Object.assign(supervisor, {
+			updateRestartPhase: phase,
+			clients: new Set([client]),
+			write,
+			cleanupSupervisorResources: vi.fn(async () => {}),
+		});
+		await supervisor.shutdown(0, true, false, false, "shutdown");
+		const terminal = phase !== "prepared";
+		expect(write).toHaveBeenCalledWith(client, { type: "daemon_closing", reason: terminal ? "shutdown" : "update" });
+		expect(supervisor.stopWorker).toHaveBeenCalledWith(expect.anything(), terminal, false, terminal);
+	});
+
+	it.each([undefined, "shutdown"] as const)("labels even forced prepared retirement as update (requested reason=%s)", async (reason) => {
+		vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
+		const supervisor = makeSupervisor();
+		const client = {};
+		const write = vi.fn();
+		Object.assign(supervisor, {
+			updateRestartPhase: "prepared",
+			clients: new Set([client]),
+			write,
+			cleanupSupervisorResources: vi.fn(async () => {}),
+		});
+		await supervisor.shutdown(0, true, false, true, reason);
+		expect(write).toHaveBeenCalledWith(client, { type: "daemon_closing", reason: "update" });
+		expect(supervisor.stopWorker).toHaveBeenCalledWith(expect.anything(), false, true, false);
+	});
 	it("bounds the server close callback when a peer never completes FIN", async () => {
 		vi.useFakeTimers();
 		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
