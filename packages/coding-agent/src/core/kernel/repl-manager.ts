@@ -1637,7 +1637,12 @@ export class ReplKernelManager {
 				}),
 			]);
 			if (timeout) globalThis.clearTimeout(timeout);
-			if (!queueSettled) return;
+			if (!queueSettled) {
+				const warning = `session ${this.options.sessionId ?? "unknown"}: final kernel snapshot skipped: kernel did not settle`;
+				this.appendKernelDiagnostic(warning);
+				console.warn(warning);
+				return;
+			}
 			await this.captureSnapshot({ executionTimeoutMs: SNAPSHOT_EXECUTION_TIMEOUT_MS });
 		} finally {
 			// Reset: a superseding start() can revive this kernel for new work.

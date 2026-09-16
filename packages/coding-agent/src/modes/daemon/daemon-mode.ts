@@ -117,6 +117,7 @@ import { SettingsManager } from "../../core/settings-manager.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
 import { isProcessAlive, spawnHidden, waitForChildProcess } from "../../utils/child-process.js";
 import { tryAcquireDirLock } from "../../utils/dir-lock.js";
+import { settleWithinBudget } from "../../utils/settle-within-budget.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
 	createAgentConnectionCommands,
@@ -146,6 +147,7 @@ import {
 } from "./agent-roster.js";
 import { createCompactAssistantDelta } from "./compact-session-stream.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
+import { closeDaemonTransport } from "./daemon-transport-close.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
 import {
@@ -412,6 +414,9 @@ const CLIENT_CATCHUP_RETRY_MS = 250;
 const MAX_DEFERRED_SESSION_FRAMES = 256;
 const MAX_DEFERRED_SESSION_BYTES = 8 * 1024 * 1024;
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
+const WORKER_SHUTDOWN_HARD_EXIT_MS = 45_000;
+const WORKER_SHUTDOWN_SESSION_CLOSE_MS = 30_000;
+const WORKER_SHUTDOWN_TRANSPORT_BACKSTOP_MS = 15_000;
 const SUPERVISOR_FENCE_POLL_MS = 250;
 const UPDATE_RESTART_MARKER =
 	"<prime_agent_update_interrupted>\n" +
@@ -528,6 +533,11 @@ export async function runDaemonMode(options: DaemonModeOptions): Promise<never> 
 export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
+	private shutdownPromise?: Promise<never>;
+	private shutdownHardExitTimer?: ReturnType<typeof setTimeout>;
+	private shutdownHardExitAt?: number;
+	private transportClosePromise?: Promise<void>;
+	private transportClosing = false;
 	private readonly updateRestartQueuePauses = new Map<string, { release(): void }>();
 	private readonly sessionInputPauses = new Map<
 		string,
@@ -3780,6 +3790,7 @@ export class AgentDaemon {
 	}
 
 	private handleConnection(socket: Socket): void {
+		if (this.transportClosing) { socket.destroy(); return; }
 		const client: DaemonSocketClient = {
 			id: createActiveSessionId(),
 			socket,
@@ -4267,9 +4278,8 @@ export class AgentDaemon {
 				}
 				case "worker_archive_and_shutdown": {
 					// Close sessions first so direct peers read session_closed "killed", not a daemon shutdown.
-					for (const state of [...this.sessions.values()]) {
-						await this.closeSession(state, "killed");
-					}
+					this.armShutdownHardExit(1);
+					await this.closeSessionsForRetirement([...this.sessions.values()], () => "killed");
 					this.fencePeerTransports();
 					this.writeWorkerSuccess(client, command);
 					setImmediate(() => void this.shutdown(0));
@@ -4315,8 +4325,9 @@ export class AgentDaemon {
 					try {
 						manifest = await this.commitPreparedUpdateRestart(transaction.id);
 					} catch (error) {
-						if (this.updateRestart === transaction) transaction.phase = "prepared";
-						if (transaction.abort.signal.aborted) this.cancelPreparedUpdateRestart(transaction.id);
+						// COMMIT is irrevocable. Keep publishing fenced until bounded
+						// shutdown or the hard backstop retires this worker.
+						setImmediate(() => void this.shutdown(1));
 						throw error;
 					}
 					this.writeWorkerSuccess(client, command, manifest);
@@ -6878,6 +6889,7 @@ export class AgentDaemon {
 		if (transaction?.id !== transactionId || !transaction.manifest) {
 			throw new Error("Daemon has no prepared update checkpoint");
 		}
+		this.armShutdownHardExit(1);
 		const manifest = transaction.manifest;
 		const restartByActiveSessionId = new Map(manifest.sessions.map((session) => [session.activeSessionId, session]));
 		for (const state of this.sessions.values()) {
@@ -6887,12 +6899,9 @@ export class AgentDaemon {
 		const closeStates = [...this.sessions.values()].sort(
 			(left, right) => this.getUpdateRestartSessionDepth(right) - this.getUpdateRestartSessionDepth(left),
 		);
-		for (const state of closeStates) {
-			if (this.sessions.has(state.activeSessionId)) {
-				await this.closeSession(state, restartByActiveSessionId.has(state.activeSessionId) ? "update" : "killed");
-			}
-		}
-		for (const state of [...this.sessions.values()]) await this.closeSession(state, "killed");
+		await this.closeSessionsForRetirement(closeStates,
+			(state) => restartByActiveSessionId.has(state.activeSessionId) ? "update" : "killed");
+		this.armShutdownHardExit(1, WORKER_SHUTDOWN_TRANSPORT_BACKSTOP_MS);
 		return manifest;
 	}
 
@@ -6932,10 +6941,8 @@ export class AgentDaemon {
 			this.writeUpdateRestartManifest(manifest);
 			return await this.commitPreparedUpdateRestart(transaction.id);
 		} catch (error) {
-			if (this.updateRestart === transaction && transaction.phase === "publishing") {
-				transaction.phase = "prepared";
-			}
-			this.cancelPreparedUpdateRestart(transaction.id);
+			if (transaction.phase === "publishing") setImmediate(() => void this.shutdown(1));
+			else this.cancelPreparedUpdateRestart(transaction.id);
 			throw error;
 		}
 	}
@@ -7142,7 +7149,7 @@ export class AgentDaemon {
 		} else if (reason === "shutdown" || reason === "replaced") {
 			await state.runtime.session.abort().catch(() => undefined);
 		}
-		this.recordWorkerRecoveryState(state, `closed:${reason}`, false);
+		this.recordWorkerRecoveryState(state, `closing:${reason}`, true);
 		state.unsubscribe?.();
 		let disposeError: unknown;
 		try {
@@ -7150,6 +7157,7 @@ export class AgentDaemon {
 		} catch (error) {
 			disposeError = error;
 		}
+		if (!disposeError) this.recordWorkerRecoveryState(state, `closed:${reason}`, false);
 		for (const client of state.clients) {
 			abortClientSnapshotStreaming(client, state.activeSessionId);
 		}
@@ -7981,6 +7989,10 @@ export class AgentDaemon {
 		}
 		for (const signal of signals) {
 			const handler = () => {
+				const exitCode = signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143;
+				if (this.shuttingDown || this.updateRestart?.phase === "publishing") {
+					return this.emergencyExit(exitCode, `received ${signal} during retirement`);
+				}
 				this.log(`received ${signal}; shutting down`);
 				killTrackedDetachedChildren();
 				void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143);
@@ -7997,56 +8009,105 @@ export class AgentDaemon {
 		return this.updateRestart?.phase === "publishing" ? "update" : "shutdown";
 	}
 
-	private async shutdown(exitCode: number): Promise<never> {
-		if (this.shuttingDown) {
-			process.exit(exitCode);
+	private armShutdownHardExit(exitCode: number, budgetMs = WORKER_SHUTDOWN_HARD_EXIT_MS): void {
+		const deadline = performance.now() + budgetMs;
+		if (this.shutdownHardExitAt !== undefined && this.shutdownHardExitAt <= deadline) return;
+		clearTimeout(this.shutdownHardExitTimer);
+		this.shutdownHardExitAt = deadline;
+		this.shutdownHardExitTimer = setTimeout(() => this.emergencyExit(exitCode, "hard-exit timer"), budgetMs);
+		this.shutdownHardExitTimer.unref();
+	}
+
+	private emergencyExit(exitCode: number, why: string): never {
+		try { this.log(`worker shutdown hard exit: ${why}`); } catch { /* Exit must not depend on logging. */ }
+		try { this.cleanupSocketPath(); } catch { /* Best effort, identity checked by cleanupSocketPath. */ }
+		clearTimeout(this.shutdownHardExitTimer);
+		this.shutdownHardExitTimer = undefined;
+		return process.exit(exitCode);
+	}
+
+	private async closeSessionsForRetirement(
+		states: ActiveSessionState[], reasonFor: (state: ActiveSessionState) => DaemonSessionClosedReason,
+	): Promise<void> {
+		const pending = new Set(states);
+		const failed = new Set<ActiveSessionState>();
+		// closeSession owns runtime disposal and releases its lease only after
+		// that disposal actually settles. The deadline here must not release it.
+		const result = await settleWithinBudget("worker session disposal", WORKER_SHUTDOWN_SESSION_CLOSE_MS, Promise.all(
+			states.map(async (state) => {
+				try { await this.closeSession(state, reasonFor(state)); }
+				catch (error) {
+					failed.add(state);
+					this.log(`session ${state.activeSessionId} disposal failed: ${String(error)}`);
+				} finally { pending.delete(state); }
+			}),
+		));
+		for (const state of new Set([...pending, ...failed])) {
+			this.recordWorkerRecoveryState(state, "update_restart_recovery_uncertain", true);
+			this.log(`session ${state.activeSessionId} recovery-uncertain: disposal did not settle cleanly; lease/evidence retained until retirement`);
 		}
+		this.log(`worker shutdown stage session disposal: ${result.ok ? "ok" : result.timedOut ? "TIMED OUT" : "failed"} after ${Math.round(result.elapsedMs)} ms`);
+	}
+
+	private closeTransportBounded(): Promise<void> {
+		if (this.transportClosePromise) return this.transportClosePromise;
+		this.transportClosing = true;
+		const server = this.server;
+		this.server = undefined;
+		let finish!: () => void;
+		this.transportClosePromise = new Promise<void>((resolveClose) => { finish = resolveClose; });
+		void closeDaemonTransport(server, [...this.clients], (label, error) => this.log(`${label}: ${String(error)}`))
+			.then((result) => this.log(`worker shutdown stage server close: ${result.ok ? "ok" : result.timedOut ? "TIMED OUT" : "failed"} after ${Math.round(result.elapsedMs)} ms`))
+			.catch((error) => { try { this.log(`worker transport close failed: ${String(error)}`); } catch { /* Exit still owns cleanup. */ } })
+			.finally(finish);
+		return this.transportClosePromise;
+	}
+
+	private shutdown(exitCode: number): Promise<never> {
+		if (this.shutdownPromise) return this.shutdownPromise;
 		this.shuttingDown = true;
-		this.peerAdmissionsFenced = true;
-		this.peerGrants.clear();
-		this.supervisorLinkInstance?.close();
-		if (this.supervisorMonitorTimer) {
+		this.armShutdownHardExit(exitCode);
+		this.shutdownPromise = Promise.resolve().then(() => this.shutdownOnce(exitCode)).catch((error) => {
+			try { this.log(`worker shutdown failed: ${String(error)}`); } catch { /* Always exit. */ }
+			return this.emergencyExit(exitCode, "shutdown threw");
+		});
+		return this.shutdownPromise;
+	}
+
+	private async shutdownOnce(exitCode: number): Promise<never> {
+		try {
+			this.peerAdmissionsFenced = true;
+			this.peerGrants.clear();
+			this.supervisorLinkInstance?.close();
 			clearTimeout(this.supervisorMonitorTimer);
 			this.supervisorMonitorTimer = undefined;
-		}
-		if (this.supervisorFenceTimer) {
 			clearTimeout(this.supervisorFenceTimer);
 			this.supervisorFenceTimer = undefined;
-		}
-		if (this.rosterHeartbeatTimer) {
 			clearInterval(this.rosterHeartbeatTimer);
 			this.rosterHeartbeatTimer = undefined;
-		}
-		this.stopWorkerMemoryGuard();
-		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
-		const closingReason = this.getShutdownClosingReason();
-		for (const client of this.clients) {
-			abortClientSnapshotStreaming(client);
-			this.write(client, { type: "daemon_closing", reason: closingReason });
-		}
-
-		this.summarizer.stop();
-		for (const cleanup of this.signalCleanupHandlers) {
-			cleanup();
-		}
-		this.cronScheduler.stop();
-		for (const state of [...this.sessions.values()]) {
-			await this.closeSession(state, closingReason);
-		}
-		for (const client of this.clients) {
-			client.detachInput();
-			client.socket.end();
-		}
-		await new Promise<void>((resolveClose) => {
-			if (!this.server) {
-				resolveClose();
-				return;
+			this.stopWorkerMemoryGuard();
+			this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
+			const closingReason = this.getShutdownClosingReason();
+			for (const client of this.clients) {
+				abortClientSnapshotStreaming(client);
+				this.write(client, { type: "daemon_closing", reason: closingReason });
 			}
-			this.server.close(() => resolveClose());
-		});
-		this.cleanupSocketPath();
-		process.exit(exitCode);
+			this.summarizer.stop();
+			this.cronScheduler.stop();
+			await this.closeSessionsForRetirement([...this.sessions.values()], () => closingReason);
+		} finally {
+			this.armShutdownHardExit(exitCode, WORKER_SHUTDOWN_TRANSPORT_BACKSTOP_MS);
+			await this.closeTransportBounded();
+			this.cleanupSocketPath();
+		}
+		// Keep the explicit second-signal handler during every await. Kernel
+		// modules also have SIGTERM handlers, so default disposition is not enough.
+		for (const cleanup of this.signalCleanupHandlers.splice(0)) cleanup();
+		clearTimeout(this.shutdownHardExitTimer);
+		this.shutdownHardExitTimer = undefined;
+		return process.exit(exitCode);
 	}
+
 }
 
 interface WorkerRosterReporterState {

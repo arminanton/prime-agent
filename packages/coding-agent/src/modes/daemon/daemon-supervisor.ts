@@ -161,6 +161,9 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
+import {
+	type DaemonWorkerRecoveryHold, readDaemonWorkerRecoveryHold, withDaemonWorkerRecoveryHold, workerRecoveryHoldMessage,
+} from "./daemon-worker-recovery-hold.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
 	createRlmLedgerRegistrySeedSource,
@@ -390,6 +393,8 @@ interface ResidentWorker {
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
 	updateRestartPrepareClient?: DaemonWorkerClient;
+	/** Kept outside the wire descriptor; persisted only by the descriptor-file writer. */
+	updateRestartRecoveryHold?: DaemonWorkerRecoveryHold;
 	lastFrameAt?: number;
 	rosterStale?: boolean;
 	/** worker_auth advertised peer-transport support; absent on workers from older builds. */
@@ -1390,8 +1395,10 @@ export class DaemonSupervisor {
 				descriptor.lifecycle = "recovering";
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
+				const recoveryHold = readDaemonWorkerRecoveryHold(descriptor);
 				const durableDescriptor = durableDaemonWorkerDescriptor(descriptor);
 				const worker: ResidentWorker = {
+					updateRestartRecoveryHold: recoveryHold,
 					descriptor: durableDescriptor,
 					descriptorPath: path,
 					summaries: new Map(),
@@ -1474,7 +1481,7 @@ export class DaemonSupervisor {
 
 	private persistWorker(worker: ResidentWorker): void {
 		worker.descriptor.updatedAt = new Date().toISOString();
-		const persisted = durableDaemonWorkerDescriptor(worker.descriptor);
+		const persisted = withDaemonWorkerRecoveryHold(durableDaemonWorkerDescriptor(worker.descriptor), worker.updateRestartRecoveryHold);
 		writeFileAtomicSync(worker.descriptorPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
 	}
 
@@ -3136,11 +3143,12 @@ export class DaemonSupervisor {
 	 * caller launch a fresh worker for the saved session.
 	 */
 	private async reclaimStaleWorkerRegistration(worker: ResidentWorker, freshCreate = false): Promise<boolean> {
+		if (this.isUpdateRestartRecoveryHeld(worker)) return false;
 		if (worker.client !== undefined || worker.recovery !== undefined) {
 			return false;
 		}
 		if (worker.descriptor.stopRequestedAt === undefined) {
-			if (worker.descriptor.lifecycle !== "failed" || worker.descriptor.ownerClientId) {
+			if (worker.descriptor.lifecycle !== "failed" || (worker.descriptor.ownerClientId && !worker.updateRestartRecoveryHold)) {
 				return false;
 			}
 			const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
@@ -3573,6 +3581,7 @@ export class DaemonSupervisor {
 
 	private async adoptOrRecoverWorker(worker: ResidentWorker): Promise<void> {
 		await this.assertRecoveryAllowed();
+		if (this.isUpdateRestartRecoveryHeld(worker)) return;
 		if (worker.descriptor.stopRequestedAt) {
 			try {
 				// A descriptor persisted before identity tracking has no
@@ -3762,7 +3771,30 @@ export class DaemonSupervisor {
 		);
 	}
 
+	private isUpdateRestartRecoveryHeld(worker: ResidentWorker): boolean {
+		const hold = worker.updateRestartRecoveryHold;
+		if (!hold) return false;
+		const identity = this.processIdentity(hold.pid, hold.processStartId);
+		if (identity === "gone" || identity === "replaced") {
+			worker.intentionalStop = worker.descriptor.stopRequestedAt !== undefined;
+			if (worker.descriptor.lifecycle !== "failed") {
+				worker.descriptor.lifecycle = "failed";
+				this.persistWorker(worker);
+			}
+			// Retain the annotation until preservation reclaim finishes. It also
+			// distinguishes a dead client-owned update worker from a live owner.
+			return false;
+		}
+		worker.intentionalStop = true;
+		worker.descriptor.lifecycle = "recovering";
+		worker.descriptor.lastError = workerRecoveryHoldMessage(hold);
+		return true;
+	}
+
 	private async retryWorkerRecovery(worker: ResidentWorker): Promise<void> {
+		if (this.isUpdateRestartRecoveryHeld(worker)) throw new Error(worker.descriptor.lastError);
+		const previousHold = worker.updateRestartRecoveryHold;
+		worker.updateRestartRecoveryHold = undefined;
 		const previousDescriptor = worker.descriptor;
 		const previousIntentionalStop = worker.intentionalStop;
 		const previousDeferredRecoveryRounds = worker.deferredRecoveryRounds;
@@ -3779,6 +3811,7 @@ export class DaemonSupervisor {
 			this.persistWorker(worker);
 		} catch (error) {
 			worker.descriptor = previousDescriptor;
+			worker.updateRestartRecoveryHold = previousHold;
 			worker.intentionalStop = previousIntentionalStop;
 			worker.deferredRecoveryRounds = previousDeferredRecoveryRounds;
 			throw error;
@@ -3787,6 +3820,7 @@ export class DaemonSupervisor {
 	}
 
 	private isWorkerRecoveryCandidate(worker: ResidentWorker): boolean {
+		if (this.isUpdateRestartRecoveryHeld(worker)) return false;
 		return (
 			!this.shuttingDown &&
 			!worker.intentionalStop &&
@@ -4196,6 +4230,7 @@ export class DaemonSupervisor {
 	}
 
 	private isWorkerRecoveryCancelled(worker: ResidentWorker): boolean {
+		if (this.isUpdateRestartRecoveryHeld(worker)) return true;
 		return (
 			this.shuttingDown ||
 			worker.intentionalStop ||
@@ -5246,13 +5281,14 @@ export class DaemonSupervisor {
 	 * identity is a live-but-unreachable worker and is never reclaimed here.
 	 */
 	private isReclaimableDeadDescriptor(worker: ResidentWorker): boolean {
+		if (this.isUpdateRestartRecoveryHeld(worker)) return false;
 		// Only a terminal "failed" descriptor is reclaimed. A starting/recovering/ready
 		// worker is mid-launch or actively managed, so removing it here would race the
 		// recovery machinery; those paths keep their own fail-closed handling.
 		if (worker.descriptor.lifecycle !== "failed") return false;
 		if (worker.client !== undefined) return false;
 		if (worker.recovery !== undefined) return false;
-		if (worker.descriptor.ownerClientId !== undefined) return false;
+		if (worker.descriptor.ownerClientId !== undefined && !worker.updateRestartRecoveryHold) return false;
 		if (this.isWorkerStopping(worker)) return false;
 		if ((this.workerStopCounts?.get(worker) ?? 0) !== 0) return false;
 		const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
@@ -6582,7 +6618,9 @@ export class DaemonSupervisor {
 		// Reclaim confirmed-dead, unowned stale descriptors first so they cannot block the
 		// fenced restart (they otherwise force a cold restart). A live-but-unreachable
 		// worker is left in place and still blocks below (fail-closed).
-		await this.reclaimStaleDeadWorkers();
+		const reclaim = await settleWithinBudget("update restart stale worker reclaim", Math.max(0, deadline - Date.now()),
+			() => this.reclaimStaleDeadWorkers());
+		if (!reclaim.ok) throw reclaim.error;
 		const residents = [...this.workers.values()];
 		const unavailable = residents.find(
 			(worker) =>
@@ -6700,19 +6738,44 @@ export class DaemonSupervisor {
 				if (!response.success) throw new Error(response.error);
 			}),
 		);
-		const commitFailure = commitResults.find(
-			(result): result is PromiseRejectedResult => result.status === "rejected",
-		);
+		const commitFailure = commitResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
+		let stopResults: PromiseSettledResult<void>[];
 		if (commitFailure) {
 			this.log(`Update restart commit response failed; forcing restart completion: ${String(commitFailure.reason)}`);
-			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
-			return manifest;
+			stopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
+		} else {
+			stopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false)));
+			if (stopResults.some((result) => result.status === "rejected")) {
+				this.log("A committed update worker did not stop gracefully; forcing restart completion");
+				stopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
+			}
 		}
-		const stopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false)));
-		if (stopResults.some((result) => result.status === "rejected")) {
-			this.log("A committed update worker did not stop gracefully; forcing restart completion");
-			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
+		for (let index = 0; index < prepared.length; index++) {
+			const worker = prepared[index];
+			if (!worker) continue;
+			const identity = this.processIdentity(worker.descriptor.pid, worker.descriptor.processStartId);
+			if (identity === "gone" || identity === "replaced") continue;
+			const response = responses[index];
+			worker.updateRestartRecoveryHold = {
+				reason: "update_restart_recovery_uncertain",
+				pid: worker.descriptor.pid,
+				processStartId: worker.descriptor.processStartId,
+				rootActiveSessionId: worker.descriptor.rootActiveSessionId,
+				activeSessionIds: [...(response?.sessions.map((session) => session.activeSessionId) ?? []),
+					...(response?.discardedActiveSessionIds ?? [])],
+				manifestCreatedAt: manifest.createdAt,
+				createdAt: new Date().toISOString(),
+			};
+			worker.intentionalStop = true;
+			worker.descriptor.lifecycle = "recovering";
+			worker.descriptor.lastError = workerRecoveryHoldMessage(worker.updateRestartRecoveryHold);
+			try { this.persistWorker(worker); }
+			catch (error) { this.reportCleanupFailure(`worker recovery hold ${worker.descriptor.workerId}`, error); }
+			const result = stopResults[index];
+			this.log(`${worker.descriptor.lastError}${result?.status === "rejected" ? `; ${String(result.reason)}` : ""}`);
 		}
+		// The manifest was published before COMMIT. A surviving worker is a
+		// session-scoped hold, not permission to abort every other session's cutover.
 		return manifest;
 	}
 
