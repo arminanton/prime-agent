@@ -1,10 +1,11 @@
 # DEPLOY A - health-gated cutover runbook
 
-This branch (`fix/deploy-a-freeze-remediation`) is BUILD-ONLY. Nothing here restarts the
-prod daemon, rebuilds the prod venv, or applies host config live. This runbook is the
-human, health-gated cutover to be run by hand LATER. Do it on the prod host
-(/mnt/devvm/custom/prime is the SEPARATE prod worktree; this branch lives in
-/mnt/devvm/custom/prime-next).
+These are historical Deploy A host-health notes, originally written for
+`fix/deploy-a-freeze-remediation`. They do not authorize a live deployment.
+For the current bounded update-restart procedure, use [HOTSWAP-RUNBOOK.md](HOTSWAP-RUNBOOK.md).
+The build worktree is `/mnt/devvm/custom/prime-next`. `/mnt/devvm/custom/prime` is the repository
+anchor/control worktree, not a runtime slot. Discover current blue/green runtime roles from
+deployment pointers. Keep unrelated host-config changes separate from a hot-swap approval.
 
 Root cause recap (verified 2026-09-15): the v0.9.1->v0.9.4 upgrade forced a kernel-venv
 rebuild storm and deploy churn; the hard freeze was host memory/swap exhaustion under the
@@ -47,15 +48,17 @@ Do NOT start unless ALL hold:
 Prebuild the venv the new daemon will use, single-threaded, BEFORE any restart, so the
 cutover never triggers an in-band rebuild storm. A.2 builds a unique generation dir
 `<base>-<hash>-<nonce>` and publishes a `<base>.current` pointer; it never touches any other
-venv family. `--prime-agent-bootstrap` now REQUIRES PRIME_AGENT_KERNEL_VENV and rejects a
-conflicting PRIME_AGENT_KERNEL_PYTHON, so a prebuild only ever touches its named family.
+venv family. Deployment prebuilds MUST set PRIME_AGENT_KERNEL_VENV and
+PRIME_AGENT_KERNEL_VENV_REQUIRED=1. The public flag otherwise warns and can use the default
+family. Do not rely on strict named-family behavior without that opt-in.
 
 ```bash
 cd /path/to/new/checkout/packages/coding-agent
-export PRIME_AGENT_KERNEL_VENV=/home/ndsadmin/.prime/agent/kernel-venv-prod
+export PRIME_AGENT_KERNEL_VENV=/absolute/path/to/the/target-slot-venv-family
+export PRIME_AGENT_KERNEL_VENV_REQUIRED=1
 # This checkout's runtime source (repo-root prime-agent-runtime, or its built dist copy). The
 # path MUST resolve; a missing source fails the bootstrap clean (no kernels).
-export PRIME_AGENT_RUNTIME_SOURCE=/mnt/devvm/custom/prime/prime-agent-runtime
+export PRIME_AGENT_RUNTIME_SOURCE=/absolute/path/to/idle-slot/prime-agent-runtime
 # Deploy-time prebuild via the REAL public flag: prints the runtime identity + resolved venv +
 # python, exits non-zero on failure (a deploy blocker), and only touches the
 # PRIME_AGENT_KERNEL_VENV family. Set PRIME_AGENT_KERNEL_VENV_REQUIRED=1 so the public flag is
@@ -89,22 +92,21 @@ session file:
   --resume /absolute/path/to/sessions/<id>.jsonl --print < /dev/null
 ```
 
-The create reclaims the dead registration before any prompt. Then run your NORMAL update path
-(the public update/restart flow, which internally drains and fences) as a dry run or preflight
-and confirm it no longer reports "failed and disconnected". Do NOT rely on any non-public
-prepare command; A.3's reclaim is what clears these going forward.
+The create reclaims the dead registration before any prompt. Verify its result with a
+read-only session listing. An update/restart is a REAL cutover, not a dry run or preflight.
+Run it only with approval under HOTSWAP-RUNBOOK.md. A.3's reclaim clears confirmed-dead
+registrations going forward; it does not authorize clearing a live recovery hold.
 
 ## 3. Stage host config (review, then apply deliberately)
 
 Files are in deploy/deploy-a/. Review each, then apply under this health gate. Reversible.
 
-- Env PLACEMENT: install the values from deploy/deploy-a/prime-agent-daemon.env into the LOGIN
-  environment of EVERY shell that may launch the daemon (for example ~/.bash_profile, or the
-  launcher wrapper) - they are read by the launching CLI process, NOT by a unit EnvironmentFile.
-  If only some shells set PRIME_AGENT_DAEMON_SCOPE, a shell-driven ensureDaemonRunning spawn is
-  unscoped. Keep PRIME_AGENT_KERNEL_VENV and PRIME_AGENT_RUNTIME_SOURCE identical in every
-  launching shell (or unset everywhere): collectDaemonLaunchEnv forwards the client env over the
-  supervisor env, so a stray value redirects a worker's venv family. Fix the paths for prod. Key
+- Env PLACEMENT: keep non-slot launch policy such as PRIME_AGENT_DAEMON_SCOPE consistent in
+  shells that may launch the daemon. Those values are read by the launching CLI, not automatically
+  from a unit EnvironmentFile. Keep slot-specific PRIME_AGENT_KERNEL_VENV and
+  PRIME_AGENT_RUNTIME_SOURCE OUT of client/login environments. Set them only in the selected
+  coordinator/daemon environment. collectDaemonLaunchEnv forwards client values over the
+  supervisor environment, so a stale client value can redirect a worker's venv family. Key
   values: PRIME_AGENT_DAEMON_SCOPE=1, PRIME_AGENT_MAX_CONCURRENT_KERNEL_BOOTS=2,
   PRIME_AGENT_INTERNAL_WORKER_SUPERVISOR_LOST_EXIT_MS=86400000, per-checkout
   PRIME_AGENT_KERNEL_VENV, and a resolvable PRIME_AGENT_RUNTIME_SOURCE.
@@ -153,10 +155,12 @@ Files are in deploy/deploy-a/. Review each, then apply under this health gate. R
 
 ## 4. Update-restart onto the new build
 
-With the venv prebuilt (1), descriptors cleared (2), host config staged and containment verified
-(3), do the normal update-restart to the new build. Because the venv identity already matches the
-prebuilt generation, no in-band rebuild happens. The successor re-enters the same
-prime-agent.slice cap (the auto-named scope avoids a unit-name collision on restart).
+Use the complete [bounded hot-swap runbook](HOTSWAP-RUNBOOK.md). Run the reviewed coordinator
+from the idle target slot, keep its target admission through successor validation, and preserve
+all unresolved manifests and worker holds. Do not signal clients or promise a silent reconnect:
+the terminal red daemon_closing screen is expected and carries the session ID.
+A matching prebuilt venv avoids an in-band rebuild. The successor re-enters the same
+prime-agent.slice cap through the scoped auto-launch path.
 
 ## 5. Post-cutover verification (health gate)
 
@@ -169,7 +173,9 @@ prime-agent.slice cap (the auto-named scope avoids a unit-name collision on rest
 - `prime-agent list` shows the expected sessions; the main conversation resumes.
 - Telemetry lines show slice memory.current well under MemoryMax and swap use flat.
 - A test scheduled wake fires (A.3): a session with a due job wakes without a live worker.
-- No new "failed and disconnected" descriptors accumulate.
+- Reconcile every failed/recovering descriptor with the update status and local hold evidence.
+  A live, identity-matched uninterruptible worker is an explicit degraded hold, not a cleanup target.
+  Do not claim complete recovery while unresolved session failures remain.
 
 ## R. Rollback
 
@@ -180,7 +186,8 @@ prime-agent.slice cap (the auto-named scope avoids a unit-name collision on rest
   the value that previous build used (or unset so it uses that build's shipped runtime copy):
   the generation identity is hashed from the runtime source, so leaving RUNTIME_SOURCE pointed at
   the new checkout would make the legacy venv non-current and force a full rebuild. Keep both env
-  values identical across EVERY launching shell (collectDaemonLaunchEnv forwards the client env).
+  values only in the chosen rollback coordinator/daemon environment; clients must omit them
+  (collectDaemonLaunchEnv forwards client values).
   Sessions persist on disk and reload. Do NOT roll back by editing `<base>.current`: a venv-only
   pointer edit only makes sense together with a matching build rollback, and a pre-Deploy-A build
   does not understand the pointer.

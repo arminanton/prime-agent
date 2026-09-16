@@ -1,8 +1,10 @@
+import type * as ChildProcessTypes from "../src/utils/child-process.js";
+import type * as SessionLeaseTypes from "../src/core/session-lease.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({ alive: true, startId: "start", connectable: false }));
-vi.mock("../src/utils/child-process.js", async (original) => ({ ...await original<typeof import("../src/utils/child-process.js")>(),
+vi.mock("../src/utils/child-process.js", async (original) => ({ ...await original<typeof ChildProcessTypes>(),
 	isProcessAlive: vi.fn(() => state.alive) }));
-vi.mock("../src/core/session-lease.js", async (original) => ({ ...await original<typeof import("../src/core/session-lease.js")>(),
+vi.mock("../src/core/session-lease.js", async (original) => ({ ...await original<typeof SessionLeaseTypes>(),
 	getProcessStartId: vi.fn(() => state.startId) }));
 vi.mock("../src/modes/daemon/daemon-client.js", () => ({ DaemonClient: class {
 	async connect() { if (!state.connectable) throw new Error("unreachable"); }

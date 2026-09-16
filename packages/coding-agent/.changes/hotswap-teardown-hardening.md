@@ -1,0 +1,4 @@
+- Fixed daemon shutdown stalls caused by accepted client sockets and blocked worker IPC writes.
+- Added bounded, identity-checked update retirement with explicit recovery holds for workers that cannot exit.
+- Fixed update restart selecting a compatible daemon from the wrong build or slot by keeping target admission through validation.
+- Preserved update checkpoints on recovery failure and limited automatic continuation to prior failed checkpoints bound to the exact live target.

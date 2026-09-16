@@ -1,10 +1,12 @@
+import type * as ChildProcessTypes from "../src/utils/child-process.js";
+import type * as SessionLeaseTypes from "../src/core/session-lease.js";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("proper-lockfile", () => ({ default: { lock: vi.fn(async () => vi.fn(async () => {})) } }));
-vi.mock("../src/utils/child-process.js", async (original) => ({ ...await original<typeof import("../src/utils/child-process.js")>(), isProcessAlive: () => true }));
-vi.mock("../src/core/session-lease.js", async (original) => ({ ...await original<typeof import("../src/core/session-lease.js")>(), getProcessStartId: () => "start" }));
+vi.mock("../src/utils/child-process.js", async (original) => ({ ...await original<typeof ChildProcessTypes>(), isProcessAlive: () => true }));
+vi.mock("../src/core/session-lease.js", async (original) => ({ ...await original<typeof SessionLeaseTypes>(), getProcessStartId: () => "start" }));
 import { acquireDaemonShutdownAdmission, acquireDaemonSupervisorOwnership, isDaemonShutdownAdmissionActive, persistDaemonStartupFenceFromOwner, waitForDaemonStartupFence } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 import { DAEMON_ADMISSION_TICKET_ENV, getDaemonReplacementIdentity } from "../src/modes/daemon/daemon-runtime-identity.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";

@@ -1,7 +1,8 @@
+import type * as ChildProcessTypes from "../src/utils/child-process.js";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({ spawned: false, launches: [] as Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv }> }));
-vi.mock("../src/utils/child-process.js", async (original) => ({ ...await original<typeof import("../src/utils/child-process.js")>(),
+vi.mock("../src/utils/child-process.js", async (original) => ({ ...await original<typeof ChildProcessTypes>(),
 	spawnHidden: (command: string, args: string[], options: { env: NodeJS.ProcessEnv }) => {
 		state.spawned = true; state.launches.push({ command, args, env: options.env }); return Object.assign(new EventEmitter(), { unref: vi.fn() });
 	} }));

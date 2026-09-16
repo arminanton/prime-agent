@@ -1,11 +1,13 @@
+import type * as ChildProcessTypes from "../src/utils/child-process.js";
+import type * as SessionLeaseTypes from "../src/core/session-lease.js";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 const processes = vi.hoisted(() => new Map<number, string | undefined>());
-vi.mock("../src/utils/child-process.js", async (original) => ({ ...await original<typeof import("../src/utils/child-process.js")>(),
+vi.mock("../src/utils/child-process.js", async (original) => ({ ...await original<typeof ChildProcessTypes>(),
 	isProcessAlive: vi.fn((pid: number) => processes.has(pid)) }));
-vi.mock("../src/core/session-lease.js", async (original) => ({ ...await original<typeof import("../src/core/session-lease.js")>(),
+vi.mock("../src/core/session-lease.js", async (original) => ({ ...await original<typeof SessionLeaseTypes>(),
 	getProcessStartId: vi.fn((pid: number) => processes.get(pid)) }));
 import { defaultWorkerDescriptorDir, scanLiveWorkerProcesses } from "../src/modes/daemon/daemon-worker-descriptors.js";
 const roots: string[] = [];

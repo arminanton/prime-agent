@@ -1,3 +1,5 @@
+import type * as ChildProcessTypes from "../src/utils/child-process.js";
+import type * as SessionLeaseTypes from "../src/core/session-lease.js";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -5,9 +7,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({ alive: true, lock: vi.fn(async () => vi.fn(async () => {})) }));
 vi.mock("proper-lockfile", () => ({ default: { lock: state.lock } }));
-vi.mock("../src/utils/child-process.js", async (original) => ({ ...await original<typeof import("../src/utils/child-process.js")>(),
+vi.mock("../src/utils/child-process.js", async (original) => ({ ...await original<typeof ChildProcessTypes>(),
 	isProcessAlive: vi.fn(() => state.alive) }));
-vi.mock("../src/core/session-lease.js", async (original) => ({ ...await original<typeof import("../src/core/session-lease.js")>(),
+vi.mock("../src/core/session-lease.js", async (original) => ({ ...await original<typeof SessionLeaseTypes>(),
 	getProcessStartId: vi.fn(() => "start") }));
 import { acquireDaemonShutdownAdmission, DaemonShutdownAdmissionError, DaemonStartupFenceTimeoutError, waitForDaemonStartupFence } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 const roots: string[] = [];
