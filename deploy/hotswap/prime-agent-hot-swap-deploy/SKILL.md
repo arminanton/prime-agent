@@ -28,7 +28,10 @@ If this file is installed elsewhere, resolve that runbook from the reviewed chec
 - Never use manifest age as proof of PREPARE success. Never clear retained checkpoints or fences by wildcard.
 - An exact live supervisor that survives SIGKILL is BLOCKED. No target ticket overrides its fence or ownership.
 - Surviving committed workers are session-scoped recovery holds. Restore the other sessions and retain evidence.
-- Preserve v1 protocol/schema/owner/session/update-format versions for this bridge.
+- Preserve v1 protocol/schema/owner/session/update-format versions and daemon appVersion for this bridge.
+  Old idle clients compare protocol/schema/appVersion and can replace an idle successor with their old build on a future bump.
+- Prepared-phase handled crash/signal shutdown also sends update. A routed notice during the supervisor handshake can lack
+  generation metadata and use the bounded compatibility fallback; neither case weakens the terminal deadline.
 </essential_principles>
 
 <process>

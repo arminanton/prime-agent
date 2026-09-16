@@ -16,6 +16,9 @@ It describes the bounded v1 update-restart bridge. It is not permission to deplo
    A hot-swap does not authorize unrelated memory-cap or host-service changes.
 6. For this bridge, the compatibility gate must show no changes from its base:
    protocol `7`, schema `protocol-7-schema-29-f50bed649543`, update format `1`, owner version `1`, session version `3`.
+   Keep daemon appVersion pinned too. Old idle clients probe protocol/schema/appVersion, not only
+   the socket. A future bump can make them classify an idle successor as stale and relaunch their
+   old build. Update that probe or the old clients before attempting a version-skewed hot-swap.
 
 Only put slot-specific kernel/runtime variables in the chosen coordinator/daemon environment.
 Client and login environments must not override workers with stale slot-specific runtime paths.
@@ -103,12 +106,20 @@ Updated TUI adapters wait up to 120 seconds for a new supervisor generation, the
 fresh 120 seconds to find and attach the restored session. They never use `retry_worker`
 to race the coordinator's manifest restoration. An update already in progress owns its
 failure deadline, even if an older predecessor sends a conflicting shutdown notice.
+A routed client can receive the update notice over its direct worker link while the supervisor
+hello is pending. The worker hello has no supervisor generation; that case uses the bounded
+compatibility fallback and update precedence, not a guaranteed predecessor-generation gate.
+Stable-envelope replay for non-update transport loss remains unchanged, including signal-bearing
+startup prompts and ACP prompt-and-wait. If update rejects an old-ID replay, the client reports
+unknown admission without cancelling the restored session. Successful acknowledgments remain authoritative.
 The red diagnostic with session ID, saved file and log path is the fallback after recovery
 fails. A genuine shutdown with no prepared update still closes the session window normally.
 
 Prepared is sticky: any later stop, including a manual stop or `--force`, is labelled `update`.
-If the coordinator died after PREPARE, no successor may arrive and clients reach the bounded
-fallback. Preserve the manifest and follow the recovery procedure rather than replaying work.
+Handled crash/signal shutdown also sends `update` in this phase, where the old code sent an
+unlabelled close. Updated TUIs take the update deadline rather than the ordinary reconnect
+path; Agents View also attempts recovery. If the coordinator died after PREPARE, no successor
+may arrive and clients reach the bounded fallback. Preserve the manifest and follow the recovery procedure rather than replaying work.
 A failed preparation resets the supervisor phase. Direct peers can already have received an
 early update notice during preparation; if preparation then cancels without a successor,
 updated clients can time out waiting for a new generation. The surviving session is intact
