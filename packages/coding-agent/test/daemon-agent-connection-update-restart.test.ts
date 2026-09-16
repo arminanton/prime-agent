@@ -114,6 +114,7 @@ async function startCutoverScript(streaming: boolean, options: {
 	let promptAccepted!: () => void;
 	const pendingPrompt = new Promise<void>((resolve) => { promptAccepted = resolve; });
 	let successorListedFailed = false;
+	let promptExecutions = 0;
 	const send = (socket: Socket, event: DaemonOutbound) => socket.write(serializeJsonLine(event));
 	let server: Server;
 	server = createServer((socket) => {
@@ -166,7 +167,14 @@ async function startCutoverScript(streaming: boolean, options: {
 					reply(snapshot(command.activeSessionId, connection >= 2 && streaming));
 				}
 			} else if (command.type === "prompt") {
-				if (options.pendingAdmission && connection === 0) promptAccepted();
+				if (options.pendingAdmission && connection !== 0) {
+					// The checkpoint closed this active ID. A stable-envelope replay is not a new execution.
+					send(socket, { type: "response", id: command.id, command: "prompt", success: false,
+						error: "Unknown active session: old-active" });
+					return;
+				}
+				promptExecutions++;
+				if (options.pendingAdmission) promptAccepted();
 				else reply();
 				send(socket, { type: "session_event", activeSessionId: "old-active", event: { type: "agent_start" } });
 				send(socket, {
@@ -189,6 +197,7 @@ async function startCutoverScript(streaming: boolean, options: {
 	});
 	return {
 		socketPath, trace, requests, predecessorConnected, pendingPrompt,
+		get promptExecutions() { return promptExecutions; },
 		endPredecessor: () => sockets[1]!.end(serializeJsonLine({ type: "daemon_closing", reason: options.predecessorReason ?? "shutdown" })),
 		beginDaemonUpdate: () => sockets[0]!.end(serializeJsonLine({ type: "daemon_closing", reason: "update" })),
 		abortSnapshotAndBeginUpdate: (failureFirst: boolean) => {
@@ -390,7 +399,7 @@ describe("coordinator update reconnect ordering", () => {
 		expect(script.requests.some(({ command }) => command.type === "retry_worker")).toBe(false);
 	});
 
-	it("reports uncertain admission without replay or cancel after a pending signalled prompt is interrupted", async () => {
+	it("reports uncertain admission without cancellation when an interrupted prompt replays its old ID", async () => {
 		const script = await startCutoverScript(true, { pendingAdmission: true });
 		const client = new DaemonClient(script.socketPath);
 		cleanup.push(async () => client.close());
@@ -407,7 +416,10 @@ describe("coordinator update reconnect ordering", () => {
 		script.beginUpdate();
 		await restored;
 		expect(await result).toMatchObject({ name: "AgentConnectionPromptAdmissionError", status: "unknown" });
-		expect(script.requests.filter(({ command }) => command.type === "prompt")).toHaveLength(1);
+		const promptRequests = script.requests.filter(({ command }) => command.type === "prompt");
+		expect(promptRequests).toHaveLength(2);
+		expect(promptRequests[1]?.command).toEqual(promptRequests[0]?.command);
+		expect(script.promptExecutions).toBe(1);
 		expect(script.requests.some(({ command }) => command.type === "cancel_prompt_admission")).toBe(false);
 	});
 

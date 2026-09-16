@@ -1232,7 +1232,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			admissionId,
 		} as Extract<DaemonCommandBody, { type: typeof type }>;
 		let promptError: unknown;
-		const promptRequest = this.requestData<unknown>(command, DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS, { recoverable: false }).catch(
+		const promptRequest = this.requestData<unknown>(command, DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS).catch(
 			(error: unknown) => {
 				promptError =
 					error instanceof DaemonCapabilityUnavailableError && !error.afterReconnect
@@ -1245,6 +1245,10 @@ export class DaemonAgentConnection implements AgentConnection {
 			const first = await Promise.race([promptRequest.then(() => "settled" as const), aborted]);
 			if (first === "settled" && promptError === undefined) return;
 			if (first === "settled" && promptError instanceof AgentConnectionPromptAdmissionError) throw promptError;
+			if (this.updateRestartPending || updateRevision !== this.updateRestartRevision) {
+				throw new AgentConnectionPromptAdmissionError("Prompt admission was interrupted by a daemon update.", "unknown",
+					promptError === undefined ? undefined : { cause: promptError });
+			}
 			if (
 				first === "settled" &&
 				!signal.aborted &&
@@ -1252,10 +1256,6 @@ export class DaemonAgentConnection implements AgentConnection {
 				this.definitiveRequestErrors.has(promptError)
 			) {
 				throw promptError;
-			}
-			if (this.updateRestartPending || updateRevision !== this.updateRestartRevision) {
-				throw new AgentConnectionPromptAdmissionError("Prompt admission was interrupted by a daemon update.", "unknown",
-					promptError === undefined ? undefined : { cause: promptError });
 			}
 			let status: "cancelled" | "owned" | "unknown" = "unknown";
 			try {
@@ -1878,9 +1878,9 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (this.reconnectPromise) {
 			return this.reconnectPromise;
 		}
-		const sessionRevision = this.sessionRevision;
+		const updateRevision = this.updateRestartRevision;
 		const ownsRecovery = () => !this.disposed && !this.terminalCloseEmitted &&
-			!this.updateRestartPending && sessionRevision === this.sessionRevision;
+			!this.updateRestartPending && updateRevision === this.updateRestartRevision;
 		const reconnectPromise = (async () => {
 			void this.emit({ type: "connection_status", status: "reconnecting", error: cause.message });
 			const timeoutMs = this.options.reconnectTimeoutMs ?? DAEMON_RECONNECT_TIMEOUT_MS;
@@ -2359,7 +2359,8 @@ export class DaemonAgentConnection implements AgentConnection {
 				}
 			} catch (error) {
 				lastError = error;
-				if (!this.client.hello || !this.client.isConnected) this.client.resetTransportForReconnect();
+				// A sibling may already own a connected socket whose hello is still pending.
+				if (!this.client.isConnected) this.client.resetTransportForReconnect();
 			}
 			if (this.disposed || this.terminalCloseEmitted) return;
 			await delay(Math.max(0, Math.min(UPDATE_RECONNECT_RETRY_MS, deadline - Date.now())));
