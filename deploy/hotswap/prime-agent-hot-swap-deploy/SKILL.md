@@ -20,7 +20,11 @@ If this file is installed elsewhere, resolve that runbook from the reviewed chec
 - Never deploy from the build worktree. Never mutate the live or rollback slot during preparation.
 - Never rebuild a shared live venv. Prebuild the named target-slot family before cutover.
 - Never inherit daemon-worker, session-lease, RLM, or stale client runtime coordinates into deployment commands.
-- Never signal/kill a TUI or client. The red daemon_closing screen is expected and carries the session ID.
+- Never signal/kill a TUI or client. A fixed prepared predecessor sends update for in-place TUI and Agents View recovery.
+  The red diagnostic with session ID is the bounded-failure fallback, not the expected successful-cutover result.
+- The first install still retires an unfixed predecessor; old attached clients may need reopening that one time.
+- Updated clients allow 120 seconds for a successor generation plus 120 seconds for session restoration.
+  Any post-prepared stop, including --force, is an update. A dead coordinator or canceled early prepare can reach the fallback.
 - Never use manifest age as proof of PREPARE success. Never clear retained checkpoints or fences by wildcard.
 - An exact live supervisor that survives SIGKILL is BLOCKED. No target ticket overrides its fence or ownership.
 - Surviving committed workers are session-scoped recovery holds. Restore the other sessions and retain evidence.
@@ -35,7 +39,8 @@ If this file is installed elsewhere, resolve that runbook from the reviewed chec
 4. Let the coordinator own PREPARE, shutdown acceptance, the exit fence, gated exact-pid escalation and target admission.
    Do not emulate this flow with a general shutdown, manual lock deletion, or an old-TUI relaunch.
 5. Observe final status and verify target build/realpath, sessions, representative heartbeat and containment.
-6. Record degraded holds separately from complete recovery. Reopen restored sessions from Agents View using the red screen's ID.
+6. Verify in-place client recovery and record degraded holds separately. Use the diagnostic ID to reopen only if recovery failed.
+   Direct peers notified before a canceled PREPARE can time out despite the original session surviving; see the runbook.
 7. Only after verification, change deployment pointers and append the ledger. Preserve the old slot through confirmation.
 </process>
 

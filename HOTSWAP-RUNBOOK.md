@@ -94,10 +94,33 @@ the hardened predecessor teardown: one second FIN grace, two second server-close
 
 ## Client behavior
 
-The terminal red `daemon_closing` screen is expected. It contains the session ID and recovery details.
-Record that ID. After restore, reopen the session from Agents View if needed.
-This bridge does not add a wire reason field or change the supervisor shutdown reason to `update`.
-Do not promise that every TUI silently reconnects or that all kernel RAM survives.
+Once the retiring daemon includes the reconnect fix, a completed PREPARE makes its closing
+notice `update`, not `shutdown`. Attached TUI and Agents View windows take the existing
+in-place reconnect path. This also benefits old clients that already understand `update`.
+The wire shape and all compatibility versions stay unchanged.
+
+Updated TUI adapters wait up to 120 seconds for a new supervisor generation, then allow a
+fresh 120 seconds to find and attach the restored session. They never use `retry_worker`
+to race the coordinator's manifest restoration. An update already in progress owns its
+failure deadline, even if an older predecessor sends a conflicting shutdown notice.
+The red diagnostic with session ID, saved file and log path is the fallback after recovery
+fails. A genuine shutdown with no prepared update still closes the session window normally.
+
+Prepared is sticky: any later stop, including a manual stop or `--force`, is labelled `update`.
+If the coordinator died after PREPARE, no successor may arrive and clients reach the bounded
+fallback. Preserve the manifest and follow the recovery procedure rather than replaying work.
+A failed preparation resets the supervisor phase. Direct peers can already have received an
+early update notice during preparation; if preparation then cancels without a successor,
+updated clients can time out waiting for a new generation. The surviving session is intact
+and can be reopened. Same-generation reattachment after prepare cancellation is not implemented.
+
+Bootstrap: the first install still retires the unfixed `39ae91e6` daemon. Its already-attached
+old clients can still go terminal on that cutover. Do not promise first-install seamlessness.
+A pre-updated client can resist the conflicting notice, but running old JavaScript cannot
+hot-load that client protection. Later cutovers gain the fixed predecessor notice.
+Local cleanup of streaming indicators during the reconnect gap is a separate client change;
+this core fix resumes from the restored snapshot and does not promise that gap has no stale
+indicator. Kernel RAM and mid-turn external effects remain best-effort, not zero-loss guarantees.
 
 Never signal or kill a TUI/client to release the daemon. The daemons close their own accepted socket ends.
 A stopped client is not a dead process. Zombies count as exited; stopped and unobservable processes do not.
@@ -176,5 +199,5 @@ Legacy unscoped manifests remain readable for explicit no-daemon/prepare recover
 before a deployment; their historical lack of socket binding is not repaired by a file-age rule.
 
 The versioned skill addendum is at `deploy/hotswap/prime-agent-hot-swap-deploy/SKILL.md`.
-Synchronize any installed host skill only after review. Older host notes claiming zero lost work,
-silent TUI reconnect, client killing, or blanket manifest cleanup are not this procedure.
+Synchronize any installed host skill only after review. Older host notes promising unconditional
+zero-loss or first-install reconnect, client killing, or blanket manifest cleanup are not this procedure.

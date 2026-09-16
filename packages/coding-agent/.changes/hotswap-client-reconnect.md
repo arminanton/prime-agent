@@ -1,0 +1,1 @@
+- Fixed attached TUI and Agents View recovery across coordinator-driven daemon updates.
