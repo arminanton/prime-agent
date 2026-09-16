@@ -1949,6 +1949,8 @@ describe("daemon worker supervisor monitoring", () => {
 
 	it("fails closed after pid reuse without fresh runtime context", async () => {
 		vi.useFakeTimers();
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-reused-pid-test-"));
+		supervisorRegistryDirs.add(root);
 		type RecoveryWorker = {
 			descriptor: {
 				workerId: string;
@@ -1965,6 +1967,10 @@ describe("daemon worker supervisor monitoring", () => {
 			recovery?: Promise<void>;
 		};
 		type RecoveryHarness = {
+			defaultSessionConfig: { cwd: string; agentDir: string };
+			socketPath: string;
+			scheduledWakeFailures: Map<string, number>;
+			scheduledWakeRecompute?: Promise<void>;
 			workers: Map<string, RecoveryWorker>;
 			shuttingDown: boolean;
 			connectWorker: ReturnType<typeof vi.fn>;
@@ -1986,6 +1992,9 @@ describe("daemon worker supervisor monitoring", () => {
 			stopRevision: 0,
 		};
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			socketPath: join(root, "supervisor.sock"),
+			scheduledWakeFailures: new Map<string, number>(),
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
 			connectWorker: vi.fn(),
@@ -1998,6 +2007,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const recovery = supervisor.recoverWorker(worker);
 		await vi.advanceTimersByTimeAsync(250);
 		await recovery;
+		await supervisor.scheduledWakeRecompute;
 
 		expect(supervisor.connectWorker).not.toHaveBeenCalled();
 		expect(supervisor.recoverUncertainWorkerOperations).toHaveBeenCalledWith(worker);

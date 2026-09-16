@@ -28,6 +28,7 @@ import * as savedSessionCatalog from "../src/modes/daemon/saved-session-catalog.
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
 import { initTheme, stopThemeWatcher, theme } from "../src/modes/interactive/theme/theme.js";
 import { WORKING_ICON_INTERVAL_MS } from "../src/modes/interactive/theme/working-icon.js";
+import * as toolsManager from "../src/utils/tools-manager.js";
 
 const modeMocks = vi.hoisted(() => ({
 	interactiveRun: vi.fn<() => Promise<never>>(),
@@ -1556,6 +1557,12 @@ function createUiServices(): InteractiveModeUiServices {
 		getThemes: () => [],
 	};
 }
+
+beforeEach(() => {
+	// Tool downloads from earlier view fixtures must not enqueue network timers
+	// while the catalog tests advance their fake clock.
+	vi.spyOn(toolsManager, "ensureTool").mockResolvedValue(undefined);
+});
 
 afterEach(() => {
 	vi.restoreAllMocks();

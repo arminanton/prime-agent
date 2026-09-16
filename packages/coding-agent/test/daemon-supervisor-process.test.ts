@@ -32,6 +32,7 @@ import {
 	isDaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../src/modes/session-worker/private-framing.js";
+import { isProcessAlive, isZombieProcess } from "../src/utils/child-process.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
@@ -269,12 +270,8 @@ async function waitForExit(child: ChildProcess): Promise<void> {
 async function waitForProcessGone(pid: number): Promise<void> {
 	const deadline = Date.now() + 10_000;
 	while (Date.now() < deadline) {
-		try {
-			process.kill(pid, 0);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-				return;
-			}
+		if (!isProcessAlive(pid)) {
+			return;
 		}
 		await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
 	}
@@ -304,6 +301,50 @@ async function startBlockingBash(client: DaemonClient, activeSessionId: string, 
 	}
 	await waitForCondition(() => existsSync(readyPath), `Blocking bash process did not become ready: ${readyPath}`);
 }
+
+describe("waitForProcessGone", () => {
+	it.skipIf(process.platform === "win32")("treats an unreaped zombie as gone while its PID still exists", async () => {
+		// Block the parent before its event loop can reap the child. Closing stdin releases it for cleanup.
+		const reaper = spawn(
+			process.execPath,
+			[
+				"--eval",
+				[
+					'const fs = require("node:fs");',
+					'const child = require("node:child_process").spawn(process.execPath, ["--eval", "process.exit(0)"], { stdio: "ignore" });',
+					'fs.writeSync(1, String(child.pid) + "\\n");',
+					"fs.readSync(0, Buffer.alloc(1), 0, 1, null);",
+				].join("\n"),
+			],
+			{ stdio: ["pipe", "pipe", "inherit"] },
+		);
+		children.add(reaper);
+		let output = "";
+		let spawnError: Error | undefined;
+		reaper.stdout?.on("data", (chunk: Buffer) => {
+			output += chunk.toString("utf8");
+		});
+		reaper.once("error", (error: Error) => {
+			spawnError = error;
+		});
+		try {
+			await waitForCondition(() => {
+				if (spawnError) throw spawnError;
+				return output.includes("\n");
+			}, "Zombie fixture did not report its child PID");
+			const zombiePid = Number.parseInt(output.trim(), 10);
+			expect(Number.isInteger(zombiePid) && zombiePid > 0).toBe(true);
+			await waitForCondition(() => isZombieProcess(zombiePid), "Fixture child did not become a zombie");
+			expect(() => process.kill(zombiePid, 0)).not.toThrow();
+
+			await expect(waitForProcessGone(zombiePid)).resolves.toBeUndefined();
+		} finally {
+			reaper.stdin?.end();
+			await waitForExit(reaper);
+			children.delete(reaper);
+		}
+	});
+});
 
 describe("daemon supervisor resident workers", () => {
 	it("accepts the canonical socket path when launched with duplicate slashes", async () => {
