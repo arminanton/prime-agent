@@ -1016,9 +1016,7 @@ describe("daemon worker supervisor monitoring", () => {
 		});
 		const ownershipRelease = vi.fn(async () => undefined);
 		const log = vi.fn();
-		const exit = vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
-			throw new Error(`exit ${code}`);
-		}) as typeof process.exit);
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
 		type ShutdownHarness = {
 			socketLease?: { release(): Promise<void> };
 			ownership?: { release(): Promise<void> };
@@ -1028,6 +1026,8 @@ describe("daemon worker supervisor monitoring", () => {
 			shuttingDown: false,
 			signalCleanupHandlers: [],
 			workers: new Map(),
+			openingWorkers: new Map(),
+			catalogOpeningWorkers: new Map(),
 			clients: new Set(),
 			catalog: { stop: vi.fn(async () => undefined) },
 			cleanupSocket,
@@ -1038,7 +1038,7 @@ describe("daemon worker supervisor monitoring", () => {
 		}) as ShutdownHarness;
 
 		try {
-			await expect(supervisor.shutdown(42, false)).rejects.toThrow("exit 42");
+			await expect(supervisor.shutdown(42, false)).resolves.toBeUndefined();
 			expect(cleanupSocket).toHaveBeenCalledOnce();
 			expect(leaseRelease).toHaveBeenCalledOnce();
 			expect(ownershipRelease).toHaveBeenCalledOnce();
@@ -1058,6 +1058,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-shutdown-finalization-test-"));
 		supervisorRegistryDirs.add(root);
 		const worker = {
+			descriptorPath: join(root, "worker.json"),
 			descriptor: {
 				workerId: "worker-shutdown-finalization",
 				pid: 111_123,
@@ -1075,10 +1076,10 @@ describe("daemon worker supervisor monitoring", () => {
 			stopRevision: 1,
 			stopFinalization: new Promise<void>(() => {}),
 		};
+		writeFileSync(worker.descriptorPath, JSON.stringify(worker.descriptor));
+		const deleteWorkerDescriptor = vi.fn(() => rmSync(worker.descriptorPath, { force: true }));
 		const workers = new Map([[worker.descriptor.workerId, worker]]);
-		const exit = vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
-			throw new Error(`exit ${code}`);
-		}) as typeof process.exit);
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
@@ -1088,8 +1089,11 @@ describe("daemon worker supervisor monitoring", () => {
 			shuttingDown: false,
 			signalCleanupHandlers: [],
 			workers,
+			openingWorkers: new Map(),
+			catalogOpeningWorkers: new Map(),
 			clients: new Set(),
 			persistWorkerStopTombstone: vi.fn(),
+			deleteWorkerDescriptor,
 			hasPersistedWorkerDescriptors: vi.fn(() => true),
 			catalog: { stop: catalogStop },
 			cleanupSocket: vi.fn(),
@@ -1105,12 +1109,16 @@ describe("daemon worker supervisor monitoring", () => {
 				(error: unknown) => error,
 			);
 			await vi.advanceTimersByTimeAsync(2000);
-			await expect(shutdown).resolves.toEqual(new Error("exit 0"));
+			await expect(shutdown).resolves.toBeUndefined();
 
-			expect(workers.has(worker.descriptor.workerId)).toBe(true);
+			expect(workers.size).toBe(0);
+			expect(deleteWorkerDescriptor).not.toHaveBeenCalled();
+			expect(JSON.parse(readFileSync(worker.descriptorPath, "utf8"))).toMatchObject({
+				workerId: worker.descriptor.workerId, stopRequestedAt: worker.descriptor.stopRequestedAt,
+			});
 			expect(killSpy).not.toHaveBeenCalled();
 			expect(catalogStop).toHaveBeenCalledOnce();
-			expect(log).toHaveBeenCalledWith(expect.stringContaining("remains tombstoned for recovery"));
+			expect(log).toHaveBeenCalledWith(expect.stringContaining("tombstone retained for recovery"));
 			expect(exit).toHaveBeenCalledWith(0);
 		} finally {
 			exit.mockRestore();

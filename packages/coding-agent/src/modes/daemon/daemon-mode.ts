@@ -8034,7 +8034,9 @@ export class AgentDaemon {
 		const failed = new Set<ActiveSessionState>();
 		// closeSession owns runtime disposal and releases its lease only after
 		// that disposal actually settles. The deadline here must not release it.
-		// closeSession registers synchronously; deepest-first COMMIT callers let parent cascades join child closes.
+		// Every closeSession registers synchronously before its first await. All
+		// entries are registered before closeSessionOnce runs, so parent cascades
+		// join child closes even when normal shutdown enumerates a parent first.
 		const result = await settleWithinBudget("worker session disposal", WORKER_SHUTDOWN_SESSION_CLOSE_MS, Promise.all(
 			states.map(async (state) => {
 				try { await this.closeSession(state, reasonFor(state)); }

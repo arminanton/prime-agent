@@ -1009,7 +1009,8 @@ async function prepareConnectedDaemonUpdateRestart(
 			const busy = list.success && isRecord(list.data) ? list.data.busyClientOwnedSessionCount : undefined;
 			if (list.success && !responseHasActiveDaemonSessions(list.data) && busy === 0) {
 				await persistPreparedRestartFence();
-				return { manifest: pendingManifest, provenance: "pending_manifest_idle_daemon", workers: [] };
+				return { manifest: pendingManifest, provenance: "pending_manifest_idle_daemon", workers: [],
+					heldActiveSessionIds: scanManifestRecoveryHolds(agentDir, socketPath, pendingManifest).held };
 			}
 		}
 		// Never pre-clear recovery evidence and never infer COMMIT from file age.

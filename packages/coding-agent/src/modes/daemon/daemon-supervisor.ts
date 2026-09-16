@@ -893,18 +893,28 @@ export class DaemonSupervisor {
 	}
 
 	private listen(): Promise<void> {
+		const server = this.server;
+		if (!server) return Promise.reject(new Error("Daemon server is unavailable before listening"));
 		return new Promise<void>((resolveListen, rejectListen) => {
+			const cleanup = () => {
+				server.off("listening", onListening);
+				server.off("error", onError);
+				server.off("close", onClose);
+			};
 			const onError = (error: Error) => {
-				this.server?.off("listening", onListening);
+				cleanup();
 				rejectListen(error);
 			};
 			const onListening = () => {
-				this.server?.off("error", onError);
+				cleanup();
 				resolveListen();
 			};
-			this.server?.once("error", onError);
-			this.server?.once("listening", onListening);
-			this.server?.listen(this.socketPath);
+			const onClose = () => onError(new Error("Daemon server closed before listening"));
+			server.once("error", onError);
+			server.once("listening", onListening);
+			server.once("close", onClose);
+			try { server.listen(this.socketPath); }
+			catch (error) { onError(error instanceof Error ? error : new Error(String(error))); }
 		});
 	}
 
@@ -7453,17 +7463,23 @@ export class DaemonSupervisor {
 		await this.shutdownStage("catalog stop", SUPERVISOR_SHUTDOWN_CATALOG_STOP_BUDGET_MS,
 			() => this.catalog.stop(SUPERVISOR_SHUTDOWN_CATALOG_STOP_BUDGET_MS));
 		await this.closeTransportBounded();
-		this.clients.clear();
-		try { this.cleanupSocket(); } catch (error) { this.reportCleanupFailure("daemon socket", error); }
-		const cacheRoot = this.snapshotCacheRoot;
-		await this.runCleanupStep("supervisor cache", () => removePath(cacheRoot, { recursive: true, force: true }),
-			SUPERVISOR_SHUTDOWN_CACHE_BUDGET_MS);
-		const lease = this.socketLease;
-		this.socketLease = undefined;
-		await this.runCleanupStep("daemon socket lock", async () => lease?.release());
-		const ownership = this.ownership;
-		this.ownership = undefined;
-		await this.runCleanupStep("daemon ownership", async () => ownership?.release());
+		try {
+			this.clients.clear();
+			try { this.cleanupSocket(); } catch (error) { this.reportCleanupFailure("daemon socket", error); }
+			const cacheRoot = this.snapshotCacheRoot;
+			await this.runCleanupStep("supervisor cache", () => removePath(cacheRoot, { recursive: true, force: true }),
+				SUPERVISOR_SHUTDOWN_CACHE_BUDGET_MS);
+		} finally {
+			const lease = this.socketLease;
+			this.socketLease = undefined;
+			try {
+				await this.runCleanupStep("daemon socket lock", async () => lease?.release());
+			} finally {
+				const ownership = this.ownership;
+				this.ownership = undefined;
+				await this.runCleanupStep("daemon ownership", async () => ownership?.release());
+			}
+		}
 	}
 
 	private async runCleanupStep(

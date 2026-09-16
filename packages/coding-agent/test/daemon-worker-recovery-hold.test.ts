@@ -38,7 +38,7 @@ describe("local worker recovery holds", () => {
 			isWorkerStopping: () => false, validateAndPersistUpdateManifest: validate,
 			stopWorker: vi.fn(async () => { throw new Error("worker survived SIGKILL"); }),
 			processIdentity: () => "current", persistWorker: persist, log: vi.fn(),
-		}) as { prepareUpdateRestartFenced(deadline: number): Promise<DaemonUpdateRestartManifest> };
+		}) as unknown as { prepareUpdateRestartFenced(deadline: number): Promise<DaemonUpdateRestartManifest> };
 		const result = await sup.prepareUpdateRestartFenced(Date.now() + 100_000);
 		expect(result.discardedActiveSessionIds).toEqual(["root"]);
 		expect(validate).toHaveBeenCalledTimes(1);
@@ -53,7 +53,7 @@ describe("local worker recovery holds", () => {
 		const connect = vi.fn();
 		const sup = Object.assign(Object.create(DaemonSupervisor.prototype) as object, {
 			processIdentity: () => identity, persistWorker: vi.fn(), assertRecoveryAllowed: vi.fn(async () => {}), connectWorker: connect,
-		}) as { adoptOrRecoverWorker(worker: unknown): Promise<void>; retryWorkerRecovery(worker: unknown): Promise<void>;
+		}) as unknown as { adoptOrRecoverWorker(worker: unknown): Promise<void>; retryWorkerRecovery(worker: unknown): Promise<void>;
 			isUpdateRestartRecoveryHeld(worker: unknown): boolean };
 		await sup.adoptOrRecoverWorker(participant);
 		expect(connect).not.toHaveBeenCalled();

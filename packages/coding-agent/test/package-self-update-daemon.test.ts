@@ -1798,4 +1798,35 @@ describe("self-update daemon restart", () => {
 		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
 	});
 
+	it("carries a manifest-bound live worker hold through idle-daemon reuse without dispatching create", async () => {
+		useFixedOwnerHello();
+		mockState.hello.runtime = { ...getDaemonRuntimeIdentity(), buildId: "previous-build" };
+		mockState.prepareManifest = createAcceptedRecoveryManifest();
+		writeFileSync(mockState.preparedManifestPath, JSON.stringify(mockState.prepareManifest));
+		mockState.listResponse = { success: true, data: { sessions: [], busyClientOwnedSessionCount: 0 } };
+		const directory = defaultWorkerDescriptorDir(agentDir, mockState.socketPath);
+		mkdirSync(directory, { recursive: true });
+		const rootId = mockState.prepareManifest.sessions[0]!.activeSessionId;
+		writeFileSync(join(directory, "idle-held.json"), JSON.stringify({
+			version: 2, workerId: "idle-held", pid: 1337, processStartId: "replacement-start",
+			supervisorSocketPath: mockState.socketPath, socketPath: join(tempDir, "held-worker.sock"),
+			authenticationToken: "private", rootActiveSessionId: rootId,
+			createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+			consecutiveFailures: 0, lifecycle: "recovering", createCommand: { type: "create" },
+			updateRestartRecoveryHold: {
+				reason: "update_restart_recovery_uncertain", pid: 1337, processStartId: "replacement-start",
+				rootActiveSessionId: rootId, activeSessionIds: [rootId], createdAt: new Date().toISOString(),
+				manifestCreatedAt: mockState.prepareManifest.createdAt,
+			},
+		}));
+		await performUpdateAndRunCoordinator();
+		expect(mockState.calls).not.toContain("daemon-request:prepare_update_restart");
+		expect(mockState.calls).toContain("ensure-daemon");
+		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
+		expect(mockState.lastCoordinatorStatus).toMatchObject({
+			phase: "complete", counts: { total: 1, restored: 0, failed: 1 }, failures: [{ kind: "held" }],
+		});
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+	});
+
 });

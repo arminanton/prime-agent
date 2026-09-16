@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getDaemonUpdateRestartManifestPath } from "../../../src/config.js";
 import type { SessionActionRecoverySnapshot } from "../../../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.js";
@@ -145,10 +145,24 @@ function createCustomMessage(content: string): CustomMessage {
 describe("issue #4257 update restart resume", () => {
 	const harnesses: Harness[] = [];
 
-	afterEach(() => {
+	beforeEach(() => {
+		const retirement = AgentDaemon.prototype as unknown as {
+			armShutdownHardExit(exitCode: number, budgetMs?: number): void;
+			shutdown(exitCode: number): Promise<never>;
+		};
+		// Process retirement is tested separately. These fixtures verify the
+		// update transaction and must never exit the Vitest process.
+		vi.spyOn(retirement, "armShutdownHardExit").mockImplementation(() => {});
+		vi.spyOn(retirement, "shutdown").mockImplementation(() => new Promise<never>(() => {}));
+	});
+
+	afterEach(async () => {
+		// Let queued retirement requests reach the mock before restoring it.
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+		vi.restoreAllMocks();
 	});
 
 	it.each([
@@ -440,7 +454,7 @@ describe("issue #4257 update restart resume", () => {
 			},
 		},
 		{
-			name: "finishes cancelled transaction cleanup after a failed publish",
+			name: "keeps a failed publish fenced and retires the worker",
 			run: async ({ internals, makeClient }) => {
 				const owner = makeClient("owner");
 				await internals.handleWorkerCommand(owner, { id: "prepare", type: "worker_prepare_update" });
@@ -452,8 +466,12 @@ describe("issue #4257 update restart resume", () => {
 				});
 
 				await internals.handleWorkerCommand(owner, { id: "commit", type: "worker_commit_update" });
+				await new Promise<void>((resolve) => setImmediate(resolve));
 
-				expect(internals.updateRestart).toBeUndefined();
+				expect(internals.updateRestart).toBe(transaction);
+				expect(transaction?.phase).toBe("publishing");
+				expect(internals.getShutdownClosingReason()).toBe("update");
+				expect(internals.shutdown).toHaveBeenCalledWith(1);
 			},
 		},
 		{
@@ -494,8 +512,10 @@ describe("issue #4257 update restart resume", () => {
 				});
 
 				await expect(internals.prepareUpdateRestart()).rejects.toThrow("stale publish failed");
+				await new Promise<void>((resolve) => setImmediate(resolve));
 
 				expect(internals.updateRestart).toBe(newerTransaction);
+				expect(internals.shutdown).toHaveBeenCalledWith(1);
 			},
 		},
 		{

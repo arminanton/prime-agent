@@ -22,7 +22,7 @@ export async function settleWithinBudget<T>(
 	const startedAt = performance.now();
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const timeout = new Promise<never>((_resolve, reject) => {
-		timer = setTimeout(() => reject(new BudgetExceededError(stage, budgetMs)), Math.max(0, budgetMs));
+		timer = setTimeout(() => reject(new BudgetExceededError(stage, budgetMs)), Math.min(2_147_483_647, Math.max(0, budgetMs)));
 		timer.unref?.();
 	});
 	let pending: Promise<T> | undefined;

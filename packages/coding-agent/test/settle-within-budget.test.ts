@@ -4,6 +4,19 @@ import { BudgetExceededError, settleWithinBudget } from "../src/utils/settle-wit
 afterEach(() => vi.useRealTimers());
 
 describe("settleWithinBudget", () => {
+	it.each([Number.MAX_SAFE_INTEGER, Number.POSITIVE_INFINITY])("clamps an oversized timer budget %s without an immediate timeout", async (budgetMs) => {
+		vi.useFakeTimers();
+		const timer = vi.spyOn(globalThis, "setTimeout");
+		let finish!: () => void;
+		const work = new Promise<void>((resolve) => { finish = resolve; });
+		const result = settleWithinBudget("large timer", budgetMs, work);
+		try {
+			expect(timer).toHaveBeenCalledWith(expect.any(Function), 2_147_483_647);
+			await vi.advanceTimersByTimeAsync(1);
+			finish();
+			await expect(result).resolves.toMatchObject({ ok: true });
+		} finally { timer.mockRestore(); }
+	});
 	it("calls a zero-argument factory without forwarding a promise callback argument", async () => {
 		const factory = vi.fn(() => 42);
 		expect(await settleWithinBudget("factory", 100, factory)).toMatchObject({ ok: true, value: 42 });

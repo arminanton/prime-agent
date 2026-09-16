@@ -22,7 +22,7 @@ describe("worker request write deadline", () => {
 		vi.useFakeTimers();
 		const client = makeClient(() => new Promise(() => {}));
 		let error: unknown;
-		void client.requestWorker({ type: "shutdown" }, 50).catch((reason) => { error = reason; });
+		void client.request({ type: "shutdown" }, 50).catch((reason) => { error = reason; });
 		await vi.advanceTimersByTimeAsync(50);
 		expect(error).toBeInstanceOf(DaemonWorkerProbeTimeoutError);
 		expect(vi.getTimerCount()).toBe(0);
@@ -32,7 +32,7 @@ describe("worker request write deadline", () => {
 		vi.useFakeTimers();
 		const failure = new Error("write failed");
 		const client = makeClient(() => Promise.reject(failure));
-		await expect(client.requestWorker({ type: "shutdown" }, 50)).rejects.toBe(failure);
+		await expect(client.request({ type: "shutdown" }, 50)).rejects.toBe(failure);
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
@@ -41,7 +41,7 @@ describe("worker request write deadline", () => {
 		const send = pendingSend();
 		const client = makeClient(() => send.promise);
 		const rejected = vi.fn();
-		const result = client.requestWorker({ type: "shutdown" }, 50).catch(rejected);
+		const result = client.request({ type: "shutdown" }, 50).catch(rejected);
 		await vi.advanceTimersByTimeAsync(50);
 		await result;
 		send.reject(new Error("late write failure"));
@@ -55,7 +55,7 @@ describe("worker request write deadline", () => {
 		vi.useFakeTimers();
 		const send = pendingSend();
 		const client = makeClient(() => send.promise);
-		const result = client.requestWorker({ type: "shutdown" }, 50);
+		const result = client.request({ type: "shutdown" }, 50);
 		const response: DaemonResponse = { type: "response", command: "shutdown", success: true, id: "worker_1" };
 		(client as unknown as { handleFrame(frame: unknown): void }).handleFrame({
 			header: { kind: "outbound", outboundType: "response", requestId: "worker_1" },
@@ -71,7 +71,7 @@ describe("worker request write deadline", () => {
 		vi.useFakeTimers();
 		const send = pendingSend();
 		const client = makeClient(() => send.promise);
-		const result = client.requestWorker({ type: "shutdown" }, 50);
+		const result = client.request({ type: "shutdown" }, 50);
 		client.close();
 		await expect(result).rejects.toThrow("Daemon worker client closed");
 		send.reject(new Error("write destroyed"));
@@ -80,9 +80,9 @@ describe("worker request write deadline", () => {
 	});
 
 	it("keeps disconnected and synchronous write failures as promise rejections", async () => {
-		await expect(new DaemonWorkerClient("in-memory").requestWorker({ type: "shutdown" })).rejects.toThrow("not connected");
+		await expect(new DaemonWorkerClient("in-memory").request({ type: "shutdown" })).rejects.toThrow("not connected");
 		const failure = new Error("synchronous write failure");
 		const client = makeClient(() => { throw failure; });
-		await expect(client.requestWorker({ type: "shutdown" }, 50)).rejects.toBe(failure);
+		await expect(client.request({ type: "shutdown" }, 50)).rejects.toBe(failure);
 	});
 });

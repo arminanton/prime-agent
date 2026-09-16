@@ -19,6 +19,9 @@ const originActiveSessionId = requireEnvironment("PRIME_AGENT_INTERNAL_DAEMON_WO
 
 process.argv[1] = cliPath;
 process.execArgv.splice(0, process.execArgv.length, tsxPath);
+// The e2e deliberately replaces the same source entrypoint/build. Exercise
+// the real cutover without changing the production already-active guard.
+process.env.PRIME_AGENT_UPDATE_RESTART_ALLOW_SAME_BUILD = "1";
 writeFileSync(pidPath, `${process.pid}\n`);
 
 await launchDaemonUpdateRestartCoordinator({

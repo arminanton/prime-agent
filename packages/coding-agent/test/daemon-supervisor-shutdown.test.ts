@@ -31,7 +31,7 @@ function makeSupervisor(): SupervisorHandle {
 		server: { close: (done: () => void) => done() },
 		runCleanupStep: vi.fn(async () => {}),
 		log: vi.fn(),
-	}) as SupervisorHandle;
+	}) as unknown as SupervisorHandle;
 }
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
@@ -155,6 +155,39 @@ describe("supervisor shutdown failures", () => {
 		await shutdown;
 		expect(supervisor.log).toHaveBeenCalledWith(expect.stringContaining("shutdown stage server close: TIMED OUT"));
 		expect(exit).toHaveBeenCalledWith(0);
+	});
+
+	it("releases both authority records when client registry cleanup throws", async () => {
+		const supervisor = makeSupervisor();
+		const leaseRelease = vi.fn(async () => {});
+		const ownershipRelease = vi.fn(async () => {});
+		Reflect.deleteProperty(supervisor, "runCleanupStep");
+		Object.assign(supervisor, {
+			workers: new Map(),
+			clients: { clear: () => { throw new Error("client registry cleanup failed"); } },
+			closeTransportBounded: vi.fn(async () => {}),
+			socketLease: { release: leaseRelease },
+			ownership: { release: ownershipRelease },
+		});
+		const cleanup = supervisor as unknown as { cleanupSupervisorResourcesOnce(): Promise<void> };
+		await expect(cleanup.cleanupSupervisorResourcesOnce()).rejects.toThrow("client registry cleanup failed");
+		expect(leaseRelease).toHaveBeenCalledOnce();
+		expect(ownershipRelease).toHaveBeenCalledOnce();
+	});
+
+	it("settles startup listen when its captured server closes during teardown", async () => {
+		const server = Object.assign(new EventEmitter(), { listen: vi.fn() });
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype) as object, {
+			server, socketPath: "/memory/listen-cancel.sock",
+		}) as unknown as { server?: typeof server; listen(): Promise<void> };
+		const settled = vi.fn();
+		void supervisor.listen().then(() => settled("listening"), (error: Error) => settled(error.message));
+		supervisor.server = undefined;
+		server.emit("close");
+		await Promise.resolve();
+		expect(settled).toHaveBeenCalledWith(expect.stringContaining("closed before listening"));
+		expect(server.listenerCount("error")).toBe(0);
+		expect(server.listenerCount("listening")).toBe(0);
 	});
 
 });

@@ -16,7 +16,7 @@ function supervisor(fields: object): StopBudgetSupervisor {
 		shuttingDown: true,
 		workerSessionArtifactContext: () => ({ artifactDir: "in-memory", sessionFile: "in-memory/session.jsonl" }),
 		log: vi.fn(),
-	}, fields) as StopBudgetSupervisor;
+	}, fields) as unknown as StopBudgetSupervisor;
 }
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });

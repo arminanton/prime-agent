@@ -18,7 +18,7 @@ function worker(): WorkerHandle {
 		recordWorkerRecoveryState: vi.fn(),
 		cleanupSocketPath: vi.fn(),
 		server: { close: (done: () => void) => done() },
-	}) as WorkerHandle;
+	}) as unknown as WorkerHandle;
 }
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
