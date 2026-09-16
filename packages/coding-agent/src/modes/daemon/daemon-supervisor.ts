@@ -838,6 +838,7 @@ export class DaemonSupervisor {
 			restrictDaemonSocketPath(this.socketPath);
 
 			this.registerSignalHandlers();
+			this.installCrashHandlers();
 			const ownedSessionFiles = new Set(
 				[...this.workers.values()]
 					.flatMap((worker) => [worker.descriptor.sessionFile, worker.descriptor.createCommand.sessionPath])
@@ -7206,6 +7207,24 @@ export class DaemonSupervisor {
 		return accepted;
 	}
 
+	private installCrashHandlers(): void {
+		const exitOnCrash = (kind: string) => (reason: unknown) => {
+			const detail = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+			this.reportCleanupFailure(kind, detail);
+			// A replacement supervisor can re-adopt resident workers. A fatal
+			// supervisor error is not authority to discard their session state.
+			void this.shutdown(1, false).catch(() => process.exit(1));
+		};
+		const uncaught = exitOnCrash("uncaught exception");
+		const unhandled = exitOnCrash("unhandled rejection");
+		process.on("uncaughtException", uncaught);
+		process.on("unhandledRejection", unhandled);
+		this.signalCleanupHandlers.push(
+			() => process.off("uncaughtException", uncaught),
+			() => process.off("unhandledRejection", unhandled),
+		);
+	}
+
 	private registerSignalHandlers(): void {
 		const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
 		if (process.platform !== "win32") {
@@ -7404,11 +7423,9 @@ export class DaemonSupervisor {
 					try {
 						await this.stopWorker(worker, true, forceWorkers, true);
 					} catch (error) {
-						if (!(error instanceof WorkerStopTimeoutError)) {
-							throw error;
-						}
-						this.log(
-							`Worker ${worker.descriptor.workerId} remains tombstoned for recovery after shutdown: ${error.message}`,
+						this.reportCleanupFailure(
+							`worker ${worker.descriptor.workerId} (tombstone retained for recovery after shutdown)`,
+							error,
 						);
 					}
 				}),

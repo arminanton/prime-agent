@@ -201,13 +201,13 @@ export class DaemonWorkerClient {
 		this.directClosingReason = undefined;
 	}
 
-	private async requestWire(
+	private requestWire(
 		command: DaemonWorkerWireCommandBody,
 		timeoutMs: number,
 		onResponse?: DaemonClientRequestOptions["onResponse"],
 	): Promise<DaemonResponse> {
 		if (!this.channel || !this.socket || this.socket.destroyed) {
-			throw new Error("Daemon worker client is not connected");
+			return Promise.reject(new Error("Daemon worker client is not connected"));
 		}
 		const id = `worker_${++this.requestId}`;
 		const fullCommand = { ...command, id } as DaemonWorkerWireCommand;
@@ -231,20 +231,25 @@ export class DaemonWorkerClient {
 				timeout,
 			});
 		});
+		// Return the timed response immediately. A blocked write callback must not
+		// hide its deadline from the caller or leave its rejection unobserved.
 		try {
-			await this.channel.send(
+			void this.channel.send(
 				{ kind: "command", requestId: id, commandType: command.type },
 				Buffer.from(serializeJsonLine(fullCommand)),
-			);
+			).catch((error) => this.rejectPendingIfCurrent(id, error));
 		} catch (error) {
-			const pending = this.pending.get(id);
-			if (pending) {
-				clearTimeout(pending.timeout);
-				this.pending.delete(id);
-				pending.reject(error instanceof Error ? error : new Error(String(error)));
-			}
+			this.rejectPendingIfCurrent(id, error);
 		}
 		return response;
+	}
+
+	private rejectPendingIfCurrent(id: string, error: unknown): void {
+		const pending = this.pending.get(id);
+		if (!pending) return;
+		clearTimeout(pending.timeout);
+		this.pending.delete(id);
+		pending.reject(error instanceof Error ? error : new Error(String(error)));
 	}
 
 	private handleFrame(frame: PrivateFrame<DaemonWorkerFrameHeader>): void {
