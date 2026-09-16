@@ -122,8 +122,16 @@ path; Agents View also attempts recovery. If the coordinator died after PREPARE,
 may arrive and clients reach the bounded fallback. Preserve the manifest and follow the recovery procedure rather than replaying work.
 A failed preparation resets the supervisor phase. Direct peers can already have received an
 early update notice during preparation; if preparation then cancels without a successor,
-updated clients can time out waiting for a new generation. The surviving session is intact
-and can be reopened. Same-generation reattachment after prepare cancellation is not implemented.
+updated clients can time out waiting for a new generation. Watchers sharing that transport
+can reach the same fallback. The surviving session is intact and can be reopened.
+
+Canceled-prepare reattach is intentionally NOT implemented. Cancel is not cleanly detectable
+client-side: a same-generation hello, a ready row, and even a successful attach do not prove
+cancel. The supervisor can serve a cached snapshot, raw worker attach is read-only during
+preparation, and asynchronous `worker_subscribe` failures are swallowed. A safe implementation
+requires a dedicated wire-level cancel signal. The bounded terminal fallback is retained as
+the safe behavior. Revisit this only if the protocol gains that signal; same-generation
+probes must not consume the separate 120-second post-successor restoration budget.
 
 Bootstrap: the first install still retires the unfixed `39ae91e6` daemon. Its already-attached
 old clients can still go terminal on that cutover. Do not promise first-install seamlessness.
