@@ -551,7 +551,7 @@ export async function runShutdownAll(json: boolean, force: boolean): Promise<voi
 		case "none":
 			break;
 	}
-	const admission = await acquireDaemonShutdownAdmission();
+	const admission = await acquireDaemonShutdownAdmission(Infinity);
 	try {
 		await runShutdownAllConverging(json, force, () => admission.assertOrRenew());
 	} finally {

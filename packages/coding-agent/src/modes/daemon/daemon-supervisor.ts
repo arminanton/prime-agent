@@ -134,6 +134,7 @@ import {
 	isDaemonShutdownAdmissionActive,
 	waitForDaemonStartupFence,
 } from "./daemon-supervisor-ownership.js";
+import { defaultWorkerDescriptorDir, descriptorKey, isDaemonWorkerDescriptor } from "./daemon-worker-descriptors.js";
 import {
 	DaemonWorkerAuthenticationError,
 	DaemonWorkerClient,
@@ -586,33 +587,6 @@ function isSessionSummary(value: unknown): value is SessionSummary {
 	);
 }
 
-function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is DaemonWorkerDescriptor {
-	if (!value || typeof value !== "object") {
-		return false;
-	}
-	const descriptor = value as Partial<DaemonWorkerDescriptor>;
-	return (
-		(descriptor.version === 1 || descriptor.version === 2) &&
-		typeof descriptor.supervisorSocketPath === "string" &&
-		normalizeSocketPath(descriptor.supervisorSocketPath) === socketPath &&
-		typeof descriptor.workerId === "string" &&
-		Number.isInteger(descriptor.pid) &&
-		(descriptor.pid ?? 0) > 0 &&
-		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string") &&
-		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
-		typeof descriptor.socketPath === "string" &&
-		typeof descriptor.authenticationToken === "string" &&
-		(descriptor.workerInstanceId === undefined || typeof descriptor.workerInstanceId === "string") &&
-		typeof descriptor.rootActiveSessionId === "string" &&
-		typeof descriptor.createdAt === "string" &&
-		typeof descriptor.updatedAt === "string" &&
-		Number.isInteger(descriptor.consecutiveFailures) &&
-		descriptor.createCommand !== undefined &&
-		typeof descriptor.createCommand === "object" &&
-		descriptor.createCommand.type === "create"
-	);
-}
-
 class PreRosterWorkerError extends Error {}
 
 function workerAuthAdvertisesRoster(data: unknown): boolean {
@@ -680,13 +654,6 @@ function sortCronJobs(jobs: AgentCronJob[]): AgentCronJob[] {
 	});
 }
 
-function descriptorKey(socketPath: string): string {
-	return createHash("sha256").update(normalizeSocketPath(socketPath)).digest("hex").slice(0, 12);
-}
-
-function defaultWorkerDescriptorDir(agentDir: string, socketPath: string): string {
-	return join(agentDir, "daemon-workers", descriptorKey(socketPath));
-}
 
 export function idleEvictionSweepIntervalMs(idleEvictionMinutes: IdleEvictionMinutes): number {
 	if (idleEvictionMinutes === "off") return IDLE_EVICTION_MAX_SWEEP_INTERVAL_MS;

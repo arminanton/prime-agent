@@ -6,6 +6,7 @@ import lockfile from "proper-lockfile";
 import { getProcessStartId } from "../../core/session-lease.js";
 import { writeFileAtomicSync } from "../../utils/atomic-file.js";
 import { isProcessAlive, isZombieProcess, processIdExists } from "../../utils/child-process.js";
+import { settleWithinBudget } from "../../utils/settle-within-budget.js";
 import { defaultDaemonSocketDir, normalizeSocketPath } from "./daemon-socket.js";
 
 const DAEMON_SUPERVISOR_REGISTRY_DIR_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
@@ -59,7 +60,22 @@ interface DaemonSupervisorOwnerScope {
 	descriptorDir: string;
 }
 
-interface DaemonStartupFenceRecord extends ProcessIdentity {
+export interface DaemonStartupFenceIdentity {
+	pid: number;
+	processStartId: string;
+	ownerToken: string;
+	supervisorGeneration: string;
+	socketPath: string;
+}
+
+export class DaemonStartupFenceTimeoutError extends Error {
+	constructor(readonly fence: DaemonStartupFenceIdentity) {
+		super(`Timed out waiting for predecessor daemon process ${fence.pid} to exit`);
+		this.name = "DaemonStartupFenceTimeoutError";
+	}
+}
+
+interface DaemonStartupFenceRecord extends DaemonStartupFenceIdentity {
 	version: 1;
 	token: string;
 	ownerToken: string;
@@ -111,7 +127,7 @@ class DaemonSupervisorOwnershipLostError extends Error {
 	}
 }
 
-class DaemonShutdownAdmissionError extends Error {
+export class DaemonShutdownAdmissionError extends Error {
 	readonly code = "daemon_shutdown_in_progress" as const;
 
 	constructor(message = "Daemon shutdown is in progress") {
@@ -347,11 +363,13 @@ function readLegacyOwnersForSocket(
 		});
 }
 
-async function withDaemonSupervisorRegistryGuard<T>(registryDir: string, action: () => T | Promise<T>): Promise<T> {
+async function withDaemonSupervisorRegistryGuard<T>(
+	registryDir: string, action: () => T | Promise<T>, timeoutMs = REGISTRY_LOCK_STALE_MS + 1_000,
+): Promise<T> {
 	mkdirSync(registryDir, { recursive: true, mode: 0o700 });
 	const guardPath = resolve(registryDir, ".guard");
 	let compromisedError: Error | undefined;
-	const release = await lockfile.lock(registryDir, {
+	const acquiring = lockfile.lock(registryDir, {
 		realpath: false,
 		lockfilePath: guardPath,
 		stale: REGISTRY_LOCK_STALE_MS,
@@ -366,6 +384,13 @@ async function withDaemonSupervisorRegistryGuard<T>(registryDir: string, action:
 			maxTimeout: REGISTRY_LOCK_RETRY_MS,
 		},
 	});
+	const acquisition = await settleWithinBudget("registry guard acquisition", timeoutMs, acquiring);
+	if (!acquisition.ok) {
+		// A late lease is released, never used to perform the canceled action.
+		void acquiring.then((release) => release()).catch(() => undefined);
+		throw acquisition.error;
+	}
+	const release = acquisition.value;
 	// Compromise detection is timer-driven and cannot preempt a synchronous stall: a stalled action's
 	// writes may already be on disk when a successor reclaims the stale guard. The guard directory's
 	// inode is the ownership identity (a steal is rmdir+mkdir), checked synchronously where the timer
@@ -397,10 +422,9 @@ async function withDaemonSupervisorRegistryGuard<T>(registryDir: string, action:
 		assertGuardHeld();
 		return result;
 	} finally {
-		if (compromisedError) {
-			await release().catch(() => undefined);
-		} else if (!guardStolen()) {
-			await release();
+		if (compromisedError || !guardStolen()) {
+			const released = await settleWithinBudget("registry guard release", 1000, release);
+			if (!released.ok && !compromisedError) throw released.error;
 		}
 		// A stolen-but-undetected guard is never released: that would delete the successor's lock.
 		// The abandoned updater notices the foreign mtime on its next tick and cleans itself up.
@@ -557,31 +581,32 @@ export async function assertDaemonSupervisorOwnerCurrent(
 	return fingerprint;
 }
 
-export async function acquireDaemonShutdownAdmission(): Promise<DaemonShutdownAdmission> {
+export async function acquireDaemonShutdownAdmission(timeoutMs = 60_000): Promise<DaemonShutdownAdmission> {
 	const registryDir = defaultDaemonSupervisorRegistryDir();
 	const processStartId = getProcessStartId(process.pid);
+	const deadline = Date.now() + timeoutMs;
+	let holderPid: number | undefined;
+	const timedOut = () => new DaemonShutdownAdmissionError(`Timed out waiting for shutdown admission held by pid ${holderPid ?? "unknown"}`);
 	while (true) {
+		if (Date.now() >= deadline) throw timedOut();
 		let acquired: DaemonShutdownAdmissionRecord | undefined;
 		await withDaemonSupervisorRegistryGuard(registryDir, () => {
-			if (readActiveShutdownAdmission(registryDir)) {
-				return;
-			}
+			if (Date.now() >= deadline) throw timedOut();
+			const holder = readActiveShutdownAdmission(registryDir);
+			if (holder) { holderPid = holder.pid; return; }
 			const now = Date.now();
 			acquired = {
-				version: OWNER_VERSION,
-				token: randomUUID(),
-				pid: process.pid,
+				version: OWNER_VERSION, token: randomUUID(), pid: process.pid,
 				...(processStartId ? { processStartId } : {}),
-				createdAt: new Date(now).toISOString(),
-				updatedAt: new Date(now).toISOString(),
+				createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString(),
 				expiresAt: new Date(now + SHUTDOWN_ADMISSION_LEASE_MS).toISOString(),
 			};
 			writeJsonAtomically(shutdownAdmissionPath(registryDir), acquired);
-		});
-		if (acquired) {
-			return new DaemonShutdownAdmission(acquired, registryDir);
-		}
-		await delay(SHUTDOWN_ADMISSION_WAIT_MS);
+		}, Math.min(REGISTRY_LOCK_STALE_MS + 1000, deadline - Date.now()));
+		if (acquired) return new DaemonShutdownAdmission(acquired, registryDir);
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) throw timedOut();
+		await delay(Math.min(SHUTDOWN_ADMISSION_WAIT_MS, remaining));
 	}
 }
 
@@ -689,7 +714,7 @@ export async function waitForDaemonStartupFence(
 			continue;
 		}
 		if (Date.now() >= deadline) {
-			throw new Error(`Timed out waiting for predecessor daemon process ${fence.pid} to exit`);
+			throw new DaemonStartupFenceTimeoutError(fence);
 		}
 		await delay(STARTUP_FENCE_POLL_MS);
 	}

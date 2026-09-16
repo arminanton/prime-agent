@@ -22,7 +22,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
-import { spawnHidden } from "../utils/child-process.js";
+import { isProcessAlive, spawnHidden } from "../utils/child-process.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
@@ -53,7 +53,7 @@ function logDaemonLaunch(message: string): void {
 	appendRotatingLog(getClientErrorLogPath(), `[${new Date().toISOString()}] daemon-launch: ${message}`);
 }
 
-async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promise<boolean> {
+export async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promise<boolean> {
 	const client = new DaemonClient(socketPath);
 	try {
 		await client.connect(timeoutMs);
@@ -185,15 +185,11 @@ interface DaemonProcessIdentity {
 
 const PROCESS_START_ID_POLL_INTERVAL_MS = 1000;
 
-function hasProcessIdentityExited(identity: DaemonProcessIdentity | undefined, verifyProcessStartId = true): boolean {
+export function hasProcessIdentityExited(identity: DaemonProcessIdentity | undefined, verifyProcessStartId = true): boolean {
 	if (!identity) {
 		return true;
 	}
-	try {
-		process.kill(identity.pid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "ESRCH";
-	}
+	if (!isProcessAlive(identity.pid)) return true; // Includes zombies; EPERM stays alive.
 	if (!identity.processStartId || !verifyProcessStartId) {
 		return false;
 	}
@@ -250,6 +246,15 @@ export async function shutdownConnectedDaemonAndWait(
 	timeoutMs = 5000,
 	hello: DaemonHello | undefined = client.hello,
 ): Promise<boolean> {
+	return (await requestDaemonShutdownAndWait(client, socketPath, timeoutMs, hello)).stopped;
+}
+
+export async function requestDaemonShutdownAndWait(
+	client: DaemonClient,
+	socketPath: string,
+	timeoutMs = 5000,
+	hello: DaemonHello | undefined = client.hello,
+): Promise<{ stopped: boolean; shutdownAccepted: boolean }> {
 	let shutdownAccepted = false;
 	const expectedIdentity = processIdentityFromDaemonHello(hello);
 	try {
@@ -260,7 +265,7 @@ export async function shutdownConnectedDaemonAndWait(
 	} finally {
 		client.close();
 	}
-	return waitForDaemonGone(socketPath, timeoutMs, shutdownAccepted, expectedIdentity);
+	return { stopped: await waitForDaemonGone(socketPath, timeoutMs, shutdownAccepted, expectedIdentity), shutdownAccepted };
 }
 
 export async function shutdownDaemonAndWait(socketPath: string, timeoutMs = 5000): Promise<boolean> {
