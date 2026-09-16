@@ -1,6 +1,7 @@
 import type { ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { rm as removePath } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -59,7 +60,7 @@ import {
 	signalProcessGroupOrProcess,
 	spawnHidden,
 } from "../../utils/child-process.js";
-import { settleWithinBudget } from "../../utils/settle-within-budget.js";
+import { type SettleResult, settleWithinBudget } from "../../utils/settle-within-budget.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
@@ -107,6 +108,7 @@ import {
 	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
+import { closeDaemonTransport } from "./daemon-transport-close.js";
 import { matchesSessionIdSuffix } from "./daemon-session-id.js";
 import {
 	classifySessionRosterStatus,
@@ -232,6 +234,15 @@ const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
 const STOP_FINALIZATION_RETRY_MS = 5000;
 const SUPERVISOR_SHUTDOWN_ARCHIVE_BUDGET_MS = 5_000;
 const SUPERVISOR_SHUTDOWN_SCHEDULE_CANCEL_BUDGET_MS = 5_000;
+// The sequential stage ceilings total 42s, below the 45s backstop and 70s
+// coordinator retirement fence. Archive/cancel ceilings sit inside worker stop.
+const SUPERVISOR_SHUTDOWN_HARD_EXIT_MS = 45_000;
+const SUPERVISOR_SHUTDOWN_IDLE_SWEEP_BUDGET_MS = 5_000;
+const SUPERVISOR_SHUTDOWN_WORKER_STOP_BUDGET_MS = 20_000;
+const SUPERVISOR_SHUTDOWN_TRANSPORT_DISPOSE_BUDGET_MS = 2_000;
+const SUPERVISOR_SHUTDOWN_CATALOG_STOP_BUDGET_MS = 2_000;
+const SUPERVISOR_SHUTDOWN_CACHE_BUDGET_MS = 1_000;
+const SUPERVISOR_SHUTDOWN_CLEANUP_STEP_BUDGET_MS = 5_000;
 const STALE_RECLAIM_WAIT_MS = 10_000;
 // Polling loops probe existence cheaply via kill(0); the ps-backed zombie and
 // identity checks are throttled so a wedged worker cannot saturate the
@@ -726,6 +737,11 @@ export class DaemonSupervisor {
 	private socketLeaseCompromise?: Error;
 	private ownership?: Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>>;
 	private cleanupPromise?: Promise<void>;
+	private shutdownPromise?: Promise<never>;
+	private shutdownHardExitTimer?: ReturnType<typeof setTimeout>;
+	private idleEvictionDrainPromise?: Promise<void>;
+	private transportClosePromise?: Promise<void>;
+	private transportClosing = false;
 	private shuttingDown = false;
 	private startupComplete = false;
 	private updateRestartPhase?: "draining" | "fencing" | "prepared";
@@ -1475,6 +1491,7 @@ export class DaemonSupervisor {
 	}
 
 	private handleConnection(socket: Socket): void {
+		if (this.transportClosing) { socket.destroy(); return; }
 		const client: DaemonSocketClient = {
 			id: createActiveSessionId(),
 			socket,
@@ -6400,6 +6417,7 @@ export class DaemonSupervisor {
 	}
 
 	private catchUpClient(client: DaemonSocketClient): Promise<void> {
+		if (this.transportClosing) return Promise.resolve();
 		if (client.catchupPromise) {
 			return client.catchupPromise;
 		}
@@ -6409,7 +6427,7 @@ export class DaemonSupervisor {
 		const catchup = this.drainClientCatchupQueue(client)
 			.catch((error) => {
 				this.log(`Failed to catch up client ${client.id}: ${String(error)}`);
-				if (client.socket.destroyed || !client.catchupActiveSessionIds?.size) return;
+				if (this.transportClosing || client.socket.destroyed || !client.catchupActiveSessionIds?.size) return;
 				client.catchupRetryTimer = setTimeout(() => {
 					client.catchupRetryTimer = undefined;
 					void this.catchUpClient(client);
@@ -6427,6 +6445,7 @@ export class DaemonSupervisor {
 
 	private async drainClientCatchupQueue(client: DaemonSocketClient): Promise<void> {
 		while (
+			!this.transportClosing &&
 			!client.socket.destroyed &&
 			!client.snapshotStreaming &&
 			!client.backpressured &&
@@ -6437,7 +6456,7 @@ export class DaemonSupervisor {
 	}
 
 	private async drainClientCatchups(client: DaemonSocketClient): Promise<void> {
-		if (client.socket.destroyed) {
+		if (this.transportClosing || client.socket.destroyed) {
 			return;
 		}
 		const pending = [...(client.catchupActiveSessionIds ?? [])].map((activeSessionId) => ({
@@ -6946,7 +6965,13 @@ export class DaemonSupervisor {
 			);
 		}
 		if (directChild) {
-			await directChild.closed;
+			const closed = await settleWithinBudget("worker child close", 1000, directChild.closed);
+			if (!closed.ok) {
+				directChild.child.stdin?.destroy();
+				directChild.child.stdout?.destroy();
+				directChild.child.stderr?.destroy();
+				throw closed.error;
+			}
 		}
 		assertStopStillApplies();
 		if (removeDescriptor && worker.descriptor.archiveOnStop) {
@@ -7253,7 +7278,11 @@ export class DaemonSupervisor {
 			signals.push("SIGHUP");
 		}
 		for (const signal of signals) {
-			const handler = () => void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143, false);
+			const handler = () => {
+				const exitCode = signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143;
+				if (this.shuttingDown) return this.emergencyExit(exitCode, `received ${signal} during shutdown`);
+				void this.shutdown(exitCode, false);
+			};
 			process.on(signal, handler);
 			this.signalCleanupHandlers.push(() => process.off(signal, handler));
 		}
@@ -7277,15 +7306,7 @@ export class DaemonSupervisor {
 	}
 
 	private fenceSupervisorSocket(): void {
-		try {
-			this.server?.close();
-		} catch {
-			// The server may already be closed by a concurrent shutdown.
-		}
-		for (const client of this.clients) {
-			client.detachInput();
-			client.socket.destroy();
-		}
+		void this.closeTransportBounded();
 	}
 
 	private handleSocketLeaseCompromised(error: Error): void {
@@ -7315,12 +7336,38 @@ export class DaemonSupervisor {
 		cleanupDaemonSocketPath(this.socketPath, identity, this.socketLease);
 	}
 
-	private async cleanupSupervisorResources(): Promise<void> {
-		if (this.cleanupPromise) {
-			return this.cleanupPromise;
-		}
-		this.cleanupPromise = this.cleanupSupervisorResourcesOnce();
+	private cleanupSupervisorResources(fromShutdown = false): Promise<void> {
+		// A concurrent startup/lease failure joins the shutdown owner. It must
+		// not release ownership while that owner is still retiring workers.
+		if (this.shutdownPromise && !fromShutdown) return this.shutdownPromise.then(() => undefined);
+		if (this.cleanupPromise) return this.cleanupPromise;
+		const ownsBackstop = this.shutdownHardExitTimer === undefined;
+		if (ownsBackstop) this.armShutdownHardExit(1);
+		this.cleanupPromise = Promise.resolve().then(() => this.cleanupSupervisorResourcesOnce()).finally(() => {
+			if (ownsBackstop && !this.shutdownPromise) this.clearShutdownHardExit();
+		});
 		return this.cleanupPromise;
+	}
+
+	private drainIdleEvictionSweep(): Promise<void> {
+		this.idleEvictionDrainPromise ??= this.shutdownStage(
+			"idle eviction sweep", SUPERVISOR_SHUTDOWN_IDLE_SWEEP_BUDGET_MS, this.idleEvictionSweep ?? Promise.resolve(),
+		).then(() => undefined);
+		return this.idleEvictionDrainPromise;
+	}
+
+	private closeTransportBounded(): Promise<void> {
+		if (this.transportClosePromise) return this.transportClosePromise;
+		this.transportClosing = true;
+		const server = this.server;
+		this.server = undefined;
+		let finish!: () => void;
+		this.transportClosePromise = new Promise<void>((resolveClose) => { finish = resolveClose; });
+		void closeDaemonTransport(server, [...this.clients], (label, error) => this.reportCleanupFailure(label, error))
+			.then((result) => this.logShutdownStage("server close", result))
+			.catch((error) => this.reportCleanupFailure("daemon transport", error))
+			.finally(finish);
+		return this.transportClosePromise;
 	}
 
 	private async cleanupSupervisorResourcesOnce(): Promise<void> {
@@ -7328,69 +7375,48 @@ export class DaemonSupervisor {
 		this.clearIdleEvictionTimer();
 		this.clearScheduledWakeTimer();
 		this.clearRosterWatchdogTimer();
-		await this.idleEvictionSweep?.catch(() => undefined);
+		await this.drainIdleEvictionSweep();
 		for (const cleanup of this.signalCleanupHandlers.splice(0)) {
-			await this.runCleanupStep("signal handler", cleanup);
+			try { cleanup(); } catch (error) { this.reportCleanupFailure("signal handler", error); }
 		}
-		const server = this.server;
-		this.server = undefined;
-		const serverClosed = new Promise<void>((resolveClose) => {
-			if (!server?.listening) {
-				resolveClose();
-				return;
-			}
-			try {
-				server.close(() => resolveClose());
-			} catch (error) {
-				this.reportCleanupFailure("daemon server", error);
-				resolveClose();
-			}
-		});
-		for (const client of this.clients) {
-			client.attachedActiveSessionIds.clear();
-			await this.runCleanupStep(`daemon client input ${client.id}`, () => client.detachInput());
-			await this.runCleanupStep(`daemon client socket ${client.id}`, () => {
-				client.socket.destroy();
-			});
-		}
-		this.clients.clear();
-		for (const worker of this.workers.values()) {
-			if (worker.ownerCleanupTimer) {
-				clearTimeout(worker.ownerCleanupTimer);
-				worker.ownerCleanupTimer = undefined;
-			}
-			await this.runCleanupStep(`worker client ${worker.descriptor.workerId}`, () => worker.client?.close());
-			worker.client = undefined;
-			const transcripts = new Set(worker.transcriptCaches.values());
-			for (const generations of worker.snapshotGenerations?.values() ?? []) {
-				for (const generation of generations.values()) {
-					transcripts.add(generation.transcript);
-					this.settleSnapshotDuplicateValidation(
-						generation,
-						new Error("Daemon supervisor stopped during snapshot transfer"),
-					);
-					if (!generation.transcript.complete) {
-						generation.transcript.markFailed(new Error("Daemon supervisor stopped during snapshot transfer"));
+		await this.shutdownStage("worker transport disposal", SUPERVISOR_SHUTDOWN_TRANSPORT_DISPOSE_BUDGET_MS, Promise.all(
+			[...this.workers.values()].map(async (worker) => {
+				if (worker.ownerCleanupTimer) {
+					clearTimeout(worker.ownerCleanupTimer);
+					worker.ownerCleanupTimer = undefined;
+				}
+				await this.runCleanupStep(`worker client ${worker.descriptor.workerId}`, () => worker.client?.close());
+				worker.client = undefined;
+				const transcripts = new Set(worker.transcriptCaches.values());
+				for (const generations of worker.snapshotGenerations?.values() ?? []) {
+					for (const generation of generations.values()) {
+						transcripts.add(generation.transcript);
+						this.settleSnapshotDuplicateValidation(generation, new Error("Daemon supervisor stopped during snapshot transfer"));
+						if (!generation.transcript.complete) {
+							generation.transcript.markFailed(new Error("Daemon supervisor stopped during snapshot transfer"));
+						}
 					}
 				}
-			}
-			for (const transcript of transcripts) {
-				await this.runCleanupStep(`worker transcript ${worker.descriptor.workerId}`, () => transcript.dispose());
-			}
-			worker.transcriptCaches.clear();
-			worker.snapshotGenerations?.clear();
-			worker.snapshotCache.clear();
-			worker.snapshotLoads.clear();
-		}
+				for (const transcript of transcripts) {
+					await this.runCleanupStep(`worker transcript ${worker.descriptor.workerId}`, () => transcript.dispose());
+				}
+				worker.transcriptCaches.clear();
+				worker.snapshotGenerations?.clear();
+				worker.snapshotCache.clear();
+				worker.snapshotLoads.clear();
+			}),
+		));
 		this.workers.clear();
 		this.openingWorkers.clear();
 		this.catalogOpeningWorkers.clear();
-		await this.runCleanupStep("daemon catalog", () => this.catalog.stop());
-		await this.runCleanupStep("daemon server", () => serverClosed);
-		await this.runCleanupStep("daemon socket", () => this.cleanupSocket());
-		await this.runCleanupStep("supervisor cache", () => {
-			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
-		});
+		await this.shutdownStage("catalog stop", SUPERVISOR_SHUTDOWN_CATALOG_STOP_BUDGET_MS,
+			() => this.catalog.stop(SUPERVISOR_SHUTDOWN_CATALOG_STOP_BUDGET_MS));
+		await this.closeTransportBounded();
+		this.clients.clear();
+		try { this.cleanupSocket(); } catch (error) { this.reportCleanupFailure("daemon socket", error); }
+		const cacheRoot = this.snapshotCacheRoot;
+		await this.runCleanupStep("supervisor cache", () => removePath(cacheRoot, { recursive: true, force: true }),
+			SUPERVISOR_SHUTDOWN_CACHE_BUDGET_MS);
 		const lease = this.socketLease;
 		this.socketLease = undefined;
 		await this.runCleanupStep("daemon socket lock", async () => lease?.release());
@@ -7399,12 +7425,43 @@ export class DaemonSupervisor {
 		await this.runCleanupStep("daemon ownership", async () => ownership?.release());
 	}
 
-	private async runCleanupStep(label: string, action: () => void | Promise<void>): Promise<void> {
+	private async runCleanupStep(
+		label: string, action: () => void | Promise<void>, budgetMs = SUPERVISOR_SHUTDOWN_CLEANUP_STEP_BUDGET_MS,
+	): Promise<void> {
+		const result = await this.shutdownStage(label, budgetMs, action);
+		if (!result.ok) this.reportCleanupFailure(label, result.error);
+	}
+
+	private async shutdownStage<T>(
+		stage: string, budgetMs: number, work: Promise<T> | (() => T | Promise<T>),
+	): Promise<SettleResult<T>> {
+		const result = await settleWithinBudget(stage, budgetMs, work);
+		this.logShutdownStage(stage, result);
+		return result;
+	}
+
+	private logShutdownStage(stage: string, result: SettleResult<unknown>): void {
 		try {
-			await action();
-		} catch (error) {
-			this.reportCleanupFailure(label, error);
-		}
+			this.log(`shutdown stage ${stage}: ${result.ok ? "ok" : result.timedOut ? "TIMED OUT" : "failed"} after ${Math.round(result.elapsedMs)} ms`);
+		} catch (error) { this.reportCleanupFailure(`shutdown stage log ${stage}`, error); }
+	}
+
+	private armShutdownHardExit(exitCode: number): void {
+		if (this.shutdownHardExitTimer) return;
+		this.shutdownHardExitTimer = setTimeout(() => this.emergencyExit(exitCode, "45s hard-exit timer"), SUPERVISOR_SHUTDOWN_HARD_EXIT_MS);
+		this.shutdownHardExitTimer.unref();
+	}
+
+	private clearShutdownHardExit(): void {
+		clearTimeout(this.shutdownHardExitTimer);
+		this.shutdownHardExitTimer = undefined;
+	}
+
+	private emergencyExit(exitCode: number, why: string): never {
+		try { this.log(`shutdown hard exit: ${why}`); } catch { /* Exit must not depend on logging. */ }
+		try { this.cleanupSocket(); } catch { /* Identity-safe best effort only. */ }
+		this.clearShutdownHardExit();
+		return process.exit(exitCode);
 	}
 
 	private reportCleanupFailure(label: string, error: unknown): void {
@@ -7416,68 +7473,72 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async shutdown(
+	private shutdown(
 		exitCode: number,
 		stopWorkers: boolean,
 		relaunch = false,
 		forceWorkers = false,
 		closingReason?: DaemonClosingReason,
 	): Promise<never> {
-		if (this.shuttingDown) {
-			process.exit(exitCode);
+		if (this.shutdownPromise) {
+			if (forceWorkers) this.emergencyExit(exitCode, "repeated forced shutdown");
+			return this.shutdownPromise;
 		}
 		this.shuttingDown = true;
-		this.clearIdleEvictionTimer();
-		this.clearScheduledWakeTimer();
-		this.clearRosterWatchdogTimer();
-		await this.idleEvictionSweep?.catch(() => undefined);
-		if (closingReason) {
-			for (const client of this.clients) {
-				this.write(client, { type: "daemon_closing", reason: closingReason });
+		this.armShutdownHardExit(exitCode);
+		const cleanup = this.cleanupPromise;
+		this.shutdownPromise = Promise.resolve().then(async () => {
+			if (cleanup) {
+				await cleanup;
+				this.clearShutdownHardExit();
+				return process.exit(exitCode);
 			}
-		}
-		for (const cleanup of this.signalCleanupHandlers) {
-			cleanup();
-		}
-		if (stopWorkers) {
-			await Promise.all(
-				[...this.workers.values()].map(async (worker) => {
-					try {
-						await this.stopWorker(worker, true, forceWorkers, true);
-					} catch (error) {
-						this.reportCleanupFailure(
-							`worker ${worker.descriptor.workerId} (tombstone retained for recovery after shutdown)`,
-							error,
-						);
-					}
-				}),
-			);
-			if (!this.hasPersistedWorkerDescriptors()) {
-				rmSync(this.supervisorConfigPath, { force: true });
-			}
-		} else {
-			for (const worker of this.workers.values()) {
-				worker.intentionalStop = true;
-				worker.client?.close();
-				worker.client = undefined;
-			}
-		}
-		await this.catalog.stop();
-		for (const client of this.clients) {
-			client.detachInput();
-			client.socket.end();
-		}
-		await new Promise<void>((resolveClose) => this.server?.close(() => resolveClose()) ?? resolveClose());
-		await this.runCleanupStep("daemon socket", () => this.cleanupSocket());
-		await this.runCleanupStep("supervisor cache", () => {
-			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
+			return this.shutdownOnce(exitCode, stopWorkers, relaunch, forceWorkers, closingReason);
+		}).catch((error) => {
+			this.reportCleanupFailure("daemon shutdown", error);
+			return this.emergencyExit(exitCode, "shutdown threw");
 		});
-		const lease = this.socketLease;
-		this.socketLease = undefined;
-		await this.runCleanupStep("daemon socket lock", async () => lease?.release());
-		const ownership = this.ownership;
-		this.ownership = undefined;
-		await this.runCleanupStep("daemon ownership", async () => ownership?.release());
+		return this.shutdownPromise;
+	}
+
+	private async shutdownOnce(
+		exitCode: number, stopWorkers: boolean, relaunch: boolean, forceWorkers: boolean, closingReason?: DaemonClosingReason,
+	): Promise<never> {
+		try {
+			this.clearIdleEvictionTimer();
+			this.clearScheduledWakeTimer();
+			this.clearRosterWatchdogTimer();
+			await this.drainIdleEvictionSweep();
+			if (closingReason) {
+				for (const client of this.clients) {
+					try { this.write(client, { type: "daemon_closing", reason: closingReason }); }
+					catch (error) { this.reportCleanupFailure("daemon closing notice", error); }
+				}
+			}
+			if (stopWorkers) {
+				// Every prepared participant belongs to the saved manifest. Neither
+				// archive nor descriptor removal (including ephemeral cron cancel)
+				// is allowed to turn that preservation stop into terminal deletion.
+				const terminalStop = this.updateRestartPhase !== "prepared";
+				await this.shutdownStage("worker stop", SUPERVISOR_SHUTDOWN_WORKER_STOP_BUDGET_MS, Promise.all(
+					[...this.workers.values()].map(async (worker) => {
+						try { await this.stopWorker(worker, terminalStop, forceWorkers, terminalStop); }
+						catch (error) {
+							this.reportCleanupFailure(`worker ${worker.descriptor.workerId} (tombstone retained for recovery after shutdown)`, error);
+						}
+					}),
+				));
+				if (!this.hasPersistedWorkerDescriptors()) rmSync(this.supervisorConfigPath, { force: true });
+			} else {
+				for (const worker of this.workers.values()) worker.intentionalStop = true;
+			}
+		} catch (error) {
+			this.reportCleanupFailure("daemon shutdown workers", error);
+		} finally {
+			// Covers the worker stop phase as well as the final transport. A thrown
+			// stop, catalog or cache failure can never strand a void shutdown call.
+			await this.cleanupSupervisorResources(true);
+		}
 		if (relaunch) {
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", this.socketPath]);
 			const environment = createCliSubprocessEnv();
@@ -7498,6 +7559,8 @@ export class DaemonSupervisor {
 			});
 			replacement.unref();
 		}
-		process.exit(exitCode);
+		this.clearShutdownHardExit();
+		return process.exit(exitCode);
 	}
+
 }

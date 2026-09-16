@@ -55,6 +55,16 @@ export interface DaemonSocketClient {
 	capabilitiesByActiveSessionId?: Map<string, Set<DaemonClientCapability>>;
 }
 
+export function abortClientSnapshotStreaming(client: DaemonSocketClient, activeSessionId?: string): void {
+	if (activeSessionId) {
+		client.snapshotTransferAbortControllers?.get(activeSessionId)?.abort();
+		return;
+	}
+	for (const controller of client.snapshotTransferAbortControllers?.values() ?? []) {
+		controller.abort();
+	}
+}
+
 export interface ActiveSessionState {
 	activeSessionId: string;
 	runtime: AgentSessionRuntime;

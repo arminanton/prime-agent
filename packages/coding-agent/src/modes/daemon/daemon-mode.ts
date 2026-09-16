@@ -130,6 +130,7 @@ import { initTheme } from "../interactive/theme/theme.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../session-worker/private-framing.js";
 import {
+	abortClientSnapshotStreaming,
 	type ActiveSessionState,
 	AmbiguousActiveSessionError,
 	createActiveSessionId,
@@ -8160,16 +8161,6 @@ export function markClientSnapshotStreaming(client: DaemonSocketClient, activeSe
 		client.snapshotTransferAbortControllers.set(activeSessionId, controller);
 	}
 	return controller.signal;
-}
-
-function abortClientSnapshotStreaming(client: DaemonSocketClient, activeSessionId?: string): void {
-	if (activeSessionId) {
-		client.snapshotTransferAbortControllers?.get(activeSessionId)?.abort();
-		return;
-	}
-	for (const controller of client.snapshotTransferAbortControllers?.values() ?? []) {
-		controller.abort();
-	}
 }
 
 export function finishClientSnapshotStreaming(client: DaemonSocketClient, activeSessionId: string): void {
