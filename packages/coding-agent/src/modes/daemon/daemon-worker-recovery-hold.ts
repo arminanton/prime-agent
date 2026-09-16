@@ -29,11 +29,12 @@ export function readDaemonWorkerRecoveryHold(descriptor: DaemonWorkerDescriptor)
 export function withDaemonWorkerRecoveryHold(
 	descriptor: DaemonWorkerDescriptor,
 	hold: DaemonWorkerRecoveryHold | undefined,
+	onInvalid?: (error: unknown) => void,
 ): DaemonWorkerDescriptor & { updateRestartRecoveryHold?: DaemonWorkerRecoveryHold } {
 	if (!hold) return descriptor;
 	const persisted = { ...descriptor, updateRestartRecoveryHold: hold };
-	readDaemonWorkerRecoveryHold(persisted);
-	return persisted;
+	try { readDaemonWorkerRecoveryHold(persisted); return persisted; }
+	catch (error) { onInvalid?.(error); return descriptor; }
 }
 
 export function workerRecoveryHoldMessage(hold: DaemonWorkerRecoveryHold): string {

@@ -21,6 +21,9 @@ describe("local worker recovery holds", () => {
 		expect(readDaemonWorkerRecoveryHold(persisted)).toEqual(hold());
 		expect(durableDaemonWorkerDescriptor(persisted)).not.toHaveProperty("updateRestartRecoveryHold");
 		expect(() => readDaemonWorkerRecoveryHold({ ...persisted, pid: 999 })).toThrow("does not match");
+		const diagnostic = vi.fn();
+		expect(withDaemonWorkerRecoveryHold({ ...descriptor(), pid: 999 }, hold(), diagnostic)).not.toHaveProperty("updateRestartRecoveryHold");
+		expect(diagnostic).toHaveBeenCalledTimes(1);
 	});
 
 	it("publishes PREPARE and retains evidence when an exact worker survives force stop", async () => {

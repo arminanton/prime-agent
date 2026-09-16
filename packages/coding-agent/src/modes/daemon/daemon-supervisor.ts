@@ -216,11 +216,11 @@ export const HEARTBEAT_LIST_LAUNCH_WAIT_MS = 15_000;
 export const HEARTBEAT_LIST_FORWARD_TIMEOUT_MS = 25_000;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
-const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
+export const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
 // The whole pre-commit prepare (drain + worker fencing) must finish inside the
 // caller's 120s prepare_update_restart request timeout, or roll back; otherwise
 // an abandoned prepare leaves the daemon permanently fenced with workers stopped.
-const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
+export const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
 /**
  * Upper bound on relay payloads deferred per client and session while a
@@ -1362,7 +1362,9 @@ export class DaemonSupervisor {
 				descriptor.lifecycle = "recovering";
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
 				descriptor.orphanProcessJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.orphans.jsonl`);
-				const recoveryHold = readDaemonWorkerRecoveryHold(descriptor);
+				let recoveryHold: DaemonWorkerRecoveryHold | undefined;
+				try { recoveryHold = readDaemonWorkerRecoveryHold(descriptor); }
+				catch (error) { this.reportCleanupFailure(`ignored invalid hold on worker ${descriptor.workerId}`, error); }
 				const durableDescriptor = durableDaemonWorkerDescriptor(descriptor);
 				const worker: ResidentWorker = {
 					updateRestartRecoveryHold: recoveryHold,
@@ -1448,7 +1450,8 @@ export class DaemonSupervisor {
 
 	private persistWorker(worker: ResidentWorker): void {
 		worker.descriptor.updatedAt = new Date().toISOString();
-		const persisted = withDaemonWorkerRecoveryHold(durableDaemonWorkerDescriptor(worker.descriptor), worker.updateRestartRecoveryHold);
+		const persisted = withDaemonWorkerRecoveryHold(durableDaemonWorkerDescriptor(worker.descriptor), worker.updateRestartRecoveryHold,
+			(error) => this.reportCleanupFailure(`ignored stale hold on worker ${worker.descriptor.workerId}`, error));
 		writeFileAtomicSync(worker.descriptorPath, `${JSON.stringify(persisted, null, 2)}\n`, { mode: 0o600 });
 	}
 
@@ -3283,6 +3286,7 @@ export class DaemonSupervisor {
 		// A failed spawn (e.g. EMFILE) leaves child.stdio undefined.
 		const startupGate = child.stdio?.[WORKER_STARTUP_GATE_FD];
 		const previousDescriptor = existing?.descriptor;
+		const previousRecoveryHold = existing?.updateRestartRecoveryHold;
 		const previousIntentionalStop = existing?.intentionalStop;
 		let descriptorAssigned = false;
 		let childPid: number;
@@ -3339,6 +3343,7 @@ export class DaemonSupervisor {
 			};
 			await this.assertRecoveryAllowed();
 			worker.descriptor = descriptor;
+			worker.updateRestartRecoveryHold = undefined;
 			worker.launchEnv = launchEnv;
 			worker.transientCreateCommand = descriptor.ownerClientId ? createCommand : existing?.transientCreateCommand;
 			descriptorAssigned = true;
@@ -3359,6 +3364,7 @@ export class DaemonSupervisor {
 			if (existing && descriptorAssigned && previousDescriptor) {
 				try {
 					existing.descriptor = previousDescriptor;
+					existing.updateRestartRecoveryHold = previousRecoveryHold;
 				} catch (cleanupError) {
 					this.reportCleanupFailure(`worker launch descriptor ${workerId}`, cleanupError);
 				}
@@ -3434,6 +3440,7 @@ export class DaemonSupervisor {
 					(mappedWorker === undefined || mappedWorker === existing)
 				) {
 					existing.descriptor = previousDescriptor;
+					existing.updateRestartRecoveryHold = previousRecoveryHold;
 					existing.intentionalStop = previousIntentionalStop ?? false;
 					this.workers.set(workerId, existing);
 					try {
@@ -3746,7 +3753,8 @@ export class DaemonSupervisor {
 			worker.intentionalStop = worker.descriptor.stopRequestedAt !== undefined;
 			if (worker.descriptor.lifecycle !== "failed") {
 				worker.descriptor.lifecycle = "failed";
-				this.persistWorker(worker);
+				try { this.persistWorker(worker); }
+				catch (error) { this.reportCleanupFailure(`retired recovery hold ${worker.descriptor.workerId}`, error); }
 			}
 			// Retain the annotation until preservation reclaim finishes. It also
 			// distinguishes a dead client-owned update worker from a live owner.

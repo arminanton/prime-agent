@@ -21,6 +21,9 @@ import {
 import type { AgentSessionRuntimeMetadata } from "../src/core/agent-session-runtime.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
 import type * as DaemonSocketModule from "../src/modes/daemon/daemon-socket.js";
+import * as processFacts from "../src/utils/child-process.js";
+import * as retirement from "../src/cli/daemon-update-retirement.js";
+import { DaemonStartupFenceTimeoutError, waitForDaemonStartupFence } from "../src/modes/daemon/daemon-supervisor-ownership.js";
 import {
 	handlePackageCommand,
 	prepareDaemonUpdateRestart,
@@ -119,6 +122,8 @@ interface MockDaemonRequest {
 
 type MockDaemonResponse = { success: true; data?: unknown } | { success: false; error: string };
 
+afterEach(() => { vi.restoreAllMocks(); });
+
 const mockState = vi.hoisted(() => ({
 	calls: [] as string[],
 	createActiveSessionIds: [] as string[],
@@ -161,6 +166,8 @@ const mockState = vi.hoisted(() => ({
 	successorSocketPath: undefined as string | undefined,
 	spawnExitCodes: [] as number[],
 	shutdownResult: true,
+	shutdownAccepted: true,
+	predecessorAlive: true,
 }));
 
 function useFixedOwnerHello(): void {
@@ -169,7 +176,7 @@ function useFixedOwnerHello(): void {
 		schemaId: DAEMON_SCHEMA_ID,
 		supervisorGeneration: "fixed-owner",
 		supervisorOwnerToken: "owner-token",
-		supervisorPid: process.pid,
+		supervisorPid: 1001,
 		supervisorProcessStartId: "process-start",
 		supervisorSocketPath: mockState.socketPath,
 	};
@@ -223,7 +230,8 @@ vi.mock("../src/modes/daemon/daemon-socket.js", async (importOriginal) => ({
 	defaultDaemonSocketPath: () => mockState.socketPath,
 }));
 
-vi.mock("../src/modes/daemon/daemon-supervisor-ownership.js", () => ({
+vi.mock("../src/modes/daemon/daemon-supervisor-ownership.js", async (original) => ({
+	...await original<typeof import("../src/modes/daemon/daemon-supervisor-ownership.js")>(),
 	acquireDaemonShutdownAdmission: vi.fn(async () => {
 		mockState.calls.push("acquire-daemon-shutdown-admission");
 		return {
@@ -243,7 +251,17 @@ vi.mock("../src/modes/daemon/daemon-supervisor-ownership.js", () => ({
 	}),
 }));
 
+vi.mock("../src/core/session-lease.js", async (original) => ({
+	...await original<typeof import("../src/core/session-lease.js")>(),
+	getProcessStartId: (pid: number) => pid === mockState.hello.supervisorPid ? "process-start" : "replacement-start",
+}));
+vi.mock("../src/utils/child-process.js", async (original) => ({
+	...await original<typeof import("../src/utils/child-process.js")>(),
+	isProcessAlive: vi.fn((pid: number) => pid !== 1001 || mockState.predecessorAlive),
+}));
+
 vi.mock("../src/cli/daemon-launch.js", () => ({
+	canConnectToDaemon: vi.fn(async () => mockState.daemonProbe.reachable),
 	ensureInteractiveDaemonRunning: vi.fn(async () => {
 		mockState.calls.push("ensure-daemon");
 	}),
@@ -265,12 +283,12 @@ vi.mock("../src/cli/daemon-launch.js", () => ({
 		mockState.probeSocketPaths.push(socketPath);
 		return mockState.daemonProbe;
 	}),
-	shutdownConnectedDaemonAndWait: vi.fn(async () => {
+	requestDaemonShutdownAndWait: vi.fn(async () => {
 		mockState.calls.push("shutdown-daemon");
 		if (mockState.daemonProbeAfterShutdown) {
 			mockState.daemonProbe = mockState.daemonProbeAfterShutdown;
 		}
-		return mockState.shutdownResult;
+		return { stopped: mockState.shutdownResult, shutdownAccepted: mockState.shutdownAccepted };
 	}),
 }));
 
@@ -468,6 +486,10 @@ describe("self-update daemon restart", () => {
 	}
 
 	beforeEach(() => {
+		vi.spyOn(process, "kill").mockImplementation((_pid, signal) => {
+			if (signal === 0) return true;
+			throw new Error("test forbids real process signals");
+		});
 		tempDir = join(tmpdir(), `pi-self-update-daemon-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		agentDir = join(tempDir, "agent");
 		projectDir = join(tempDir, "project");
@@ -501,6 +523,8 @@ describe("self-update daemon restart", () => {
 		mockState.restoreNextTurnFailures = 0;
 		mockState.spawnExitCodes = [];
 		mockState.shutdownResult = true;
+		mockState.shutdownAccepted = true;
+		mockState.predecessorAlive = true;
 		mkdirSync(agentDir, { recursive: true });
 		mkdirSync(join(agentDir, "daemon-update-restarts"), { recursive: true });
 		mkdirSync(projectDir, { recursive: true });
@@ -761,11 +785,9 @@ describe("self-update daemon restart", () => {
 		const statusPath = join(agentDir, "exit-race-status.json");
 		const statusWriter = new DaemonUpdateRestartStatusWriter(statusPath, "exit-race", mockState.socketPath);
 		statusWriter.update({ phase: "preparing" });
-		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
+		const killSpy = vi.spyOn(processFacts, "isProcessAlive").mockImplementation(() => {
 			statusWriter.update({ phase: "complete" });
-			const error = new Error("process exited") as NodeJS.ErrnoException;
-			error.code = "ESRCH";
-			throw error;
+			return false;
 		});
 
 		try {
@@ -819,8 +841,9 @@ describe("self-update daemon restart", () => {
 		});
 	});
 
-	it("clears the prepared manifest after fallback restoration when shutdown fails", async () => {
+	it("retains the prepared manifest and never restores into a predecessor that refuses shutdown", async () => {
 		mockState.shutdownResult = false;
+		mockState.shutdownAccepted = false;
 		mockState.prepareManifest = {
 			formatVersion: 1,
 			createdAt: "2026-07-07T00:00:00.000Z",
@@ -847,9 +870,10 @@ describe("self-update daemon restart", () => {
 
 		expect(mockState.lastCoordinatorStatus).toMatchObject({
 			phase: "failed",
-			counts: { total: 1, restored: 1, resumed: 0, failed: 0 },
+			counts: { total: 1, restored: 0, resumed: 0, failed: 0 },
 		});
-		expect(existsSync(mockState.preparedManifestPath)).toBe(false);
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
 	});
 
 	it("starts a successor when shutdown identity confirmation times out after the socket is gone", async () => {
@@ -1003,8 +1027,9 @@ describe("self-update daemon restart", () => {
 		expect(fenceIndex).toBeGreaterThan(prepareIndex);
 	});
 
-	it("recovers and clears a legacy manifest when the predecessor disconnects after persisting it", async () => {
+	it("recovers a retained legacy manifest only when the exact predecessor is confirmed dead", async () => {
 		useFixedOwnerHello();
+		mockState.predecessorAlive = false;
 		const legacyManifestPath = getLegacyDaemonUpdateRestartManifestPath(agentDir);
 		mockState.preparedManifestPath = legacyManifestPath;
 		mockState.disconnectAfterPersistRequestTypes = ["prepare_update_restart"];
@@ -1036,7 +1061,7 @@ describe("self-update daemon restart", () => {
 			phase: "complete",
 			counts: { total: 1, restored: 1, resumed: 0, failed: 0 },
 		});
-		expect(mockState.calls).toContain("persist-daemon-startup-fence");
+		expect(mockState.calls).not.toContain("persist-daemon-startup-fence");
 		expect(existsSync(legacyManifestPath)).toBe(false);
 		expect(existsSync(getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir))).toBe(false);
 	});
@@ -1075,7 +1100,7 @@ describe("self-update daemon restart", () => {
 
 		mockState.calls = [];
 		mockState.requestThrowTypes = [];
-		mockState.listResponse = { success: true, data: { sessions: [] } };
+		mockState.listResponse = { success: true, data: { sessions: [], busyClientOwnedSessionCount: 0 } };
 		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).resolves.toEqual(pendingManifest);
 		const listIndex = mockState.calls.indexOf("daemon-request:list");
 		const fenceIndex = mockState.calls.indexOf("persist-daemon-startup-fence");
@@ -1106,7 +1131,7 @@ describe("self-update daemon restart", () => {
 		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow(
 			"prepare_update_restart disconnected",
 		);
-		expect(existsSync(getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir))).toBe(false);
+		expect(existsSync(getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir))).toBe(true);
 	});
 
 	it("skips predecessor fencing when the daemon hello has no fixed-owner identity", async () => {
@@ -1498,4 +1523,50 @@ describe("self-update daemon restart", () => {
 			logSpy.mockRestore();
 		}
 	});
+	it("retains a recent manifest when PREPARE disconnects but the predecessor is still alive", async () => {
+		useFixedOwnerHello(); mockState.disconnectAfterPersistRequestTypes = ["prepare_update_restart"];
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "failed" });
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+		expect(mockState.calls).not.toContain("ensure-daemon");
+		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
+	});
+
+	it.each(["dead", "survived_sigkill"] as const)("keeps the supervisor fence contract when escalation returns %s", async (outcome) => {
+		useFixedOwnerHello(); mockState.shutdownResult = false; mockState.daemonProbeAfterShutdown = { reachable: false };
+		vi.mocked(waitForDaemonStartupFence).mockRejectedValueOnce(new DaemonStartupFenceTimeoutError({
+			pid: 1001, processStartId: "process-start", ownerToken: "owner-token", supervisorGeneration: "fixed-owner", socketPath: mockState.socketPath,
+		}));
+		const escalation = vi.spyOn(retirement, "escalateExactProcess").mockImplementation(async (identity, options) => {
+			const report = { pid: identity.pid, processStartId: identity.processStartId, signals: ["SIGTERM", "SIGKILL"], outcome, at: new Date().toISOString() };
+			options?.onProgress?.(report); return report;
+		});
+		await performUpdateAndRunCoordinator();
+		expect(escalation).toHaveBeenCalledTimes(1);
+		if (outcome === "dead") expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "complete", escalation: { outcome: "dead" } });
+		else {
+			expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "failed", message: expect.stringContaining("blocked: predecessor 1001 survived SIGKILL") });
+			expect(mockState.calls).not.toContain("ensure-daemon"); expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+		}
+	});
+
+	it("does not signal a predecessor that is still listening at the fence deadline", async () => {
+		useFixedOwnerHello(); mockState.shutdownResult = false;
+		vi.mocked(waitForDaemonStartupFence).mockRejectedValueOnce(new DaemonStartupFenceTimeoutError({
+			pid: 1001, processStartId: "process-start", ownerToken: "owner-token", supervisorGeneration: "fixed-owner", socketPath: mockState.socketPath,
+		}));
+		const escalation = vi.spyOn(retirement, "escalateExactProcess").mockRejectedValue(new Error("test forbids real process signals"));
+		await performUpdateAndRunCoordinator();
+		expect(escalation).not.toHaveBeenCalled(); expect(mockState.calls).not.toContain("ensure-daemon");
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "failed", message: expect.stringContaining("G3") });
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+	});
+
+	it("keeps the manifest when a validated successor has a partial restore failure", async () => {
+		mockState.prepareManifest = createAcceptedRecoveryManifest(); mockState.restoreActionFailures = 1;
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus?.counts.failed).toBe(1);
+		expect(existsSync(mockState.preparedManifestPath)).toBe(true);
+	});
+
 });

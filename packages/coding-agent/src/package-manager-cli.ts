@@ -5,12 +5,13 @@ import { readFileSync, rmSync, statSync } from "fs";
 import { resolve, sep } from "path";
 import { selectConfig } from "./cli/config-selector.js";
 import {
+	canConnectToDaemon,
 	ensureInteractiveDaemonRunning,
 	isDaemonSessionSummary,
 	isSessionBusy,
 	probeRunningDaemonSessions,
 	type RunningDaemonProbe,
-	shutdownConnectedDaemonAndWait,
+	requestDaemonShutdownAndWait,
 } from "./cli/daemon-launch.js";
 import {
 	confirmDaemonSessionLoss,
@@ -27,12 +28,17 @@ import {
 	DaemonUpdateRestartCoordinatorAlreadyRunningError,
 	type DaemonUpdateRestartCounts,
 	type DaemonUpdateRestartFailure,
+	type DaemonUpdateRestartEscalation,
 	type DaemonUpdateRestartProcessIdentity,
 	type DaemonUpdateRestartStatus,
 	DaemonUpdateRestartStatusWriter,
 	launchDaemonUpdateRestartCoordinator,
 	waitForActiveDaemonUpdateRestartCoordinator,
 } from "./cli/daemon-update-restart.js";
+import {
+	captureCommittedEpochWorkers, escalateCommittedEpochWorkers, escalateExactProcess, evaluatePredecessorEscalationGate,
+	type ManifestProvenance, UPDATE_RESTART_NO_ESCALATION_ENV,
+} from "./cli/daemon-update-retirement.js";
 import { getNativeUpdatePlan, NativeReleaseUnavailableError } from "./cli/native-update.js";
 import {
 	APP_NAME,
@@ -55,6 +61,7 @@ import type { AgentSessionRuntimeMetadata } from "./core/agent-session-runtime.j
 import { type CustomMessage, isSessionSlashCommand } from "./core/messages.js";
 import { DefaultPackageManager } from "./core/package-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
+import { getProcessStartId } from "./core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "./modes/daemon/daemon-client.js";
 import {
 	DAEMON_PROTOCOL_VERSION,
@@ -67,6 +74,7 @@ import {
 import { defaultDaemonSocketPath, normalizeSocketPath } from "./modes/daemon/daemon-socket.js";
 import {
 	acquireDaemonShutdownAdmission,
+	DaemonStartupFenceTimeoutError,
 	persistDaemonStartupFenceFromOwner,
 	waitForDaemonStartupFence,
 } from "./modes/daemon/daemon-supervisor-ownership.js";
@@ -74,7 +82,9 @@ import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 } from "./modes/daemon/daemon-worker-protocol.js";
-import { shouldUseWindowsShell } from "./utils/child-process.js";
+import { isProcessAlive, shouldUseWindowsShell } from "./utils/child-process.js";
+import { settleWithinBudget } from "./utils/settle-within-budget.js";
+import { scanLiveWorkerProcesses, type WorkerDescriptorInventoryEntry } from "./modes/daemon/daemon-worker-descriptors.js";
 import {
 	getLatestPiRelease,
 	isBaseVersionDowngrade,
@@ -86,6 +96,8 @@ import {
 export type PackageCommand = "install" | "remove" | "update" | "list";
 
 const UPDATE_RESTART_PREDECESSOR_FENCE_TIMEOUT_MS = 60_000;
+// Preserve the existing 100s pre-COMMIT plus 90s COMMIT and bounded stop slack.
+export const UPDATE_RESTART_PREPARE_RPC_TIMEOUT_MS = 210_000;
 
 type UpdateTarget = { type: "all" } | { type: "self" } | { type: "extensions"; source?: string };
 
@@ -865,60 +877,43 @@ function parseDaemonUpdateRestartManifest(value: unknown): DaemonUpdateRestartMa
 	if (!Array.isArray(sessions)) {
 		throw new Error("Daemon update restart response is missing sessions");
 	}
+	const discarded = value.discardedActiveSessionIds;
+	if (discarded !== undefined && (!Array.isArray(discarded) || !discarded.every((id) => typeof id === "string" && id.length > 0))) {
+		throw new Error("Daemon update restart response has invalid discarded root dispositions");
+	}
 	return {
 		formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 		createdAt: readString(value.createdAt, "createdAt"),
 		sessions: sessions.map(parseDaemonUpdateRestartSession),
+		...(discarded ? { discardedActiveSessionIds: discarded as string[] } : {}),
 	};
 }
 
 function clearPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: string): void {
-	for (const manifestPath of [
-		getDaemonUpdateRestartManifestPath(socketPath, agentDir),
-		getLegacyDaemonUpdateRestartManifestPath(agentDir),
-	]) {
-		try {
-			rmSync(manifestPath, { force: true });
-		} catch {
-			// Best effort only; the mtime guard below prevents stale fallback use.
-		}
+	// Only called after a validated successor has restored every checkpoint.
+	for (const path of [getDaemonUpdateRestartManifestPath(socketPath, agentDir), getLegacyDaemonUpdateRestartManifestPath(agentDir)]) {
+		rmSync(path, { force: true });
 	}
 }
 
-function readPreparedDaemonUpdateRestartManifest(
-	socketPath: string,
-	agentDir: string,
-	notBeforeMs?: number,
-): DaemonUpdateRestartManifest | undefined {
-	for (const manifestPath of [
-		getDaemonUpdateRestartManifestPath(socketPath, agentDir),
-		getLegacyDaemonUpdateRestartManifestPath(agentDir),
-	]) {
-		let modifiedAt: number;
-		try {
-			modifiedAt = statSync(manifestPath).mtimeMs;
-		} catch {
-			continue;
+function readPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: string): DaemonUpdateRestartManifest | undefined {
+	for (const path of [getDaemonUpdateRestartManifestPath(socketPath, agentDir), getLegacyDaemonUpdateRestartManifestPath(agentDir)]) {
+		let text: string;
+		try { text = readFileSync(path, "utf8"); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
 		}
-		if (notBeforeMs !== undefined && modifiedAt < notBeforeMs - 1000) {
-			continue;
-		}
-		const parsed = JSON.parse(readFileSync(manifestPath, "utf-8")) as unknown;
-		return parseDaemonUpdateRestartManifest(parsed);
+		return parseDaemonUpdateRestartManifest(JSON.parse(text));
 	}
 	return undefined;
 }
 
-function tryReadPreparedDaemonUpdateRestartManifest(
-	socketPath: string,
-	agentDir: string,
-): DaemonUpdateRestartManifest | undefined {
-	try {
-		return readPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
-	} catch {
-		clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
-		return undefined;
-	}
+function tryReadPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: string): DaemonUpdateRestartManifest | undefined {
+	// A live daemon may produce a fresh checkpoint, but never delete invalid
+	// evidence merely because a probe could not parse it.
+	try { return readPreparedDaemonUpdateRestartManifest(socketPath, agentDir); }
+	catch { console.error("Warning: unreadable update restart manifest retained; a fresh PREPARE is required"); return undefined; }
 }
 
 function hasRestorableDaemonUpdateRestart(manifest: DaemonUpdateRestartManifest | undefined): boolean {
@@ -954,57 +949,57 @@ function hasFixedDaemonSupervisorOwnerIdentity(value: unknown): value is FixedDa
 	);
 }
 
+interface PreparedDaemonUpdateRestart {
+	manifest: DaemonUpdateRestartManifest;
+	provenance: ManifestProvenance;
+	workers: WorkerDescriptorInventoryEntry[];
+}
+
+function isPredecessorIdentityGone(identity: FixedDaemonSupervisorOwnerIdentity): boolean {
+	if (!isProcessAlive(identity.supervisorPid)) return true;
+	const observed = getProcessStartId(identity.supervisorPid);
+	return observed !== undefined && observed !== identity.supervisorProcessStartId;
+}
+
+function assertNoUncommittedLiveWorkers(agentDir: string, socketPath: string): void {
+	const live = scanLiveWorkerProcesses(agentDir, socketPath);
+	if (live.length > 0) throw new Error(`blocked: predecessor unavailable with ${live.length} live worker process(es) and no successful PREPARE inventory; pending manifest retained`);
+}
+
 async function prepareConnectedDaemonUpdateRestart(
-	client: DaemonClient,
-	socketPath: string,
-	agentDir: string,
-	hello: DaemonHello | undefined,
-): Promise<DaemonUpdateRestartManifest> {
+	client: DaemonClient, socketPath: string, agentDir: string, hello: DaemonHello | undefined,
+): Promise<PreparedDaemonUpdateRestart> {
 	const pendingManifest = tryReadPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
-	let startedAt: number | undefined;
-	let fixedOwnerIdentity: FixedDaemonSupervisorOwnerIdentity | undefined;
+	let fixedOwnerIdentity = hasFixedDaemonSupervisorOwnerIdentity(hello) ? hello : undefined;
 	let fencePersistenceStarted = false;
 	const persistPreparedRestartFence = async () => {
-		const currentHello = client.hello;
-		if (hasFixedDaemonSupervisorOwnerIdentity(currentHello)) {
-			fixedOwnerIdentity = currentHello;
-		}
-		if (!fixedOwnerIdentity) {
-			return;
-		}
+		if (!fixedOwnerIdentity && hasFixedDaemonSupervisorOwnerIdentity(client.hello)) fixedOwnerIdentity = client.hello;
+		if (!fixedOwnerIdentity) return;
 		fencePersistenceStarted = true;
 		await persistDaemonStartupFenceFromOwner(socketPath, fixedOwnerIdentity);
 	};
 	try {
-		if (hasFixedDaemonSupervisorOwnerIdentity(hello)) {
-			fixedOwnerIdentity = hello;
-		}
 		if (pendingManifest && pendingManifest.sessions.length > 0) {
-			const listResponse = await client.request({ type: "list" }, 30000);
-			if (listResponse.success && !responseHasActiveDaemonSessions(listResponse.data)) {
+			const list = await client.request({ type: "list", includeClientOwned: true }, 30_000);
+			const busy = list.success && isRecord(list.data) ? list.data.busyClientOwnedSessionCount : undefined;
+			if (list.success && !responseHasActiveDaemonSessions(list.data) && busy === 0) {
 				await persistPreparedRestartFence();
-				return pendingManifest;
+				return { manifest: pendingManifest, provenance: "pending_manifest_idle_daemon", workers: [] };
 			}
 		}
-		clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
-		startedAt = Date.now();
-		const response = await client.request({ type: "prepare_update_restart" }, 120000);
-		if (!response.success) {
-			throw new Error(response.error);
-		}
+		// Never pre-clear recovery evidence and never infer COMMIT from file age.
+		const response = await client.request({ type: "prepare_update_restart" }, UPDATE_RESTART_PREPARE_RPC_TIMEOUT_MS);
+		if (!response.success) throw new Error(response.error);
 		const manifest = parseDaemonUpdateRestartManifest(response.data);
+		const workers = captureCommittedEpochWorkers(agentDir, socketPath, manifest);
 		await persistPreparedRestartFence();
-		return manifest;
+		return { manifest, provenance: "prepare_rpc", workers };
 	} catch (error) {
-		if (fencePersistenceStarted) {
-			throw error;
-		}
-		if (startedAt !== undefined) {
-			const fallback = readPreparedDaemonUpdateRestartManifest(socketPath, agentDir, startedAt);
-			if (fallback) {
-				await persistPreparedRestartFence();
-				return fallback;
-			}
+		if (fencePersistenceStarted) throw error;
+		if (fixedOwnerIdentity && isPredecessorIdentityGone(fixedOwnerIdentity)) {
+			assertNoUncommittedLiveWorkers(agentDir, socketPath);
+			const pending = tryReadPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
+			if (pending) return { manifest: pending, provenance: "pending_manifest_predecessor_dead", workers: [] };
 		}
 		throw error;
 	}
@@ -1021,9 +1016,10 @@ export async function prepareDaemonUpdateRestart(
 		await client.connect(1000);
 		connected = true;
 		const hello = await client.waitForHello(2000).catch(() => undefined);
-		return await prepareConnectedDaemonUpdateRestart(client, socketPath, agentDir, hello);
+		return (await prepareConnectedDaemonUpdateRestart(client, socketPath, agentDir, hello)).manifest;
 	} catch (error) {
 		if (!connected && pendingManifest && pendingManifest.sessions.length > 0) {
+			assertNoUncommittedLiveWorkers(agentDir, socketPath);
 			return pendingManifest;
 		}
 		throw error;
@@ -1143,8 +1139,9 @@ async function restoreDaemonUpdateRestartSession(
 			);
 		}
 	}
-	await restoreNextTurnMessages(client, activeSessionId, session.sessionFile, session.queue.nextTurn);
-	if (!session.shouldResume) return { restored: true, resumed: false };
+	const restoreFailures: string[] = [];
+	if (!(await restoreNextTurnMessages(client, activeSessionId, session.sessionFile, session.queue.nextTurn))) restoreFailures.push("pending context restore failed");
+	if (!session.shouldResume) return { restored: restoreFailures.length === 0, resumed: false, failureMessage: restoreFailures.join("; ") || undefined };
 
 	const needsContinuationPrompt =
 		session.wasStreaming ||
@@ -1163,6 +1160,7 @@ async function restoreDaemonUpdateRestartSession(
 		if (response.success) {
 			restoredQueuedWork = true;
 		} else {
+			restoreFailures.push(`queued action restore failed: ${response.error}`);
 			console.error(
 				chalk.yellow(`Warning: could not restore queued actions for ${session.sessionFile}: ${response.error}`),
 			);
@@ -1200,7 +1198,8 @@ async function restoreDaemonUpdateRestartSession(
 			);
 		}
 	}
-	return { restored: true, resumed: resumedSession };
+	if (session.shouldResume && !resumedSession) restoreFailures.push("interrupted session activation failed");
+	return { restored: restoreFailures.length === 0, resumed: resumedSession, failureMessage: restoreFailures.join("; ") || undefined };
 }
 
 async function restoreDaemonUpdateRestart(
@@ -1208,6 +1207,7 @@ async function restoreDaemonUpdateRestart(
 	manifest: DaemonUpdateRestartManifest,
 	restartOriginActiveSessionId?: string,
 	onProgress?: (progress: RestoreDaemonUpdateRestartResult) => void,
+	heldActiveSessionIds: ReadonlySet<string> = new Set(),
 ): Promise<RestoreDaemonUpdateRestartResult> {
 	const restoredActiveSessionIds = new Map<string, string>();
 	if (manifest.sessions.length === 0) {
@@ -1221,6 +1221,7 @@ async function restoreDaemonUpdateRestart(
 		await client.connect(10000);
 		for (const session of manifest.sessions) {
 			try {
+				if (heldActiveSessionIds.has(session.activeSessionId)) throw new Error("recovery-uncertain: committed worker has not retired; session lease and checkpoint are retained until it exits");
 				const result = await restoreDaemonUpdateRestartSession(
 					client,
 					session,
@@ -1326,6 +1327,49 @@ function validateReplacementDaemon(
 	return successor;
 }
 
+async function retirePreparedPredecessor(context: {
+	socketPath: string; agentDir: string; predecessor?: DaemonUpdateRestartProcessIdentity;
+	prepared?: PreparedDaemonUpdateRestart; shutdownAccepted: boolean; statusWriter: DaemonUpdateRestartStatusWriter;
+	assertAdmission: () => Promise<void>;
+}): Promise<Set<string>> {
+	let escalation: DaemonUpdateRestartEscalation | undefined;
+	try {
+		await waitForDaemonStartupFence(context.socketPath, UPDATE_RESTART_PREDECESSOR_FENCE_TIMEOUT_MS);
+	} catch (error) {
+		if (!(error instanceof DaemonStartupFenceTimeoutError)) throw error;
+		const gate = evaluatePredecessorEscalationGate({ fence: error.fence, predecessor: context.predecessor,
+			provenance: context.prepared?.provenance, shutdownAccepted: context.shutdownAccepted,
+			socketConnectable: await canConnectToDaemon(context.socketPath, 250), socketPath: context.socketPath,
+			disabledByEnv: process.env[UPDATE_RESTART_NO_ESCALATION_ENV] === "1" });
+		if (!gate.allowed) throw new Error(`${error.message}; automatic escalation refused: ${gate.reason}`);
+		escalation = await escalateExactProcess(error.fence, { assertAdmission: context.assertAdmission, onProgress: (report) => {
+			escalation = report; context.statusWriter.update({ escalation });
+		} });
+		if (escalation.outcome !== "dead") {
+			throw new Error(`blocked: predecessor ${error.fence.pid} ${escalation.outcome === "survived_sigkill" ? "survived SIGKILL (uninterruptible)" : "has an unobservable process identity"}; refusing to start a successor`);
+		}
+		await waitForDaemonStartupFence(context.socketPath, 10_000);
+	}
+	const prepared = context.prepared;
+	if (!prepared || prepared.provenance !== "prepare_rpc" || prepared.workers.length === 0) return new Set();
+	const predecessor = context.predecessor;
+	if (!predecessor?.processStartId || (isProcessAlive(predecessor.pid) &&
+		(getProcessStartId(predecessor.pid) === undefined || getProcessStartId(predecessor.pid) === predecessor.processStartId))) {
+		throw new Error("blocked: committed worker retirement requires a confirmed-dead predecessor identity");
+	}
+	const allowSignals = context.shutdownAccepted && process.env[UPDATE_RESTART_NO_ESCALATION_ENV] !== "1" &&
+		!(await canConnectToDaemon(context.socketPath, 250));
+	const held = await escalateCommittedEpochWorkers({ agentDir: context.agentDir, socketPath: context.socketPath,
+		manifest: prepared.manifest, workers: prepared.workers, allowSignals, assertAdmission: context.assertAdmission,
+		onProgress: (workers) => {
+			escalation = { ...(escalation ?? { pid: context.predecessor?.pid ?? 0,
+				processStartId: context.predecessor?.processStartId, signals: [], outcome: "predecessor_retired", at: new Date().toISOString() }), workers };
+			context.statusWriter.update({ escalation });
+		} });
+	if (escalation) context.statusWriter.update({ escalation: { ...escalation, heldActiveSessionIds: [...held] } });
+	return held;
+}
+
 export async function runDaemonUpdateRestartCoordinator(options: {
 	socketPath: string;
 	agentDir: string;
@@ -1342,6 +1386,8 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 	let shutdownAdmission: Awaited<ReturnType<typeof acquireDaemonShutdownAdmission>> | undefined;
 	let connectedClient: DaemonClient | undefined;
 	let manifest: DaemonUpdateRestartManifest | undefined;
+	let prepared: PreparedDaemonUpdateRestart | undefined;
+	let shutdownAccepted = false;
 	try {
 		try {
 			lease = await acquireDaemonUpdateRestartCoordinator({
@@ -1378,17 +1424,18 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 			predecessor = processIdentityFromDaemonHello(hello);
 			statusWriter.update({ phase: "preparing", ...(predecessor ? { predecessor } : {}) });
 			try {
-				manifest = await prepareConnectedDaemonUpdateRestart(
+				prepared = await prepareConnectedDaemonUpdateRestart(
 					connectedClient,
 					options.socketPath,
 					options.agentDir,
 					hello,
 				);
+				manifest = prepared.manifest;
 			} catch (error: unknown) {
 				const daemonLacksPrepareCommand = isUnknownDaemonCommandError(error, "prepare_update_restart");
 				if (daemonProbeMayHaveBusySessions(daemonProbe) || !daemonLacksPrepareCommand) {
 					throw new Error(
-						`Could not prepare daemon sessions for automatic resume; the previous daemon is still running (${formatUnknownError(error)})`,
+						`Could not prepare daemon sessions for automatic resume; predecessor state is uncertain and the manifest is retained (${formatUnknownError(error)})`,
 					);
 				}
 			}
@@ -1402,34 +1449,15 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 				},
 			});
 			await shutdownAdmission.assertOrRenew();
-			const stopped = await shutdownConnectedDaemonAndWait(connectedClient, options.socketPath, 10000, hello);
+			const stop = await requestDaemonShutdownAndWait(connectedClient, options.socketPath, 10000, hello);
+			shutdownAccepted = stop.shutdownAccepted;
 			connectedClient = undefined;
-			if (!stopped) {
-				const remainingDaemon = await probeRunningDaemonSessions(options.socketPath);
-				if (remainingDaemon.reachable) {
-					if (manifest) {
-						try {
-							const restoreResult = await restoreDaemonUpdateRestart(
-								options.socketPath,
-								manifest,
-								options.originActiveSessionId,
-								reportRestoreProgress,
-							);
-							const { failures: restoreFailures, ...counts } = restoreResult;
-							clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
-							statusWriter.update({
-								counts,
-								...(restoreFailures.length > 0 ? { failures: restoreFailures } : {}),
-							});
-						} catch {
-							// Keep the manifest for a later recovery attempt when fallback restoration fails.
-						}
-					}
-					throw new Error(`Could not stop the predecessor daemon on ${options.socketPath}`);
-				}
+			if (!shutdownAccepted && (await probeRunningDaemonSessions(options.socketPath)).reachable) {
+				throw new Error(`Predecessor daemon on ${options.socketPath} did not accept shutdown; the prepared manifest is retained for a re-run`);
 			}
 		} else {
-			manifest = tryReadPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			manifest = readPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			if (manifest) assertNoUncommittedLiveWorkers(options.agentDir, options.socketPath);
 			if (!hasRestorableDaemonUpdateRestart(manifest)) {
 				statusWriter.update({ phase: "skipped", message: "No running daemon needed to be restarted" });
 				return statusWriter.current();
@@ -1437,7 +1465,8 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 		}
 
 		statusWriter.update({ phase: "starting_daemon" });
-		await waitForDaemonStartupFence(options.socketPath, UPDATE_RESTART_PREDECESSOR_FENCE_TIMEOUT_MS);
+		const held = await retirePreparedPredecessor({ socketPath: options.socketPath, agentDir: options.agentDir,
+			predecessor, prepared, shutdownAccepted, statusWriter, assertAdmission: () => shutdownAdmission!.assertOrRenew() });
 		await shutdownAdmission.assertOrRenew();
 		await shutdownAdmission.release();
 		shutdownAdmission = undefined;
@@ -1461,6 +1490,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 				manifest,
 				options.originActiveSessionId,
 				reportRestoreProgress,
+				held,
 			);
 			counts = {
 				total: restoreResult.total,
@@ -1469,7 +1499,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 				failed: restoreResult.failed,
 			};
 			failures = restoreResult.failures;
-			clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			if (restoreResult.failed === 0) clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
 		}
 		statusWriter.update({
 			phase: "complete",
@@ -1485,8 +1515,13 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 	} finally {
 		stopStatusHeartbeat();
 		connectedClient?.close();
-		await shutdownAdmission?.release();
-		await lease?.release();
+		for (const [stage, release] of [
+			["shutdown admission release", () => shutdownAdmission?.release()],
+			["coordinator lease release", () => lease?.release()],
+		] as const) {
+			const result = await settleWithinBudget(stage, 5_000, async () => { await release(); });
+			if (!result.ok) statusWriter.update({ phase: "failed", message: `${stage} failed: ${formatUnknownError(result.error)}` });
+		}
 	}
 	return statusWriter.current();
 }

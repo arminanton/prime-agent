@@ -6901,7 +6901,8 @@ export class AgentDaemon {
 		);
 		await this.closeSessionsForRetirement(closeStates,
 			(state) => restartByActiveSessionId.has(state.activeSessionId) ? "update" : "killed");
-		this.armShutdownHardExit(1, WORKER_SHUTDOWN_TRANSPORT_BACKSTOP_MS);
+		// A successful COMMIT waits for the supervisor's shared stop phase.
+		// The 45s retirement timer remains armed; only shutdown shortens it.
 		return manifest;
 	}
 
@@ -7990,7 +7991,7 @@ export class AgentDaemon {
 		for (const signal of signals) {
 			const handler = () => {
 				const exitCode = signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143;
-				if (this.shuttingDown || this.updateRestart?.phase === "publishing") {
+				if (this.shuttingDown) {
 					return this.emergencyExit(exitCode, `received ${signal} during retirement`);
 				}
 				this.log(`received ${signal}; shutting down`);
@@ -8033,6 +8034,7 @@ export class AgentDaemon {
 		const failed = new Set<ActiveSessionState>();
 		// closeSession owns runtime disposal and releases its lease only after
 		// that disposal actually settles. The deadline here must not release it.
+		// closeSession registers synchronously; deepest-first COMMIT callers let parent cascades join child closes.
 		const result = await settleWithinBudget("worker session disposal", WORKER_SHUTDOWN_SESSION_CLOSE_MS, Promise.all(
 			states.map(async (state) => {
 				try { await this.closeSession(state, reasonFor(state)); }

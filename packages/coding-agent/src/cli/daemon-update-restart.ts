@@ -49,6 +49,19 @@ export interface DaemonUpdateRestartProcessIdentity {
 	supervisorOwnerToken?: string;
 }
 
+export interface DaemonProcessEscalation {
+	pid: number;
+	processStartId?: string;
+	signals: string[];
+	outcome: string;
+	at: string;
+}
+
+export interface DaemonUpdateRestartEscalation extends DaemonProcessEscalation {
+	workers?: Array<DaemonProcessEscalation & { workerId: string; rootActiveSessionId: string }>;
+	heldActiveSessionIds?: string[];
+}
+
 export interface DaemonUpdateRestartStatus {
 	version: 1;
 	requestId: string;
@@ -57,6 +70,7 @@ export interface DaemonUpdateRestartStatus {
 	coordinator: DaemonUpdateRestartProcessIdentity;
 	predecessor?: DaemonUpdateRestartProcessIdentity;
 	successor?: DaemonUpdateRestartProcessIdentity;
+	escalation?: DaemonUpdateRestartEscalation;
 	counts: DaemonUpdateRestartCounts;
 	failures?: DaemonUpdateRestartFailure[];
 	message?: string;
