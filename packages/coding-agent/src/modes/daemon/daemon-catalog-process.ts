@@ -10,6 +10,7 @@ import type { DeleteSessionFileResult } from "../../core/session-file-actions.js
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
 import { spawnHidden } from "../../utils/child-process.js";
+import { settleWithinBudget } from "../../utils/settle-within-budget.js";
 
 export const DAEMON_CATALOG_ROLE_ENV = "PRIME_AGENT_INTERNAL_DAEMON_CATALOG";
 const DAEMON_CATALOG_START_TIMEOUT_MS = 30_000;
@@ -257,6 +258,9 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 export class DaemonCatalogClient {
 	private child?: ChildProcess;
 	private starting?: Promise<void>;
+	private cancelStartup?: (error: Error) => void;
+	private stopping = false;
+	private stopPromise?: Promise<void>;
 	private readonly pending = new Map<
 		string,
 		{
@@ -270,6 +274,7 @@ export class DaemonCatalogClient {
 	constructor(private readonly onDiagnostic: (message: string) => void) {}
 
 	async start(): Promise<void> {
+		if (this.stopping) throw new Error("Daemon catalog is stopping");
 		if (this.child?.connected) {
 			return;
 		}
@@ -332,14 +337,47 @@ export class DaemonCatalogClient {
 		});
 	}
 
-	async stop(): Promise<void> {
+	stop(budgetMs = 2000): Promise<void> {
+		if (this.stopPromise) return this.stopPromise;
+		this.stopping = true;
+		this.stopPromise = this.stopOnce(Math.max(0, budgetMs));
+		return this.stopPromise;
+	}
+
+	private async stopOnce(budgetMs: number): Promise<void> {
+		const deadline = performance.now() + budgetMs;
+		const remaining = () => Math.max(0, deadline - performance.now());
+		const stoppingError = new Error("Daemon catalog is stopping");
+		const starting = this.starting;
+		// spawnCatalog captures the child before its first await. Stop that exact
+		// incarnation, never a later child installed by a late continuation.
 		const child = this.child;
-		if (!child) {
-			return;
+		this.rejectAllPending(stoppingError);
+		this.cancelStartup?.(stoppingError);
+		if (starting) {
+			await settleWithinBudget("catalog startup stop", Math.min(500, remaining()), starting);
 		}
-		await this.request({ type: "request", id: randomUUID(), command: "shutdown" }).catch(() => undefined);
-		child.disconnect();
-		this.child = undefined;
+		if (!child) return;
+		if (child.connected) {
+			await settleWithinBudget("catalog shutdown send", Math.min(500, remaining()), () =>
+				new Promise<void>((resolveSent, rejectSent) => {
+					child.send({ type: "request", id: randomUUID(), command: "shutdown" }, (error) => {
+						if (error) rejectSent(error);
+						else resolveSent();
+					});
+				}),
+			);
+			try { child.disconnect(); } catch { /* Already disconnected. */ }
+		}
+		if (!(await waitForCatalogExit(child, Math.max(0, remaining() - 500)))) {
+			child.kill("SIGKILL");
+			if (!(await waitForCatalogExit(child, remaining()))) {
+				// Keep the captured handle as evidence when even SIGKILL cannot retire it.
+				this.onDiagnostic(`Daemon catalog ${child.pid ?? "unknown"} survived SIGKILL during bounded stop`);
+				return;
+			}
+		}
+		if (this.child === child) this.child = undefined;
 	}
 
 	private async spawnCatalog(): Promise<void> {
@@ -384,6 +422,7 @@ export class DaemonCatalogClient {
 			}, DAEMON_CATALOG_START_TIMEOUT_MS);
 			const cleanup = () => {
 				clearTimeout(timeout);
+				if (this.cancelStartup === onError) this.cancelStartup = undefined;
 				child.off("message", onMessage);
 				child.off("error", onError);
 				child.off("exit", onExit);
@@ -401,6 +440,7 @@ export class DaemonCatalogClient {
 			const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
 				onError(new Error(`Daemon catalog exited during startup (${signal ?? code ?? "unknown"})`));
 			};
+			this.cancelStartup = onError;
 			child.on("message", onMessage);
 			child.once("error", onError);
 			child.once("exit", onExit);
@@ -409,6 +449,7 @@ export class DaemonCatalogClient {
 
 	private async request<T = void>(request: CatalogRequest, callbacks?: CatalogListCallbacks): Promise<T> {
 		await this.start();
+		if (this.stopping) throw new Error("Daemon catalog is stopping");
 		const child = this.child;
 		if (!child?.connected) {
 			throw new Error("Daemon catalog is not connected");
@@ -475,10 +516,31 @@ export class DaemonCatalogClient {
 		}
 		this.child = undefined;
 		this.onDiagnostic(error.message);
+		this.rejectAllPending(error);
+	}
+
+	private rejectAllPending(error: Error): void {
 		for (const [id, pending] of this.pending) {
 			clearTimeout(pending.timeout);
 			pending.reject(error);
 			this.pending.delete(id);
 		}
 	}
+}
+
+/** Exit, not IPC disconnect, proves this owned child no longer runs. */
+function waitForCatalogExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+	if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+	return new Promise((resolveExit) => {
+		const finish = (exited: boolean) => {
+			clearTimeout(timer);
+			child.off("exit", onExit);
+			resolveExit(exited);
+		};
+		const onExit = () => finish(true);
+		const timer = setTimeout(() => finish(false), Math.max(0, timeoutMs));
+		timer.unref?.();
+		child.once("exit", onExit);
+		if (child.exitCode !== null || child.signalCode !== null) finish(true);
+	});
 }

@@ -59,6 +59,7 @@ import {
 	signalProcessGroupOrProcess,
 	spawnHidden,
 } from "../../utils/child-process.js";
+import { settleWithinBudget } from "../../utils/settle-within-budget.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
@@ -229,6 +230,8 @@ const MAX_DEFERRED_RECOVERY_ROUNDS = 10;
 const STOP_FINALIZATION_RECHECK_MS = 250;
 const STOP_FINALIZATION_SIGKILL_GRACE_MS = 5000;
 const STOP_FINALIZATION_RETRY_MS = 5000;
+const SUPERVISOR_SHUTDOWN_ARCHIVE_BUDGET_MS = 5_000;
+const SUPERVISOR_SHUTDOWN_SCHEDULE_CANCEL_BUDGET_MS = 5_000;
 const STALE_RECLAIM_WAIT_MS = 10_000;
 // Polling loops probe existence cheaply via kill(0); the ps-backed zombie and
 // identity checks are throttled so a wedged worker cannot saturate the
@@ -7080,7 +7083,13 @@ export class DaemonSupervisor {
 				sessionId: worker.descriptor.rootSessionId,
 				sessionFile: context.sessionFile,
 			});
-			await this.catalog.archive(context.sessionFile, worker.descriptor.rootSessionId);
+			const archive = this.catalog.archive(context.sessionFile, worker.descriptor.rootSessionId);
+			if (this.shuttingDown) {
+				const result = await settleWithinBudget("catalog archive", SUPERVISOR_SHUTDOWN_ARCHIVE_BUDGET_MS, archive);
+				if (!result.ok) throw result.error; // Keep the tombstone for the next supervisor.
+			} else {
+				await archive;
+			}
 		}
 	}
 
@@ -7137,13 +7146,23 @@ export class DaemonSupervisor {
 		if (!context || !worker.descriptor.rootSessionId) {
 			return true;
 		}
+		let cancelStillWanted = true;
+		const pid = worker.descriptor.pid;
+		const stopRevision = worker.stopRevision;
 		try {
-			await this.cancelScheduledJobsForSessionTree(
+			const cancel = this.cancelScheduledJobsForSessionTree(
 				worker.descriptor.rootSessionId,
 				context.sessionFile,
-				() => worker.descriptor.ownerClientId !== undefined,
+				() => cancelStillWanted && worker.descriptor.ownerClientId !== undefined &&
+					worker.descriptor.pid === pid && worker.stopRevision === stopRevision,
 				worker,
 			);
+			if (this.shuttingDown) {
+				const result = await settleWithinBudget("schedule cancel", SUPERVISOR_SHUTDOWN_SCHEDULE_CANCEL_BUDGET_MS, cancel);
+				if (!result.ok) throw result.error;
+			} else {
+				await cancel;
+			}
 			return true;
 		} catch (error) {
 			// A promotion that landed during the failed read means the cancel is no longer wanted.
@@ -7154,6 +7173,9 @@ export class DaemonSupervisor {
 				`Could not cancel scheduled jobs for client-owned worker ${worker.descriptor.workerId}: ${String(error)}`,
 			);
 			return false;
+		} finally {
+			// A family read that finishes after its budget cannot cancel a new owner's jobs.
+			cancelStillWanted = false;
 		}
 	}
 
