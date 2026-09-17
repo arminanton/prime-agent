@@ -159,7 +159,11 @@ describe("Windows kernel subprocesses", () => {
 	it("forces UTF-8 for the hidden background Python bootstrap without changing the parent environment", async () => {
 		process.env.PRIME_AGENT_KERNEL_PYTHON = join(tempDir, "python.exe");
 		await expect(ensureKernelPython()).rejects.toThrow("PRIME_AGENT_KERNEL_PYTHON");
-		expect(spawn.mock.calls[0]?.[2]).toMatchObject({ windowsHide: true, stdio: "ignore", env: { PYTHONUTF8: "1" } });
+		expect(spawn.mock.calls[0]?.[2]).toMatchObject({
+			windowsHide: true,
+			stdio: ["ignore", "ignore", "pipe"],
+			env: { PYTHONUTF8: "1" },
+		});
 		expect(process.env.PYTHONUTF8).toBe("0");
 	});
 
@@ -182,7 +186,11 @@ describe("Windows kernel subprocesses", () => {
 
 		const call = spawn.mock.calls.at(-1);
 		expect(call?.[0]).toBe(process.env.ComSpec ?? "cmd.exe");
-		expect(call?.[2]).toMatchObject({ windowsHide: true, windowsVerbatimArguments: true, stdio: "ignore" });
+		expect(call?.[2]).toMatchObject({
+			windowsHide: true,
+			windowsVerbatimArguments: true,
+			stdio: ["ignore", "ignore", "pipe"],
+		});
 		expect(Object.values(call?.[2]?.env ?? {})).toContain(uv);
 	});
 

@@ -73,17 +73,35 @@ The Python side does not call providers or implement an agent loop.
 
 ## Kernel Lifecycle
 
-The kernel is created lazily on first Python REPL use. Python resolution is:
+The kernel is created lazily on first Python REPL use. Passive sessions restore saved state at that point, unless `PRIME_AGENT_EAGER_KERNEL_PREWARM_ON_HYDRATE=1` requests eager hydration. Explicit interactive prewarming remains available.
+
+Python resolution is:
 
 1. `PRIME_AGENT_KERNEL_PYTHON`, when it has a current `prime-agent-runtime`;
-2. `~/.prime/agent/kernel-venv/bin/python`, bootstrapped with `uv`; or
+2. a managed generation selected by the `~/.prime/agent/kernel-venv.current` JSON pointer, or the legacy `~/.prime/agent/kernel-venv` when no valid pointer exists; or
 3. the XDG data location when `~/.prime` is not writable.
 
-The managed environment includes Python 3.11, `prime-agent-runtime`, `dill`, and the default Python packages. A bootstrap marker detects stale environments.
+`PRIME_AGENT_KERNEL_VENV` overrides the managed family's base path. New environments are sibling directories named `<base>-<identity>-<unique-id>`. Bootstrap validates a candidate before publishing its name in `<base>.current`. Running kernels keep their generation's path. The managed environment includes Python 3.11, `prime-agent-runtime`, `dill`, and the default Python packages.
+
+This layout is a reference design. Legacy fixed-path consumers and their documentation are not yet migrated; compatibility needs agreement before a mergeable change.
 
 Startup spawns `python -m rlm.repl` and exchanges newline-delimited JSON over stdio: the runtime announces itself with a single `ready` event, then requests and events flow one JSON object per line (see `prime-agent-runtime/src/rlm/repl.md`).
 
 The manager owns the child process and a bounded stderr tail. Shutdown sends a `shutdown` request, waits for the process to exit, and terminates it as a fallback. Persistent sessions may snapshot the kernel namespace into their session artifact directory for revival.
+
+### Retained environments and recovery
+
+Bootstrap never deletes a published generation. Each upgrade or forced rebuild can add another environment, so disk use can grow without a limit. The pointer records only `current` and `previous`; older generations may still serve running kernels.
+
+Until a retention policy exists, cleanup is manual:
+
+1. Stop all sessions, daemons, and Python kernels that use this environment family, and ensure no bootstrap is in progress.
+2. Inspect `<base>.current` and the sibling generation directories. Keep `current`, `previous`, and any generation needed for rollback.
+3. Delete only specific older directories that are no longer in use. Do not use a wildcard or assume an unreferenced generation is unused.
+
+A readiness-probe failure on a matching environment does not rebuild it or write a rebuild-backoff marker. Retry after resource pressure clears. If a published generation remains broken, remove only the `.current` JSON file shown in the error, then retry Python startup. This works without a bootstrap CLI: it clears the selection, not the environments, and bootstrap can reuse a healthy generation or build a new one. An earlier failed build still obeys its retry window. Do not delete a live venv directory to recover.
+
+Where the one-shot bootstrap CLI is available, `PRIME_AGENT_KERNEL_VENV_FORCE_REBUILD=1` requests a fresh generation. Ordinary sessions ignore this switch, so leaving it in the environment does not force repeated rebuilds.
 
 ## Stdio Transport
 

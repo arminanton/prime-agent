@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, existsSync, readdirSync, readFileSync } from "node:fs";
-import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { stderr, stdin } from "node:process";
@@ -8,13 +8,15 @@ import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { getPackageDir } from "../../config.js";
+import { writeFileAtomicSync } from "../../utils/atomic-file.js";
 import { isProcessAlive, spawnHidden } from "../../utils/child-process.js";
 import { tryAcquireDirLock } from "../../utils/dir-lock.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 
 const BOOTSTRAP_SCHEMA = 9;
 const PYTHON_VERSION = "3.11";
-const RUNTIME_REQUIREMENT = "prime-agent-runtime";
+const RUNTIME_PACKAGE_NAME = "prime-agent-runtime";
+const RUN_STDERR_TAIL_CHARS = 8_000;
 // Serializes the kernel's user namespace so it can be revived across session
 // resume. Internal-only; intentionally not surfaced to the model as an import.
 const STATE_SNAPSHOT_REQUIREMENT = "dill";
@@ -100,6 +102,13 @@ const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
 const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
 const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
+// Generations and metadata are siblings of the legacy venv, never files inside it.
+// Published generations remain available to running kernels; bootstrap never collects them.
+const BOOTSTRAP_POINTER_SUFFIX = ".current";
+const BOOTSTRAP_FAILED_SUFFIX = ".bootstrap-failed";
+const BOOTSTRAP_GENERATION_HASH_LENGTH = 16;
+const BOOTSTRAP_BACKOFF_BASE_MS = 60_000;
+const BOOTSTRAP_BACKOFF_MAX_MS = 30 * 60_000;
 
 let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
 
@@ -109,6 +118,8 @@ export type KernelBootstrapProgressHandler = (message: string) => void;
 export interface EnsureKernelPythonOptions {
 	pythonSkills?: readonly KernelPythonSkill[];
 	onProgress?: KernelBootstrapProgressHandler;
+	/** Build a fresh generation. Only the one-shot bootstrap CLI reads the environment switch. */
+	forceRebuild?: boolean;
 }
 
 interface BootstrapPythonSkill {
@@ -123,7 +134,21 @@ interface BootstrapVersion {
 	runtime?: string;
 	snapshot?: string;
 	extraUvArgs?: string[];
+	generation?: string;
 	pythonSkills?: BootstrapPythonSkill[];
+}
+
+interface BootstrapPointer {
+	current: string;
+	previous?: string;
+	updatedAt: number;
+}
+
+interface BootstrapFailureMarker {
+	identity: string;
+	attempt: number;
+	nextRetryAt: number;
+	lastError?: string;
 }
 
 function errorMessage(error: unknown): string {
@@ -369,16 +394,91 @@ function ensureKernelPythonKey(pythonSkills: readonly BootstrapPythonSkill[]): s
 	return [
 		process.env.PRIME_AGENT_KERNEL_PYTHON ?? "",
 		process.env.PRIME_AGENT_KERNEL_VENV ?? "",
+		process.env.PRIME_AGENT_RUNTIME_SOURCE ?? "",
 		process.env.HOME ?? "",
 		process.env.XDG_DATA_HOME ?? "",
 		JSON.stringify(pythonSkills),
 	].join("\0");
 }
 
-export function getKernelVenvDir(): string {
+function getBaseKernelVenvDir(): string {
 	const override = process.env.PRIME_AGENT_KERNEL_VENV;
 	if (override) return path.resolve(expandHome(override));
 	return path.join(os.homedir(), ".prime", "agent", "kernel-venv");
+}
+
+// Skill packages are synced in place; only base dependencies identify a generation.
+export function bootstrapGenerationHash(runtimeIdentity: string): string {
+	const identity = JSON.stringify({
+		schema: BOOTSTRAP_SCHEMA,
+		runtime: runtimeIdentity,
+		snapshot: STATE_SNAPSHOT_REQUIREMENT,
+		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+		pythonVersion: PYTHON_VERSION,
+		readyCheck: RUNTIME_READY_CHECK,
+	});
+	return createHash("sha256").update(identity).digest("hex").slice(0, BOOTSTRAP_GENERATION_HASH_LENGTH);
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function generationFamilyPattern(baseDir: string): RegExp {
+	const base = escapeRegExp(path.basename(baseDir));
+	return new RegExp(`^${base}-[0-9a-f]{${BOOTSTRAP_GENERATION_HASH_LENGTH}}(?:-[0-9a-f]{32})?$`);
+}
+
+function generationIdentityPattern(baseDir: string, generationHash: string): RegExp {
+	const base = escapeRegExp(path.basename(baseDir));
+	return new RegExp(`^${base}-${generationHash}(?:-[0-9a-f]{32})?$`);
+}
+
+// A unique path keeps forced rebuilds from overwriting a same-identity live generation.
+function newGenerationVenvDir(baseDir: string, generationHash: string): string {
+	return `${baseDir}-${generationHash}-${randomUUID().replaceAll("-", "")}`;
+}
+
+function bootstrapPointerPath(baseDir: string): string {
+	return `${baseDir}${BOOTSTRAP_POINTER_SUFFIX}`;
+}
+
+function bootstrapFailedPath(baseDir: string): string {
+	return `${baseDir}${BOOTSTRAP_FAILED_SUFFIX}`;
+}
+
+function readBootstrapPointer(baseDir: string): BootstrapPointer | null {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(bootstrapPointerPath(baseDir), "utf8"));
+		if (!isRecord(parsed) || typeof parsed.current !== "string") return null;
+		return {
+			current: parsed.current,
+			previous: typeof parsed.previous === "string" ? parsed.previous : undefined,
+			updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0,
+		};
+	} catch {
+		return null;
+	}
+}
+
+// Reject paths outside this venv family before resolving a pointer.
+function publishedGenerationDir(baseDir: string): string | null {
+	const pointer = readBootstrapPointer(baseDir);
+	if (!pointer) return null;
+	if (!generationFamilyPattern(baseDir).test(pointer.current)) return null;
+	const dir = path.join(path.dirname(baseDir), pointer.current);
+	return existsSync(dir) ? dir : null;
+}
+
+function pointerReferences(baseDir: string, generationDir: string): boolean {
+	const name = path.basename(generationDir);
+	const pointer = readBootstrapPointer(baseDir);
+	return pointer?.current === name || pointer?.previous === name;
+}
+
+export function getKernelVenvDir(): string {
+	const baseDir = getBaseKernelVenvDir();
+	return publishedGenerationDir(baseDir) ?? baseDir;
 }
 
 function getXdgKernelVenvDir(): string {
@@ -389,7 +489,7 @@ function getXdgKernelVenvDir(): string {
 }
 
 async function resolveWritableKernelVenvDir(): Promise<string> {
-	const primary = getKernelVenvDir();
+	const primary = getBaseKernelVenvDir();
 	try {
 		await mkdir(path.dirname(primary), { recursive: true });
 		return primary;
@@ -421,17 +521,24 @@ function run(command: string, args: string[], options: { stdio?: "ignore" | "inh
 		const batch = isBatchShim(command) ? buildBatchShimInvocation(command, args, env) : undefined;
 		const child = spawnHidden(batch ? (process.env.ComSpec ?? "cmd.exe") : command, batch?.args ?? args, {
 			env: batch?.env ?? env,
-			stdio: options.stdio ?? "ignore",
+			stdio: options.stdio === "inherit" ? "inherit" : ["ignore", "ignore", "pipe"],
 			...(batch ? { windowsVerbatimArguments: true } : {}),
 		});
+		let stderrTail = "";
+		child.stderr?.setEncoding("utf8");
+		child.stderr?.on("data", (chunk: string) => {
+			stderrTail = (stderrTail + chunk).slice(-RUN_STDERR_TAIL_CHARS);
+		});
 		child.on("error", reject);
-		child.on("exit", (code, signal) => {
+		// Wait for stderr to finish before reporting a failed command.
+		child.on("close", (code, signal) => {
 			if (code === 0) {
 				resolve();
 				return;
 			}
 			const reason = signal ? `signal ${signal}` : `exit code ${code}`;
-			reject(new Error(`${command} ${args.join(" ")} failed with ${reason}`));
+			const detail = stderrTail.trim();
+			reject(new Error(`${command} ${args.join(" ")} failed with ${reason}${detail ? `\n${detail}` : ""}`));
 		});
 	});
 }
@@ -628,6 +735,7 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 			runtime: typeof parsed.runtime === "string" ? parsed.runtime : undefined,
 			snapshot: typeof parsed.snapshot === "string" ? parsed.snapshot : undefined,
 			extraUvArgs,
+			generation: typeof parsed.generation === "string" ? parsed.generation : undefined,
 			pythonSkills,
 		};
 	} catch {
@@ -673,7 +781,8 @@ function bootstrapBaseVersionCurrent(version: BootstrapVersion | null, runtimeId
 		version?.schema === BOOTSTRAP_SCHEMA &&
 		version.runtime === runtimeIdentity &&
 		version.snapshot === STATE_SNAPSHOT_REQUIREMENT &&
-		extraUvArgsMatch(version.extraUvArgs, DEFAULT_RLM_EXTRA_UV_ARGS)
+		extraUvArgsMatch(version.extraUvArgs, DEFAULT_RLM_EXTRA_UV_ARGS) &&
+		version.generation === bootstrapGenerationHash(runtimeIdentity)
 	);
 }
 
@@ -687,12 +796,15 @@ async function writeBootstrapVersion(
 		runtime: runtimeIdentity,
 		snapshot: STATE_SNAPSHOT_REQUIREMENT,
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+		generation: bootstrapGenerationHash(runtimeIdentity),
 		pythonSkills: [...pythonSkills],
 	};
-	await writeFile(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`, "utf8");
+	writeFileAtomicSync(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`);
 }
 
 function runtimeCandidateDirs(): string[] {
+	const override = process.env.PRIME_AGENT_RUNTIME_SOURCE;
+	if (override) return [path.resolve(expandHome(override))];
 	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 	// Compiled executables use a flat sidecar layout; Node packages keep sources in dist/.
 	// Resolve both from the physical package directory, outside Bun's virtual filesystem.
@@ -713,19 +825,28 @@ async function resolveRuntimeSourceDir(): Promise<string | null> {
 	return null;
 }
 
-// Identity of the runtime to be installed. For a local source checkout this is a
-// content hash of every rlm/*.py file plus pyproject.toml, so any runtime code or
-// dependency change invalidates an existing venv automatically. Falls back to the
-// bare package name when the runtime resolves to a registry install (no local source).
-export async function resolveRuntimeIdentity(): Promise<string> {
+// The runtime ships as local source. There is no package-index fallback.
+async function requireRuntimeSourceDir(): Promise<string> {
 	const sourceDir = await resolveRuntimeSourceDir();
-	if (!sourceDir) return RUNTIME_REQUIREMENT;
-	return hashRuntimeSource(sourceDir);
+	if (sourceDir) return sourceDir;
+	throw missingRuntimeSourceError(runtimeCandidateDirs());
 }
 
-// Throws if the local source can't be read. A failure here must surface rather than
-// fall back to RUNTIME_REQUIREMENT: that constant is the registry-install identity, and
-// recording it for a local checkout would permanently mask later source changes.
+function missingRuntimeSourceError(candidates: string[]): Error {
+	return new Error(
+		`Failed to set up the Python kernel runtime: the ${RUNTIME_PACKAGE_NAME} source that ships with this prime-agent install is missing ` +
+			`(looked in: ${candidates.join(", ")}). ` +
+			"The install this process was started from was probably deleted, moved, or replaced while prime-agent was running. " +
+			"The existing kernel venv was left untouched. Restart prime-agent from an intact install, " +
+			`point PRIME_AGENT_RUNTIME_SOURCE at a ${RUNTIME_PACKAGE_NAME} checkout, ` +
+			`or set PRIME_AGENT_KERNEL_PYTHON to a Python with a current ${RUNTIME_PACKAGE_NAME} and default Python packages installed.`,
+	);
+}
+
+export async function resolveRuntimeIdentity(): Promise<string> {
+	return hashRuntimeSource(await requireRuntimeSourceDir());
+}
+
 async function hashRuntimeSource(sourceDir: string): Promise<string> {
 	const rlmDir = path.join(sourceDir, "src", "rlm");
 	const files: string[] = [path.join(sourceDir, "pyproject.toml")];
@@ -758,15 +879,14 @@ export function kernelVenvPython(venv: string, platform: NodeJS.Platform = proce
 
 async function bootstrapVenv(
 	venv: string,
+	runtimeSourceDir: string,
+	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
 	options: EnsureKernelPythonOptions,
 ): Promise<void> {
 	await mkdir(path.dirname(venv), { recursive: true });
 	const uv = await ensureUv(options);
 	const python = kernelVenvPython(venv);
-	const sourceDir = await resolveRuntimeSourceDir();
-	const runtimeRequirement = sourceDir ?? RUNTIME_REQUIREMENT;
-	const runtimeIdentity = await resolveRuntimeIdentity();
 
 	await run(uv, ["python", "install", PYTHON_VERSION]);
 	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
@@ -775,7 +895,7 @@ async function bootstrapVenv(
 		"install",
 		"--python",
 		python,
-		runtimeRequirement,
+		runtimeSourceDir,
 		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
 	]);
@@ -888,6 +1008,109 @@ function formatBootstrapFailure(error: unknown): Error {
 	);
 }
 
+async function publishGeneration(baseDir: string, generationDir: string): Promise<void> {
+	const current = path.basename(generationDir);
+	const familyPattern = generationFamilyPattern(baseDir);
+	const existing = readBootstrapPointer(baseDir);
+	const previousCandidate = existing && existing.current !== current ? existing.current : existing?.previous;
+	const previous =
+		previousCandidate && previousCandidate !== current && familyPattern.test(previousCandidate)
+			? previousCandidate
+			: undefined;
+	const pointer: BootstrapPointer = {
+		current,
+		...(previous ? { previous } : {}),
+		updatedAt: Date.now(),
+	};
+	writeFileAtomicSync(bootstrapPointerPath(baseDir), `${JSON.stringify(pointer)}\n`);
+}
+
+function readBootstrapFailure(baseDir: string): BootstrapFailureMarker | null {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(bootstrapFailedPath(baseDir), "utf8"));
+		if (
+			!isRecord(parsed) ||
+			typeof parsed.identity !== "string" ||
+			typeof parsed.attempt !== "number" ||
+			typeof parsed.nextRetryAt !== "number"
+		) {
+			return null;
+		}
+		return {
+			identity: parsed.identity,
+			attempt: parsed.attempt,
+			nextRetryAt: parsed.nextRetryAt,
+			lastError: typeof parsed.lastError === "string" ? parsed.lastError : undefined,
+		};
+	} catch {
+		return null;
+	}
+}
+
+function bootstrapBackoffMs(attempt: number): number {
+	const exponent = Math.max(0, attempt - 1);
+	return Math.min(BOOTSTRAP_BACKOFF_BASE_MS * 2 ** exponent, BOOTSTRAP_BACKOFF_MAX_MS);
+}
+
+async function recordBootstrapFailure(baseDir: string, identity: string, error: unknown): Promise<void> {
+	const existing = readBootstrapFailure(baseDir);
+	const attempt = existing && existing.identity === identity ? existing.attempt + 1 : 1;
+	const marker: BootstrapFailureMarker = {
+		identity,
+		attempt,
+		nextRetryAt: Date.now() + bootstrapBackoffMs(attempt),
+		lastError: errorMessage(error).slice(0, RUN_STDERR_TAIL_CHARS),
+	};
+	writeFileAtomicSync(bootstrapFailedPath(baseDir), `${JSON.stringify(marker)}\n`);
+}
+
+// A stale marker must not turn a successful publication into a failed boot.
+async function clearBootstrapFailure(baseDir: string): Promise<void> {
+	await rm(bootstrapFailedPath(baseDir), { force: true }).catch(() => undefined);
+}
+
+function bootstrapBackoffError(marker: BootstrapFailureMarker): Error {
+	const retryAt = new Date(marker.nextRetryAt).toISOString();
+	return new KernelBootstrapUnavailableError(
+		`kernel venv bootstrap failed ${marker.attempt} time(s) for this runtime; ` +
+			`not rebuilding again before ${retryAt} (a runtime, python-version, or readiness-check change retries immediately; a skill change syncs in place). ` +
+			`Last error: ${marker.lastError ?? "unknown"}`,
+	);
+}
+
+class KernelBootstrapUnavailableError extends Error {}
+
+// Reuse an intact generation on rollback instead of building the same runtime again.
+async function findReusableGeneration(
+	baseDir: string,
+	generationHash: string,
+	skipDir: string,
+	runtimeIdentity: string,
+): Promise<string | null> {
+	const parent = path.dirname(baseDir);
+	const identityPattern = generationIdentityPattern(baseDir, generationHash);
+	const skipName = path.basename(skipDir);
+	const candidates: { dir: string; mtimeMs: number }[] = [];
+	try {
+		for (const entry of await readdir(parent, { withFileTypes: true })) {
+			if (!entry.isDirectory() || !identityPattern.test(entry.name) || entry.name === skipName) continue;
+			const dir = path.join(parent, entry.name);
+			try {
+				candidates.push({ dir, mtimeMs: (await stat(dir)).mtimeMs });
+			} catch {
+				// Ignore a generation removed since the directory listing.
+			}
+		}
+	} catch {
+		return null;
+	}
+	candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	for (const { dir } of candidates) {
+		if (await kernelBaseReady(kernelVenvPython(dir), dir, runtimeIdentity)) return dir;
+	}
+	return null;
+}
+
 async function ensureKernelPythonUncached(
 	options: EnsureKernelPythonOptions,
 	pythonSkills: readonly BootstrapPythonSkill[],
@@ -925,40 +1148,103 @@ async function ensureKernelPythonUncached(
 		throw new Error(`PRIME_AGENT_KERNEL_PYTHON points to a Python missing ${missing.join(" and ")}: ${python}`);
 	}
 
-	const venv = await resolveWritableKernelVenvDir();
-	const python = kernelVenvPython(venv);
-	const runtimeIdentity = await resolveRuntimeIdentity();
-	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
+	// Resolve sources before modifying any venv or bootstrap metadata.
+	const runtimeSourceDir = await requireRuntimeSourceDir();
+	const runtimeIdentity = await hashRuntimeSource(runtimeSourceDir);
+	const baseDir = await resolveWritableKernelVenvDir();
+	const generationHash = bootstrapGenerationHash(runtimeIdentity);
+	const forceRebuild = options.forceRebuild === true;
 
-	const releaseLock = await acquireBootstrapLock(venv);
+	const liveDir = publishedGenerationDir(baseDir) ?? baseDir;
+	const livePython = kernelVenvPython(liveDir);
+	if (!forceRebuild && (await kernelReady(livePython, liveDir, runtimeIdentity, pythonSkills))) return livePython;
+
+	const releaseLock = await acquireBootstrapLock(baseDir);
 	try {
-		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
-		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
-			await syncPythonSkills(await ensureUv(options), venv, python, runtimeIdentity, pythonSkills, options);
-			return python;
+		const currentDir = publishedGenerationDir(baseDir) ?? baseDir;
+		const currentPython = kernelVenvPython(currentDir);
+		if (!forceRebuild && (await kernelReady(currentPython, currentDir, runtimeIdentity, pythonSkills)))
+			return currentPython;
+
+		// A matching manifest plus a failed probe can mean memory pressure, not a stale runtime.
+		if (!forceRebuild && bootstrapBaseVersionCurrent(await readBootstrapVersion(currentDir), runtimeIdentity)) {
+			if (await hasPrimeAgentRuntime(currentPython)) {
+				await syncPythonSkills(
+					await ensureUv(options),
+					currentDir,
+					currentPython,
+					runtimeIdentity,
+					pythonSkills,
+					options,
+				);
+				return currentPython;
+			}
+			if (existsSync(currentPython)) {
+				throw new KernelBootstrapUnavailableError(
+					`the live kernel venv (${currentDir}) is recorded for the current runtime but failed its readiness probe; ` +
+						"leaving it untouched. Retry when memory is available. To select another generation, remove only " +
+						`the pointer file (${bootstrapPointerPath(baseDir)}) and retry; do not delete the venv directory. ` +
+						"If the bootstrap CLI is available, run it with PRIME_AGENT_KERNEL_VENV_FORCE_REBUILD=1 to build a fresh generation.",
+				);
+			}
 		}
 
-		const hadVenv = existsSync(venv);
-		reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
-		if (hadVenv) {
-			reportProgress(options, "rebuilding kernel venv");
-			await rm(venv, { recursive: true, force: true });
+		if (!forceRebuild) {
+			const reusable = await findReusableGeneration(baseDir, generationHash, currentDir, runtimeIdentity);
+			if (reusable) {
+				const reusablePython = kernelVenvPython(reusable);
+				await syncPythonSkills(
+					await ensureUv(options),
+					reusable,
+					reusablePython,
+					runtimeIdentity,
+					pythonSkills,
+					options,
+				);
+				await publishGeneration(baseDir, reusable);
+				await clearBootstrapFailure(baseDir);
+				return reusablePython;
+			}
+
+			const marker = readBootstrapFailure(baseDir);
+			if (marker && marker.identity === generationHash && Date.now() < marker.nextRetryAt) {
+				throw bootstrapBackoffError(marker);
+			}
 		}
 
-		await bootstrapVenv(venv, pythonSkills, options);
+		const buildDir = newGenerationVenvDir(baseDir, generationHash);
+		const generationPython = kernelVenvPython(buildDir);
+		let published = false;
+		try {
+			reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
+			await bootstrapVenv(buildDir, runtimeSourceDir, runtimeIdentity, pythonSkills, options);
+			if (!(await kernelBaseReady(generationPython, buildDir, runtimeIdentity))) {
+				throw new Error(`kernel venv failed its readiness check after bootstrap: ${buildDir}`);
+			}
+			// Publication can succeed before a later I/O error. Never delete this directory again.
+			published = true;
+			await publishGeneration(baseDir, buildDir);
+		} catch (error) {
+			if (!published && !pointerReferences(baseDir, buildDir)) {
+				await rm(buildDir, { recursive: true, force: true }).catch(() => undefined);
+			}
+			await recordBootstrapFailure(baseDir, generationHash, error).catch(() => undefined);
+			throw error;
+		}
+		await clearBootstrapFailure(baseDir);
+		reportProgress(options, "✓ ready");
+		return generationPython;
 	} catch (error) {
+		if (error instanceof KernelBootstrapUnavailableError) throw error;
 		throw formatBootstrapFailure(error);
 	} finally {
 		await releaseLock().catch(() => undefined);
 	}
-
-	reportProgress(options, "✓ ready");
-	return python;
 }
 
 export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Promise<string> {
 	const pythonSkills = normalizePythonSkills(options.pythonSkills);
-	const key = ensureKernelPythonKey(pythonSkills);
+	const key = `${ensureKernelPythonKey(pythonSkills)}\0${options.forceRebuild === true}`;
 	if (inFlightEnsureKernelPython?.key === key) return inFlightEnsureKernelPython.promise;
 
 	const promise = ensureKernelPythonUncached(options, pythonSkills).finally(() => {

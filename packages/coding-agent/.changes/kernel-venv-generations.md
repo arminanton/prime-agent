@@ -1,0 +1,2 @@
+- Changed Python runtime upgrades to retain older environments for running kernels, with manual cleanup needed for unused generations ([#2203](https://github.com/PrimeIntellect-ai/prime-agent/pull/2203)).
+- Changed passive session hydration to start its Python kernel on first use unless `PRIME_AGENT_EAGER_KERNEL_PREWARM_ON_HYDRATE=1` is set.

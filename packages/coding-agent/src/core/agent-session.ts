@@ -10329,13 +10329,12 @@ export class AgentSession {
 			includeAllExtensionTools: options.includeAllExtensionTools,
 		});
 
-		// Prewarm when configured, or whenever we're resuming a session that already
-		// has a kernel snapshot — so its state is revived and the model is told what
-		// came back before the first turn, rather than a turn later when the kernel
-		// would otherwise lazily start on first use.
-		const hasSnapshot =
-			!!this._ipythonKernelSnapshotDir && existsSync(snapshotPathIn(this._ipythonKernelSnapshotDir));
-		if ((this._prewarmIpythonKernel || hasSnapshot) && this.getActiveToolNames().includes("ipython")) {
+		// Passive sessions restore their snapshot on first Python use, unless eager hydration is requested.
+		const prewarmSnapshot =
+			process.env.PRIME_AGENT_EAGER_KERNEL_PREWARM_ON_HYDRATE === "1" &&
+			!!this._ipythonKernelSnapshotDir &&
+			existsSync(snapshotPathIn(this._ipythonKernelSnapshotDir));
+		if ((this._prewarmIpythonKernel || prewarmSnapshot) && this.getActiveToolNames().includes("ipython")) {
 			this._ipythonKernelProvisioner?.prewarm();
 		}
 

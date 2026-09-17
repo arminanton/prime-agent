@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerFauxProvider } from "@earendil-works/pi-ai";
@@ -8,12 +8,14 @@ import { AGENT_MESSAGE_SKILL_NAME, type AgentSessionMessageController } from "..
 import { AGENT_OBSERVE_SKILL_NAME, type AgentObserveController } from "../src/core/agent-observe.js";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { snapshotPathIn } from "../src/core/kernel/state-snapshot.js";
 import { McpConnectionStore } from "../src/core/mcp/connection-store.js";
 import { McpManager } from "../src/core/mcp/mcp-manager.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
+import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
 
 describe("createAgentSessionFromServices", () => {
 	const cleanupPaths: string[] = [];
@@ -29,6 +31,53 @@ describe("createAgentSessionFromServices", () => {
 			if (path && existsSync(path)) {
 				rmSync(path, { recursive: true, force: true });
 			}
+		}
+	});
+
+	it.each([
+		{ name: "passive hydration", depth: 0, prewarm: false, snapshot: true, eager: false, calls: 0 },
+		{ name: "child hydration", depth: 1, prewarm: true, snapshot: true, eager: false, calls: 0 },
+		{ name: "fresh child", depth: 1, prewarm: true, snapshot: false, eager: false, calls: 0 },
+		{ name: "interactive root", depth: 0, prewarm: true, snapshot: false, eager: false, calls: 1 },
+		{ name: "opt-in hydration", depth: 1, prewarm: false, snapshot: true, eager: true, calls: 1 },
+		{ name: "opt-in without state", depth: 1, prewarm: false, snapshot: false, eager: true, calls: 0 },
+	])("prewarms only when requested for $name", async ({ depth, prewarm, snapshot, eager, calls }) => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-session-prewarm-"));
+		cleanupPaths.push(tempDir);
+		vi.stubEnv("PRIME_AGENT_EAGER_KERNEL_PREWARM_ON_HYDRATE", eager ? "1" : "0");
+		const faux = registerFauxProvider();
+		unregisters.push(() => faux.unregister());
+		const services = await createAgentSessionServices({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage: AuthStorage.inMemory(),
+			telemetryDisabled: true,
+			resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true },
+		});
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		sessionManager.newSession({ rlmDepth: depth });
+		if (snapshot) {
+			const artifacts = sessionManager.getSessionArtifactDir()!;
+			mkdirSync(artifacts, { recursive: true });
+			writeFileSync(snapshotPathIn(artifacts), "saved state");
+		}
+		// Keep the kernel-start boundary local; session construction and snapshot detection are real.
+		const start = vi.spyOn(IpythonKernelProvisioner.prototype, "prewarm").mockImplementation(() => {});
+		try {
+			const { session } = await createAgentSessionFromServices({
+				services,
+				sessionManager,
+				model: faux.getModel(),
+				prewarmIpythonKernel: prewarm,
+			});
+			try {
+				expect(session.getActiveToolNames()).toContain("ipython");
+				expect(start).toHaveBeenCalledTimes(calls);
+			} finally {
+				await session.disposeAsync();
+			}
+		} finally {
+			start.mockRestore();
 		}
 	});
 
