@@ -1549,6 +1549,36 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it.each(["switchSession", "newSession", "fork", "importFromJsonl"] as const)(
+		"keeps host capabilities on the replacement session after %s",
+		async (operation) => {
+			const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-host-capabilities-"));
+			let state: ActiveSessionState | undefined;
+			try {
+				const { fixture, internals } = makePassiveMemoHarness(tempDir);
+				state = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+				const manager = state.runtime.session.sessionManager;
+				const entryId = manager.appendMessage({ role: "user", content: "fork point", timestamp: 1 });
+				manager.flushNow();
+				const retired = fixture.createRuntime.mock.lastCall![0].sessionOptions!;
+				const target = operation === "fork" ? entryId : fixture.childSessionFile;
+				await (operation === "newSession" ? state.runtime.newSession() : state.runtime[operation](target));
+				const current = { sessionId: state.runtime.session.sessionId };
+				const host = fixture.createRuntime.mock.lastCall![0].sessionOptions!;
+				const heartbeat = await host.rlmHeartbeatController!.createRlmHeartbeat({ instruction: "check progress" });
+				expect(heartbeat).toMatchObject(current);
+				for (const field of ["agentMessageController", "agentObserveController"] as const) {
+					expect(await host[field]!.listAgents()).toMatchObject({ current });
+					expect(() => retired[field]!.listAgents()).toThrow("state is not ready");
+				}
+				expect(() => retired.rlmHeartbeatController!.listRlmHeartbeats()).toThrow("state is not ready");
+			} finally {
+				await state?.runtime.dispose();
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
+
 	function makePassiveMemoHarness(tempDir: string) {
 		const fixture = makePersistedRlmDaemonFixture(tempDir);
 		const internals = fixture.daemon as unknown as {
@@ -3350,6 +3380,7 @@ function makeRuntimeSession(
 		subscribe: vi.fn(() => vi.fn()),
 		bindExtensions: vi.fn(async () => {}),
 		setExecEnvProvider: vi.fn(),
+		setCurrentRecap: vi.fn(),
 		getAvailableThinkingLevels: vi.fn(() => []),
 		scopedModels: [],
 		getActiveToolNames: vi.fn(() => []),

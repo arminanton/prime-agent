@@ -1,0 +1,1 @@
+- Fixed daemon-hosted sessions losing heartbeat, messaging, and observation tools after resume, new-session, fork, or import operations.

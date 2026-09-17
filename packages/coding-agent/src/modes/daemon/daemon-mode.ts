@@ -64,7 +64,7 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
+import { type AgentSession, type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
@@ -1851,6 +1851,48 @@ export class AgentDaemon {
 		}
 	}
 
+	private createDaemonRuntime(
+		getState: () => ActiveSessionState | undefined,
+		options: Parameters<typeof createAgentSessionRuntime>[1],
+	): Promise<AgentSessionRuntime> {
+		const initialSessionOptions = options.sessionOptions;
+		const createRuntime: CreateAgentSessionRuntimeFactory = async (runtimeOptions) => {
+			let createdSession: AgentSession | undefined;
+			const getCurrentState = () => {
+				const state = getState();
+				// Prewarm can issue host requests before a replacement is installed.
+				// Neither that kernel nor a retired one may act on a different session.
+				return createdSession && state?.runtime.session === createdSession ? state : undefined;
+			};
+			const requireHeartbeatState = () => {
+				const state = getCurrentState();
+				if (!state) throw new Error("RLM heartbeat state is not ready for this session yet");
+				return state;
+			};
+			const result = await this.options.createRuntime({
+				...runtimeOptions,
+				sessionOptions: {
+					...initialSessionOptions,
+					...runtimeOptions.sessionOptions,
+					rlmHeartbeatController: {
+						listRlmHeartbeats: (listOptions) =>
+							this.cronStore.listRlmHeartbeats(requireHeartbeatState().activeSessionId, listOptions),
+						createRlmHeartbeat: (input) => this.createRlmHeartbeatForState(requireHeartbeatState(), input),
+						updateRlmHeartbeat: (input) => this.updateRlmHeartbeatForState(requireHeartbeatState(), input),
+						deleteRlmHeartbeat: (id) => this.deleteRlmHeartbeatForState(requireHeartbeatState(), id),
+					},
+					agentMessageController: this.createAgentMessageController(getCurrentState),
+					agentObserveController: this.createAgentObserveController(getCurrentState),
+				},
+			});
+			createdSession = result.session;
+			return result;
+		};
+		// AgentSessionRuntime retains this factory for switch/new/fork/import.
+		// Preserve creation options and bind fresh controllers before each constructor.
+		return createAgentSessionRuntime(createRuntime, options);
+	}
+
 	private async createRuntime(
 		command: Extract<DaemonCommand, { type: "create" }>,
 		runtimeOpenGuard?: RuntimeOpenGuard,
@@ -2023,43 +2065,13 @@ export class AgentDaemon {
 			// while the runtime loads them, so it must be in process.env for the
 			// duration; withClientEnv restores it after.
 			const runtime = await withClientEnv(clientEnv, () =>
-				createAgentSessionRuntime(this.options.createRuntime, {
+				this.createDaemonRuntime(() => stateRef, {
 					cwd: sessionManager.getCwd(),
 					agentDir,
 					sessionManager,
 					sessionConfig: config,
 					runtimeMetadata: command.runtimeMetadata,
 					sessionLease,
-					sessionOptions: {
-						rlmHeartbeatController: {
-							listRlmHeartbeats: (listOptions) => {
-								if (!stateRef) {
-									throw new Error("RLM heartbeat state is not ready for this session yet");
-								}
-								return this.cronStore.listRlmHeartbeats(stateRef.activeSessionId, listOptions);
-							},
-							createRlmHeartbeat: (input) => {
-								if (!stateRef) {
-									throw new Error("RLM heartbeat state is not ready for this session yet");
-								}
-								return this.createRlmHeartbeatForState(stateRef, input);
-							},
-							updateRlmHeartbeat: (input) => {
-								if (!stateRef) {
-									throw new Error("RLM heartbeat state is not ready for this session yet");
-								}
-								return this.updateRlmHeartbeatForState(stateRef, input);
-							},
-							deleteRlmHeartbeat: (id) => {
-								if (!stateRef) {
-									throw new Error("RLM heartbeat state is not ready for this session yet");
-								}
-								return this.deleteRlmHeartbeatForState(stateRef, id);
-							},
-						},
-						agentMessageController: this.createAgentMessageController(() => stateRef),
-						agentObserveController: this.createAgentObserveController(() => stateRef),
-					},
 				}),
 			);
 			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
@@ -2896,7 +2908,7 @@ export class AgentDaemon {
 		let stateRef: ActiveSessionState | undefined;
 		// Subagents inherit the parent's client env (e.g. herdr pane identity).
 		const runtime = await withClientEnv(parentState.clientEnv, () =>
-			createAgentSessionRuntime(this.options.createRuntime, {
+			this.createDaemonRuntime(() => stateRef, {
 				cwd: sessionManager.getCwd(),
 				agentDir: parentState.runtime.services.agentDir,
 				sessionManager,
@@ -2912,34 +2924,6 @@ export class AgentDaemon {
 					customTools: options.customTools,
 					includeGoals: options.includeGoals,
 					includeCompactSkill: options.includeCompactSkill,
-					agentMessageController: this.createAgentMessageController(() => stateRef),
-					agentObserveController: this.createAgentObserveController(() => stateRef),
-					rlmHeartbeatController: {
-						listRlmHeartbeats: (listOptions) => {
-							if (!stateRef) {
-								throw new Error("RLM heartbeat state is not ready for this session yet");
-							}
-							return this.cronStore.listRlmHeartbeats(stateRef.activeSessionId, listOptions);
-						},
-						createRlmHeartbeat: (input) => {
-							if (!stateRef) {
-								throw new Error("RLM heartbeat state is not ready for this session yet");
-							}
-							return this.createRlmHeartbeatForState(stateRef, input);
-						},
-						updateRlmHeartbeat: (input) => {
-							if (!stateRef) {
-								throw new Error("RLM heartbeat state is not ready for this session yet");
-							}
-							return this.updateRlmHeartbeatForState(stateRef, input);
-						},
-						deleteRlmHeartbeat: (id) => {
-							if (!stateRef) {
-								throw new Error("RLM heartbeat state is not ready for this session yet");
-							}
-							return this.deleteRlmHeartbeatForState(stateRef, id);
-						},
-					},
 					rlmDepth: options.rlmDepth,
 					rlmMaxDepth: options.rlmMaxDepth,
 					rlmSessionDir: options.sessionDir,
@@ -3317,7 +3301,7 @@ export class AgentDaemon {
 				}
 			}
 			runtime = await withClientEnv(hydrationEnv, () =>
-				createAgentSessionRuntime(this.options.createRuntime, {
+				this.createDaemonRuntime(() => stateRef, {
 					cwd: sessionManager.getCwd(),
 					agentDir: parentState.runtime.services.agentDir,
 					sessionManager,
@@ -3326,34 +3310,6 @@ export class AgentDaemon {
 					sessionLease,
 					sessionOptions: {
 						...(rehydratedModel ? { model: rehydratedModel } : {}),
-						agentMessageController: this.createAgentMessageController(() => stateRef),
-						agentObserveController: this.createAgentObserveController(() => stateRef),
-						rlmHeartbeatController: {
-							listRlmHeartbeats: (listOptions) => {
-								if (!stateRef) {
-									throw new Error("RLM heartbeat state is not ready for this session yet");
-								}
-								return this.cronStore.listRlmHeartbeats(stateRef.activeSessionId, listOptions);
-							},
-							createRlmHeartbeat: (input) => {
-								if (!stateRef) {
-									throw new Error("RLM heartbeat state is not ready for this session yet");
-								}
-								return this.createRlmHeartbeatForState(stateRef, input);
-							},
-							updateRlmHeartbeat: (input) => {
-								if (!stateRef) {
-									throw new Error("RLM heartbeat state is not ready for this session yet");
-								}
-								return this.updateRlmHeartbeatForState(stateRef, input);
-							},
-							deleteRlmHeartbeat: (id) => {
-								if (!stateRef) {
-									throw new Error("RLM heartbeat state is not ready for this session yet");
-								}
-								return this.deleteRlmHeartbeatForState(stateRef, id);
-							},
-						},
 						rlmSessionDir: entry.sessionDir,
 						// Registry depth is authoritative (written at spawn); for legacy entries
 						// without it, the shared accessor resolves persisted header depth or the
