@@ -54,6 +54,7 @@ class FakeDaemonClient {
 	promptGate: Promise<void> | undefined;
 	promptError: Error | undefined;
 	promptResponseError: string | undefined;
+	listResponseError: string | undefined;
 	cancelPromptAdmissionStatus: "cancelled" | "owned" | "unknown" = "owned";
 	serverCapabilities = new Set<string>();
 	updateRestartSessions: Array<Record<string, unknown>> = [];
@@ -95,6 +96,9 @@ class FakeDaemonClient {
 					data: { status: this.cancelPromptAdmissionStatus },
 				};
 			case "list":
+				if (this.listResponseError) {
+					return { type: "response", command: command.type, success: false, error: this.listResponseError };
+				}
 				return {
 					type: "response",
 					command: command.type,
@@ -1169,18 +1173,22 @@ describe("DaemonAgentConnection", () => {
 	});
 
 	it.each([
-		["rollback", "ready"],
-		["rollback", undefined],
-		["restart", "ready"],
+		["rollback", "ready", false],
+		["rollback", undefined, false],
+		["restart", "ready", false],
+		["restart", "stopping", false],
+		["restart", "ready", true],
 	] as const)(
-		"restores a pause-held direct link after update prepare %s (workerState=%s, #2260)",
-		async (outcome, workerState) => {
+		"restores a pause-held direct link after update prepare %s (workerState=%s, listRejected=%s, #2260)",
+		async (outcome, workerState, rejectList) => {
 			vi.useFakeTimers();
 			const supervisor = new FakeDaemonClient();
 			supervisor.hello = { ...supervisor.hello!, supervisorGeneration: "predecessor" };
 			supervisor.serverCapabilities.add("session_input_pause");
 			const activeSessionId = outcome === "rollback" ? "active-1" : "active-restored";
 			supervisor.updateRestartSessions = [{ activeSessionId, sessionId: "session-current", workerState }];
+			if (workerState === "stopping") supervisor.updateRestartSessions[0].activeSessionId = "active-1";
+			supervisor.listResponseError = rejectList ? "Daemon is shutting down" : undefined;
 			const direct = new FakeDaemonClient();
 			const routed = new DaemonRoutedClient(asDaemonClient(supervisor), direct as unknown as DaemonWorkerClient);
 			const connection = new DaemonAgentConnection(routed, "active-1");
@@ -1194,10 +1202,16 @@ describe("DaemonAgentConnection", () => {
 				direct.emitMessage({ type: "daemon_closing", reason: "update" });
 				direct.connected = false;
 				direct.emitClose(new DaemonSocketClosedError("/tmp/worker.sock", "update"));
-				await vi.advanceTimersByTimeAsync(0);
+				await vi.advanceTimersByTimeAsync(300);
+				expect(supervisor.resetTransportCount).toBe(0);
+				expect(supervisor.reconnectCount).toBe(1);
 				if (outcome === "restart") {
 					expect(events.filter((event) => event.type === "session_resynced")).toEqual([]);
+					expect(supervisor.requests.filter((command) => command.type === "list")).toHaveLength(4);
 					supervisor.hello = { ...supervisor.hello!, supervisorGeneration: "successor" };
+					supervisor.listResponseError = undefined;
+					supervisor.updateRestartSessions[0].activeSessionId = activeSessionId;
+					supervisor.updateRestartSessions[0].workerState = "ready";
 				}
 				await vi.advanceTimersByTimeAsync(120100);
 				expect(events.filter((event) => event.type === "closed")).toEqual([]);
@@ -1626,26 +1640,25 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests.at(-1)).toMatchObject({ type: "detach", activeSessionId: "active-restored" });
 	});
 
-	it("returns to normal close handling after update restoration times out", async () => {
+	it.each(["connect", "list"])("ends update restoration when %s fails for 120 seconds", async (failure) => {
 		vi.useFakeTimers();
 		try {
 			const fakeClient = new FakeDaemonClient();
-			fakeClient.reconnectError = new Error("daemon unavailable");
+			fakeClient.reconnectError = failure === "connect" ? new Error("daemon unavailable") : undefined;
+			fakeClient.hello = { ...fakeClient.hello!, supervisorGeneration: "predecessor" };
+			fakeClient.listResponseError = failure === "list" ? "daemon unavailable" : undefined;
 			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
 			const closedEvents: AgentConnectionEvent[] = [];
 			connection.subscribe((event) => {
-				if (event.type === "closed") {
-					closedEvents.push(event);
-				}
+				if (event.type === "closed") closedEvents.push(event);
 			});
 			await connection.attach();
 
-			fakeClient.emitMessage({
-				type: "session_closed",
-				activeSessionId: "active-original",
-				reason: "update",
-			});
-			await vi.advanceTimersByTimeAsync(120100);
+			fakeClient.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "update" });
+			await vi.advanceTimersByTimeAsync(119_999);
+			expect(closedEvents).toEqual([]);
+			await vi.advanceTimersByTimeAsync(1);
+			if (failure === "list") expect(fakeClient.resetTransportCount).toBe(0);
 
 			expect(closedEvents).toHaveLength(1);
 			const closedError = closedEvents[0]?.type === "closed" ? closedEvents[0].error : undefined;

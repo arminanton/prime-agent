@@ -197,7 +197,7 @@ function reconnectDaemonTransportAfterUpdate(
 					lastError = error;
 					if (Date.now() >= deadline) throw error;
 					if (![...participants.keys()].some((active) => active())) return;
-					transport.resetTransportForReconnect();
+					if (!transport.isConnected) transport.resetTransportForReconnect();
 				}
 				await delay(Math.max(0, Math.min(UPDATE_RECONNECT_RETRY_MS, deadline - Date.now())));
 			}
