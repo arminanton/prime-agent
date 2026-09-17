@@ -1,0 +1,3 @@
+- Changed GitHub Copilot requests to use the CLI identity to access all the models that are actually available in the Copilot CLI.
+- Expanded the Copilot catalog from 28 to 36 models with current context limits and reasoning options.
+- Fixed Copilot login to request consent before enabling models with unconfigured policies.

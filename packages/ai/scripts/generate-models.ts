@@ -23,6 +23,7 @@ import {
 	KnownProvider,
 	Model,
 	type OpenAICompletionsCompat,
+	type ThinkingLevelMap,
 } from "../src/types.js";
 import { MODELS as EXISTING_MODELS } from "../src/models.generated.js";
 import { renderModelsFile } from "./render-models.js";
@@ -45,6 +46,18 @@ interface ModelsDevModel {
 		output?: number;
 		cache_read?: number;
 		cache_write?: number;
+	};
+	reasoning_options?: {
+		type?: string;
+		values?: string[];
+	}[];
+	experimental?: {
+		modes?: Record<
+			string,
+			{
+				cost?: ModelsDevModel["cost"];
+			}
+		>;
 	};
 	modalities?: {
 		input?: string[];
@@ -70,6 +83,84 @@ interface AiGatewayModel {
 }
 
 const COPILOT_STATIC_HEADERS = COPILOT_CLIENT_HEADERS;
+
+interface CopilotLiveLimits {
+	contextWindow: number;
+	maxTokens: number;
+}
+
+// Copilot CLI 1.0.84-5 snapshot (2026-09-14). Context windows come from the
+// catalog; output limits use observed server caps or a client ceiling for
+// models without an enforced output cap. These fallbacks do not grant access.
+const modelsDevCopilotSourceIds = new Set<string>();
+
+const COPILOT_LIVE_LIMITS: Record<string, CopilotLiveLimits> = {
+	"claude-fable-5": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	"claude-fable-5.1": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	"claude-opus-4.5": { contextWindow: 200_000, maxTokens: 32_000 },
+	"claude-opus-4.6": { contextWindow: 200_000, maxTokens: 32_000 },
+	"claude-opus-4.7": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	"claude-opus-4.8": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	// GitHub documentation says fast mode cannot select the 1M context tier,
+	// while CAPI reports this raw maximum. Preserve the server capability here;
+	// no context-tier field is sent on inference requests.
+	"claude-opus-4.8-fast": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	"claude-opus-5": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	"claude-sonnet-4": { contextWindow: 216_000, maxTokens: 16_000 },
+	"claude-sonnet-4.5": { contextWindow: 200_000, maxTokens: 32_000 },
+	"claude-sonnet-4.6": { contextWindow: 200_000, maxTokens: 32_000 },
+	"claude-sonnet-5": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	"gemini-3.5-flash": { contextWindow: 1_000_000, maxTokens: 200_000 },
+	"gemini-3.6-flash": { contextWindow: 1_000_000, maxTokens: 200_000 },
+	"gemini-3.7-flash": { contextWindow: 1_000_000, maxTokens: 200_000 },
+	"gemini-3.8-flash": { contextWindow: 1_048_576, maxTokens: 200_000 },
+	"gpt-4.1": { contextWindow: 128_000, maxTokens: 16_384 },
+	"gpt-5.2": { contextWindow: 400_000, maxTokens: 128_000 },
+	"gpt-5.2-codex": { contextWindow: 400_000, maxTokens: 128_000 },
+	"gpt-5.3-codex": { contextWindow: 400_000, maxTokens: 128_000 },
+	"gpt-5.4-mini": { contextWindow: 400_000, maxTokens: 128_000 },
+	"gpt-5.4-nano": { contextWindow: 400_000, maxTokens: 128_000 },
+	"gpt-5.4": { contextWindow: 1_050_000, maxTokens: 128_000 },
+	"gpt-5.5": { contextWindow: 1_050_000, maxTokens: 128_000 },
+	"gpt-5.6-luna": { contextWindow: 1_050_000, maxTokens: 128_000 },
+	"gpt-5.6-sol": { contextWindow: 1_050_000, maxTokens: 128_000 },
+	"gpt-5.6-terra": { contextWindow: 1_050_000, maxTokens: 128_000 },
+	"gpt-6-astra": { contextWindow: 1_000_000, maxTokens: 128_000 },
+	"grok-4.5": { contextWindow: 500_000, maxTokens: 128_000 },
+	"grok-4.6": { contextWindow: 500_000, maxTokens: 128_000 },
+	"kimi-k2.7-code": { contextWindow: 256_000, maxTokens: 32_000 },
+	"kimi-k3": { contextWindow: 1_048_576, maxTokens: 131_072 },
+	"mai-code-1-flash-picker": { contextWindow: 256_000, maxTokens: 128_000 },
+	"mai-code-1.1-flash": { contextWindow: 256_000, maxTokens: 128_000 },
+	"gpt-5-mini": { contextWindow: 264_000, maxTokens: 64_000 },
+	"claude-haiku-4.5": { contextWindow: 200_000, maxTokens: 64_000 },
+};
+
+const COPILOT_LIVE_REASONING_EFFORTS: Record<string, readonly string[]> = {
+	"claude-opus-4.7": ["low", "medium", "high", "xhigh", "max"],
+	"claude-opus-4.8": ["low", "medium", "high", "xhigh", "max"],
+	"claude-opus-4.8-fast": ["low", "medium", "high", "xhigh", "max"],
+	"claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
+	"claude-sonnet-5": ["low", "medium", "high", "xhigh", "max"],
+	"gemini-3.5-flash": ["minimal", "low", "medium", "high"],
+	"gemini-3.6-flash": ["minimal", "low", "medium", "high"],
+	"gemini-3.7-flash": ["low", "medium", "high"],
+	"gemini-3.8-flash": ["low", "medium", "high"],
+	"gpt-5.3-codex": ["low", "medium", "high", "xhigh"],
+	"gpt-5.4": ["none", "low", "medium", "high", "xhigh"],
+	"gpt-5.4-mini": ["none", "low", "medium", "high", "xhigh"],
+	"gpt-5.4-nano": ["none", "low", "medium", "high", "xhigh"],
+	"gpt-5.5": ["none", "low", "medium", "high", "xhigh"],
+	"gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
+	"gpt-5.6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
+	"gpt-5.6-terra": ["none", "low", "medium", "high", "xhigh", "max"],
+	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
+	"grok-4.5": ["low", "medium", "high"],
+	"grok-4.6": ["low", "medium", "high", "xhigh"],
+	"mai-code-1-flash-picker": ["low", "medium", "high"],
+	"mai-code-1.1-flash": ["low", "medium", "high"],
+	"gpt-5-mini": ["low", "medium", "high"],
+};
 
 const KIMI_STATIC_HEADERS = {
 	"User-Agent": "KimiCLI/1.5",
@@ -226,6 +317,24 @@ const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
 
 function mergeThinkingLevelMap(model: Model<any>, map: NonNullable<Model<any>["thinkingLevelMap"]>): void {
 	model.thinkingLevelMap = { ...model.thinkingLevelMap, ...map };
+}
+
+function thinkingLevelMapFromEfforts(values: readonly string[]): ThinkingLevelMap {
+	const supported = new Set(values);
+	return {
+		off: supported.has("none") ? "none" : null,
+		minimal: supported.has("minimal") ? "minimal" : null,
+		low: supported.has("low") ? "low" : null,
+		medium: supported.has("medium") ? "medium" : null,
+		high: supported.has("high") ? "high" : null,
+		xhigh: supported.has("xhigh") ? "xhigh" : null,
+		max: supported.has("max") ? "max" : null,
+	};
+}
+
+function getModelsDevThinkingLevelMap(model: ModelsDevModel): ThinkingLevelMap | undefined {
+	const effort = model.reasoning_options?.find((option) => option.type === "effort");
+	return effort?.values?.length ? thinkingLevelMapFromEfforts(effort.values) : undefined;
 }
 
 function supportsOpenAiXhigh(modelId: string): boolean {
@@ -1251,17 +1360,31 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		}
 
 		// Process GitHub Copilot models
-		if (data["github-copilot"]?.models) {
-			for (const [modelId, model] of Object.entries(data["github-copilot"].models)) {
+		const copilotSourceModels = data["github-copilot"]?.models;
+		if (copilotSourceModels) {
+			modelsDevCopilotSourceIds.clear();
+			for (const modelId of Object.keys(copilotSourceModels)) {
+				modelsDevCopilotSourceIds.add(modelId);
+			}
+			const hasStandaloneOpusFast = Object.prototype.hasOwnProperty.call(
+				copilotSourceModels,
+				"claude-opus-4.8-fast",
+			);
+			for (const [modelId, model] of Object.entries(copilotSourceModels)) {
 				const m = model as ModelsDevModel & { status?: string };
 				if (m.tool_call !== true) continue;
 				if (m.status === "deprecated") continue;
 
-				// Copilot proxies Claude via the Anthropic Messages API
+				// Copilot proxies Claude via the Anthropic Messages API.
 				const isCopilotClaude = modelId.startsWith("claude-");
-				// gpt-5/gpt-6 models require responses API, others use completions
+				// Modern GPT, Grok, OSWE, and MAI models advertise /responses in
+				// Copilot's live catalog. Gemini and Kimi currently use completions.
 				const needsResponsesApi =
-					modelId.startsWith("gpt-5") || modelId.startsWith("gpt-6") || modelId.startsWith("oswe");
+					modelId.startsWith("gpt-5") ||
+					modelId.startsWith("gpt-6") ||
+					modelId.startsWith("oswe") ||
+					modelId.startsWith("grok") ||
+					modelId.startsWith("mai-code");
 
 				const api: Api = isCopilotClaude
 					? "anthropic-messages"
@@ -1271,14 +1394,16 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 
 				const anthropicCompat =
 					api === "anthropic-messages" ? getAnthropicMessagesCompat("github-copilot", modelId) : undefined;
+				const thinkingLevelMap = getModelsDevThinkingLevelMap(m);
 
-				const copilotModel: Model<any> = {
+				const copilotModel: Model<Api> = {
 					id: modelId,
 					name: m.name || modelId,
 					api,
 					provider: "github-copilot",
 					baseUrl: "https://api.individual.githubcopilot.com",
 					reasoning: m.reasoning === true,
+					...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
@@ -1291,16 +1416,35 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					headers: { ...COPILOT_STATIC_HEADERS },
 					...(anthropicCompat ? { compat: anthropicCompat } : {}),
 					// compat only applies to openai-completions
-					...(api === "openai-completions" ? {
-						compat: {
-							supportsStore: false,
-							supportsDeveloperRole: false,
-							supportsReasoningEffort: false,
-						},
-					} : {}),
+					...(api === "openai-completions"
+						? {
+								compat: {
+									supportsStore: false,
+									supportsDeveloperRole: false,
+									supportsReasoningEffort: false,
+								},
+							}
+						: {}),
 				};
 
 				models.push(copilotModel);
+
+				// models.dev exposes Copilot's fast route as a mode on the base model,
+				// while the live CAPI catalog exposes it as this separate model ID.
+				const fastMode = m.experimental?.modes?.fast;
+				if (modelId === "claude-opus-4.8" && fastMode && !hasStandaloneOpusFast) {
+					models.push({
+						...copilotModel,
+						id: "claude-opus-4.8-fast",
+						name: "Claude Opus 4.8 (fast mode)",
+						cost: {
+							input: fastMode.cost?.input ?? copilotModel.cost.input,
+							output: fastMode.cost?.output ?? copilotModel.cost.output,
+							cacheRead: fastMode.cost?.cache_read ?? copilotModel.cost.cacheRead,
+							cacheWrite: fastMode.cost?.cache_write ?? copilotModel.cost.cacheWrite,
+						},
+					});
+				}
 			}
 		}
 
@@ -1465,19 +1609,46 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 }
 
 async function generateModels() {
+	// A provider filter supports focused, reproducible catalog refreshes without
+	// accepting unrelated churn from the other live catalogs.
+	const providerFilter = process.env.GENERATE_MODELS_PROVIDER?.trim();
+	if (providerFilter && providerFilter !== "github-copilot") {
+		throw new Error("GENERATE_MODELS_PROVIDER currently supports only github-copilot");
+	}
+
 	// Fetch models from both sources
 	// models.dev: Anthropic, Google, OpenAI, Groq, Cerebras
 	// OpenRouter: xAI and other providers (excluding Anthropic, Google, OpenAI)
 	// AI Gateway: OpenAI-compatible catalog with tool-capable models
 	const modelsDevModels = await loadModelsDevData();
-	const openRouterModels = await fetchOpenRouterModels();
-	const aiGatewayModels = await fetchAiGatewayModels();
+	const openRouterModels = providerFilter ? [] : await fetchOpenRouterModels();
+	const aiGatewayModels = providerFilter ? [] : await fetchAiGatewayModels();
 
 	// Combine models (models.dev has priority)
 	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels].filter(
 		(model) =>
 			!((model.provider === "opencode" || model.provider === "opencode-go") && model.id === "gpt-5.3-codex-spark"),
 	);
+
+	// An omitted model is not necessarily retired. Keep existing fallbacks;
+	// the Copilot server still controls each account's access.
+	const generatedCopilotIds = new Set(
+		allModels.filter((model) => model.provider === "github-copilot").map((model) => model.id),
+	);
+	const existingCopilotModels = Object.values(
+		EXISTING_MODELS["github-copilot"] as unknown as Record<string, Model<Api>>,
+	);
+	for (const model of existingCopilotModels) {
+		if (generatedCopilotIds.has(model.id) || modelsDevCopilotSourceIds.has(model.id)) continue;
+		allModels.push({
+			...model,
+			input: [...model.input],
+			cost: { ...model.cost },
+			...(model.compat ? { compat: { ...model.compat } } : {}),
+			...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
+			headers: { ...COPILOT_STATIC_HEADERS },
+		});
+	}
 
 	// Fix incorrect cache pricing for Claude Opus 4.5 from models.dev
 	// models.dev has 3x the correct pricing (1.5/18.75 instead of 0.5/6.25)
@@ -1489,6 +1660,22 @@ async function generateModels() {
 
 	// Temporary overrides until upstream model metadata is corrected.
 	for (const candidate of allModels) {
+		if (candidate.provider === "github-copilot") {
+			candidate.headers = { ...COPILOT_STATIC_HEADERS };
+			const liveLimits = COPILOT_LIVE_LIMITS[candidate.id];
+			if (liveLimits) {
+				candidate.contextWindow = liveLimits.contextWindow;
+				candidate.maxTokens = liveLimits.maxTokens;
+			}
+			const liveEfforts = COPILOT_LIVE_REASONING_EFFORTS[candidate.id];
+			if (liveEfforts) {
+				candidate.thinkingLevelMap = thinkingLevelMapFromEfforts(liveEfforts);
+			}
+			if (candidate.id.startsWith("mai-code") || candidate.id.startsWith("gpt-6")) {
+				candidate.api = "openai-responses";
+				delete candidate.compat;
+			}
+		}
 		if (candidate.provider === "amazon-bedrock" && candidate.id.includes("anthropic.claude-opus-4-6-v1")) {
 			candidate.cost.cacheRead = 0.5;
 			candidate.cost.cacheWrite = 6.25;
@@ -1496,8 +1683,7 @@ async function generateModels() {
 		if (
 			(candidate.provider === "anthropic" ||
 				candidate.provider === "opencode" ||
-				candidate.provider === "opencode-go" ||
-				candidate.provider === "github-copilot") &&
+				candidate.provider === "opencode-go") &&
 			(candidate.id === "claude-opus-4-6" ||
 				candidate.id === "claude-sonnet-4-6" ||
 				candidate.id === "claude-opus-4.6" ||
@@ -2242,8 +2428,10 @@ async function generateModels() {
 	];
 	allModels.push(...vertexModels);
 
-	const primeInferenceModels = await fetchPrimeInferenceModels();
-	allModels.push(...primeInferenceModels);
+	if (!providerFilter) {
+		const primeInferenceModels = await fetchPrimeInferenceModels();
+		allModels.push(...primeInferenceModels);
+	}
 
 	const azureOpenAiModels: Model<Api>[] = allModels
 		.filter((model) => model.provider === "openai" && model.api === "openai-responses")
@@ -2260,7 +2448,7 @@ async function generateModels() {
 	}
 
 	// Group by provider and deduplicate by model ID
-	const providers: Record<string, Record<string, Model<Api>>> = {};
+	let providers: Record<string, Record<string, Model<Api>>> = {};
 	for (const model of allModels) {
 		if (!providers[model.provider]) {
 			providers[model.provider] = {};
@@ -2270,6 +2458,17 @@ async function generateModels() {
 		if (!providers[model.provider][model.id]) {
 			providers[model.provider][model.id] = model;
 		}
+	}
+
+	if (providerFilter) {
+		const generatedProvider = providers[providerFilter];
+		if (!generatedProvider) {
+			throw new Error(`No generated models for provider: ${providerFilter}`);
+		}
+		providers = {
+			...(EXISTING_MODELS as unknown as Record<string, Record<string, Model<Api>>>),
+			[providerFilter]: generatedProvider,
+		};
 	}
 
 	// Generate TypeScript file. JSON string literals prevent remote catalog
@@ -2294,4 +2493,7 @@ async function generateModels() {
 }
 
 // Run the generator
-generateModels().catch(console.error);
+generateModels().catch((error) => {
+	console.error(error);
+	process.exitCode = 1;
+});

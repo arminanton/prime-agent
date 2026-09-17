@@ -259,10 +259,10 @@ describe("Anthropic request wire contract", () => {
 
 		expect(request.headers.authorization).toBe("Bearer tid_copilot_session_test_token");
 		expect(request.headers["x-api-key"]).toBeUndefined();
-		expect(request.headers["user-agent"]).toContain("GitHubCopilotChat");
-		expect(request.headers["copilot-integration-id"]).toBe("vscode-chat");
+		expect(request.headers["user-agent"]).toContain("copilot/1.0.84-5");
+		expect(request.headers["copilot-integration-id"]).toBe("copilot-developer-cli");
 		expect(request.headers["x-initiator"]).toBe("user");
-		expect(request.headers["openai-intent"]).toBe("conversation-edits");
+		expect(request.headers["openai-intent"]).toBe("conversation-agent");
 		expect(request.headers["anthropic-beta"] ?? "").not.toContain("fine-grained-tool-streaming");
 
 		expect(request.body.model).toBe("claude-sonnet-4.6");

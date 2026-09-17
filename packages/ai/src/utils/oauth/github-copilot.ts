@@ -1,5 +1,10 @@
-import { COPILOT_CLIENT_HEADERS, COPILOT_CLIENT_USER_AGENT } from "../../copilot-client-version.js";
-import { getModels } from "../../models.js";
+import {
+	buildCopilotCatalogHeaders,
+	copilotApiVersion,
+	copilotCliVersion,
+	copilotControlPlaneUserAgent,
+	copilotIntegrationId,
+} from "../../providers/github-copilot-headers.js";
 import type { Api, Model } from "../../types.js";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "./types.js";
 
@@ -10,7 +15,14 @@ type CopilotCredentials = OAuthCredentials & {
 const decode = (s: string) => atob(s);
 const CLIENT_ID = decode("SXYxLmI1MDdhMDhjODdlY2ZlOTg=");
 
-const COPILOT_HEADERS = COPILOT_CLIENT_HEADERS;
+// Read overrides per call, using the same identity as inference requests.
+function copilotControlPlaneHeaders(): Record<string, string> {
+	return {
+		"User-Agent": copilotControlPlaneUserAgent(),
+		"Editor-Version": `copilot/${copilotCliVersion()}`,
+		"Copilot-Integration-Id": copilotIntegrationId(),
+	};
+}
 
 const INITIAL_POLL_INTERVAL_MULTIPLIER = 1.2;
 const SLOW_DOWN_POLL_INTERVAL_MULTIPLIER = 1.4;
@@ -96,7 +108,7 @@ async function startDeviceFlow(domain: string): Promise<DeviceCodeResponse> {
 		headers: {
 			Accept: "application/json",
 			"Content-Type": "application/x-www-form-urlencoded",
-			"User-Agent": COPILOT_CLIENT_USER_AGENT,
+			"User-Agent": copilotControlPlaneUserAgent(),
 		},
 		body: new URLSearchParams({
 			client_id: CLIENT_ID,
@@ -180,7 +192,7 @@ async function pollForGitHubAccessToken(
 			headers: {
 				Accept: "application/json",
 				"Content-Type": "application/x-www-form-urlencoded",
-				"User-Agent": COPILOT_CLIENT_USER_AGENT,
+				"User-Agent": copilotControlPlaneUserAgent(),
 			},
 			body: new URLSearchParams({
 				client_id: CLIENT_ID,
@@ -232,7 +244,7 @@ export async function refreshGitHubCopilotToken(
 		headers: {
 			Accept: "application/json",
 			Authorization: `Bearer ${refreshToken}`,
-			...COPILOT_HEADERS,
+			...copilotControlPlaneHeaders(),
 		},
 	});
 
@@ -255,13 +267,40 @@ export async function refreshGitHubCopilotToken(
 	};
 }
 
-/**
- * Enable a model for the user's GitHub Copilot account.
- * This is required for some models (like Claude, Grok) before they can be used.
- */
+interface UnconfiguredCopilotModel {
+	id: string;
+	terms?: string;
+}
+
+/** Return only live models whose policy explicitly requires enablement. */
+async function getUnconfiguredGitHubCopilotModels(
+	token: string,
+	enterpriseDomain?: string,
+): Promise<UnconfiguredCopilotModel[]> {
+	const baseUrl = getGitHubCopilotBaseUrl(token, enterpriseDomain);
+	const response = await fetch(`${baseUrl}/models`, {
+		headers: { ...buildCopilotCatalogHeaders(), Authorization: `Bearer ${token}` },
+	});
+	if (!response.ok) return [];
+	const payload = (await response.json()) as unknown;
+	if (!payload || typeof payload !== "object" || !("data" in payload) || !Array.isArray(payload.data)) {
+		return [];
+	}
+	return payload.data.flatMap((entry) => {
+		if (!entry || typeof entry !== "object") return [];
+		const { id, policy } = entry as {
+			id?: unknown;
+			policy?: { state?: unknown; terms?: unknown };
+		};
+		if (typeof id !== "string" || policy?.state !== "unconfigured") return [];
+		return [{ id, ...(typeof policy.terms === "string" ? { terms: policy.terms } : {}) }];
+	});
+}
+
+/** Enable one live model whose policy is explicitly unconfigured. */
 async function enableGitHubCopilotModel(token: string, modelId: string, enterpriseDomain?: string): Promise<boolean> {
 	const baseUrl = getGitHubCopilotBaseUrl(token, enterpriseDomain);
-	const url = `${baseUrl}/models/${modelId}/policy`;
+	const url = `${baseUrl}/models/${encodeURIComponent(modelId)}/policy`;
 
 	try {
 		const response = await fetch(url, {
@@ -269,7 +308,8 @@ async function enableGitHubCopilotModel(token: string, modelId: string, enterpri
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${token}`,
-				...COPILOT_HEADERS,
+				...copilotControlPlaneHeaders(),
+				"X-GitHub-Api-Version": copilotApiVersion(),
 				"openai-intent": "chat-policy",
 				"x-interaction-type": "chat-policy",
 			},
@@ -281,16 +321,20 @@ async function enableGitHubCopilotModel(token: string, modelId: string, enterpri
 	}
 }
 
-/**
- * Enable all known GitHub Copilot models that may require policy acceptance.
- * Called after successful login to ensure all models are available.
- */
-async function enableAllGitHubCopilotModels(
+/** Enable only live unconfigured entries after explicit terms acceptance. */
+async function enableUnconfiguredGitHubCopilotModels(
 	token: string,
-	enterpriseDomain?: string,
+	enterpriseDomain: string | undefined,
+	confirm: (models: readonly UnconfiguredCopilotModel[]) => Promise<boolean>,
 	onProgress?: (model: string, success: boolean) => void,
 ): Promise<void> {
-	const models = getModels("github-copilot");
+	let models: UnconfiguredCopilotModel[];
+	try {
+		models = await getUnconfiguredGitHubCopilotModels(token, enterpriseDomain);
+	} catch {
+		return;
+	}
+	if (models.length === 0 || !(await confirm(models))) return;
 	await Promise.all(
 		models.map(async (model) => {
 			const success = await enableGitHubCopilotModel(token, model.id, enterpriseDomain);
@@ -342,8 +386,25 @@ export async function loginGitHubCopilot(options: {
 	);
 	const credentials = await refreshGitHubCopilotToken(githubAccessToken, enterpriseDomain ?? undefined);
 
-	options.onProgress?.("Enabling models...");
-	await enableAllGitHubCopilotModels(credentials.access, enterpriseDomain ?? undefined);
+	options.onProgress?.("Checking model policies...");
+	await enableUnconfiguredGitHubCopilotModels(
+		credentials.access,
+		enterpriseDomain ?? undefined,
+		async (models) => {
+			const details = models
+				.map((model) => `- ${model.id}${model.terms ? `: ${model.terms.slice(0, 500)}` : ""}`)
+				.join("\n")
+				.slice(0, 4000);
+			const answer = await options.onPrompt({
+				message: `Enable these GitHub Copilot models and accept their listed terms?\n${details}\nType yes to accept`,
+				placeholder: "yes",
+				allowEmpty: true,
+			});
+			if (options.signal?.aborted) throw new Error("Login cancelled");
+			return /^(?:y|yes)$/i.test(answer.trim());
+		},
+		(model, success) => options.onProgress?.(`${success ? "Enabled" : "Could not enable"} ${model}`),
+	);
 	return credentials;
 }
 

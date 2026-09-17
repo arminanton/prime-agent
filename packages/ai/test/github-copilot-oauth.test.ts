@@ -51,6 +51,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 				expect(init?.headers).toMatchObject({
 					Accept: "application/json",
 					"Content-Type": "application/x-www-form-urlencoded",
+					"User-Agent": expect.stringMatching(/^copilot\/1\.0\.84-5 /),
 				});
 				expect(String(init?.body)).toContain("client_id=");
 				expect(String(init?.body)).toContain("scope=read%3Auser");
@@ -81,9 +82,24 @@ describe("GitHub Copilot OAuth device flow", () => {
 			}
 
 			if (url.includes("/copilot_internal/v2/token")) {
+				expect(init?.headers).toMatchObject({
+					"User-Agent": expect.stringMatching(/^copilot\/1\.0\.84-5 /),
+					"Editor-Version": "copilot/1.0.84-5",
+					"Copilot-Integration-Id": "copilot-developer-cli",
+				});
+				expect(init?.headers).not.toHaveProperty("Editor-Plugin-Version");
 				return jsonResponse({
 					token: "tid=test;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com;",
 					expires_at: 9999999999,
+				});
+			}
+
+			if (url.endsWith("/models")) {
+				return jsonResponse({
+					data: [
+						{ id: "live-enabled", policy: { state: "enabled" } },
+						{ id: "needs/policy", policy: { state: "unconfigured", terms: "https://terms.example/model" } },
+					],
 				});
 			}
 
@@ -96,9 +112,13 @@ describe("GitHub Copilot OAuth device flow", () => {
 
 		vi.stubGlobal("fetch", fetchMock);
 
+		const prompts: string[] = [];
 		const loginPromise = loginGitHubCopilot({
 			onAuth: () => {},
-			onPrompt: async () => "",
+			onPrompt: async ({ message }) => {
+				prompts.push(message);
+				return message.startsWith("GitHub Enterprise") ? "" : "yes";
+			},
 			onProgress: () => {},
 		});
 
@@ -123,11 +143,65 @@ describe("GitHub Copilot OAuth device flow", () => {
 		await vi.advanceTimersByTimeAsync(1);
 		await loginPromise;
 
+		expect(prompts).toHaveLength(2);
+		expect(prompts[1]).toContain("needs/policy");
+		expect(prompts[1]).toContain("https://terms.example/model");
+		const catalogCalls = fetchMock.mock.calls.filter(([input]) => getUrl(input).endsWith("/models"));
+		expect(catalogCalls).toHaveLength(1);
+		expect(catalogCalls[0][1]?.headers).toMatchObject({
+			"Copilot-Integration-Id": "copilot-developer-cli",
+			"Copilot-Harness-Id": "copilot-sdk",
+			"X-GitHub-Api-Version": "2026-08-01",
+			"User-Agent": expect.stringMatching(/^copilot\/1\.0\.84-5 \(.+\) term\/[^ ]+$/),
+		});
+		const policyCalls = fetchMock.mock.calls.filter(([input]) => getUrl(input).endsWith("/policy"));
+		expect(policyCalls).toHaveLength(1);
+		expect(getUrl(policyCalls[0][0])).toContain("/models/needs%2Fpolicy/policy");
+		expect(policyCalls[0][1]?.method).toBe("POST");
+		expect(JSON.parse(String(policyCalls[0][1]?.body))).toEqual({ state: "enabled" });
+
 		expect(accessTokenPollTimes).toEqual([
 			startTime.getTime() + 6000,
 			startTime.getTime() + 12000,
 			startTime.getTime() + 26000,
 		]);
+	});
+
+	it.each([
+		{ state: "unconfigured", answer: "no", prompts: 2 },
+		{ state: "unconfigured", answer: "", prompts: 2 },
+		{ state: "disabled", answer: "yes", prompts: 1 },
+		{ state: "enabled", answer: "yes", prompts: 1 },
+		{ state: undefined, answer: "yes", prompts: 1 },
+	])("does not enable a $state model after answering '$answer'", async ({ state, answer, prompts }) => {
+		vi.useFakeTimers();
+		const requests: string[] = [];
+		vi.stubGlobal("fetch", async (input: unknown): Promise<Response> => {
+			const url = getUrl(input);
+			requests.push(url);
+			if (url.endsWith("/login/device/code"))
+				return jsonResponse({
+					device_code: "test-device",
+					user_code: "TEST-CODE",
+					verification_uri: "https://github.com/login/device",
+					interval: 1,
+					expires_in: 60,
+				});
+			if (url.endsWith("/login/oauth/access_token")) return jsonResponse({ access_token: "gho_test_refresh" });
+			if (url.endsWith("/copilot_internal/v2/token"))
+				return jsonResponse({ token: "test-copilot-token", expires_at: 9999999999 });
+			if (url.endsWith("/models")) return jsonResponse({ data: [{ id: "test-model", policy: { state } }] });
+			return jsonResponse({});
+		});
+		let promptCount = 0;
+		const login = loginGitHubCopilot({
+			onAuth: () => {},
+			onPrompt: async () => (++promptCount === 1 ? "" : answer),
+		});
+		await vi.runAllTimersAsync();
+		expect(await login).toMatchObject({ refresh: "gho_test_refresh", access: "test-copilot-token" });
+		expect(promptCount).toBe(prompts);
+		expect(requests.filter((url) => url.endsWith("/policy"))).toEqual([]);
 	});
 
 	it("uses the remaining lifetime for a final poll before timing out after repeated slow_down responses", async () => {
