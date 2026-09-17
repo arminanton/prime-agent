@@ -1,0 +1,2 @@
+- Fixed attached clients losing update-restart recovery to stale connection failures or shutdown notices from the retiring daemon.
+- Fixed prepared update restarts archiving sessions and deleting worker descriptors during shutdown.

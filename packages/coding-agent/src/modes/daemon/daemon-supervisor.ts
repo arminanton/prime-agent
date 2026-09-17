@@ -7159,9 +7159,12 @@ export class DaemonSupervisor {
 		this.clearScheduledWakeTimer();
 		this.clearRosterWatchdogTimer();
 		await this.idleEvictionSweep?.catch(() => undefined);
-		if (closingReason) {
+		const terminalStop = this.updateRestartPhase !== "prepared";
+		// A prepared restart preserves its workers even when shutdown is forced.
+		const effectiveClosingReason = terminalStop ? closingReason : "update";
+		if (effectiveClosingReason) {
 			for (const client of this.clients) {
-				this.write(client, { type: "daemon_closing", reason: closingReason });
+				this.write(client, { type: "daemon_closing", reason: effectiveClosingReason });
 			}
 		}
 		for (const cleanup of this.signalCleanupHandlers) {
@@ -7171,7 +7174,7 @@ export class DaemonSupervisor {
 			await Promise.all(
 				[...this.workers.values()].map(async (worker) => {
 					try {
-						await this.stopWorker(worker, true, forceWorkers, true);
+						await this.stopWorker(worker, terminalStop, forceWorkers, terminalStop);
 					} catch (error) {
 						if (!(error instanceof WorkerStopTimeoutError)) {
 							throw error;

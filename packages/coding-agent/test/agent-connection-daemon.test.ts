@@ -1261,6 +1261,98 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	}, 10_000);
 
+	it("shares update recovery between a routed attachment and a watcher", async () => {
+		vi.useFakeTimers();
+		const supervisor = new FakeDaemonClient();
+		supervisor.hello = { ...supervisor.hello!, supervisorGeneration: "predecessor" };
+		supervisor.updateRestartSessions = [
+			{ activeSessionId: "restored", sessionId: "session-current", workerState: "ready" },
+		];
+		const direct = new FakeDaemonClient();
+		const routed = new DaemonRoutedClient(asDaemonClient(supervisor), direct as unknown as DaemonWorkerClient);
+		const connections = [
+			new DaemonAgentConnection(routed, "active-original"),
+			new DaemonAgentConnection(asDaemonClient(supervisor), "active-watcher"),
+		];
+		const events: AgentConnectionEvent[][] = [[], []];
+		try {
+			for (const [index, connection] of connections.entries()) {
+				await connection.attach();
+				connection.subscribe((event) => {
+					events[index].push(event);
+				});
+			}
+			supervisor.emitMessage({ type: "daemon_closing", reason: "update" });
+			supervisor.emitMessage({ type: "session_closed", activeSessionId: "active-original", reason: "shutdown" });
+			supervisor.emitClose(new DaemonSocketClosedError("/tmp/fake.sock", "shutdown"));
+			await vi.advanceTimersByTimeAsync(0);
+			expect(events.flat().filter((event) => event.type === "closed")).toEqual([]);
+			expect(supervisor.requests.filter((request) => request.type === "list")).toEqual([]);
+			supervisor.hello = { ...supervisor.hello!, supervisorGeneration: "successor" };
+			await vi.advanceTimersByTimeAsync(100);
+			expect(supervisor.closeCount).toBe(1);
+			expect(direct.closeCount).toBe(1);
+			for (const delivered of events) {
+				expect(delivered.map((event) => event.type)).toEqual([
+					"connection_status",
+					"session_resynced",
+					"connection_status",
+				]);
+				expect(delivered[1]).toMatchObject({ snapshot: { state: { activeSessionId: "restored" } } });
+			}
+			supervisor.emitClose(new DaemonSocketClosedError("/tmp/fake.sock", "shutdown"));
+			expect(events.flat().filter((event) => event.type === "closed")).toHaveLength(2);
+		} finally {
+			for (const connection of connections) await connection.dispose();
+			routed.close();
+			await vi.advanceTimersByTimeAsync(100);
+			vi.useRealTimers();
+		}
+	});
+
+	it.each(["update", "replacement"])("keeps reconnect ownership across a session %s", async (boundary) => {
+		vi.useFakeTimers();
+		const client = new FakeDaemonClient();
+		let release!: () => void;
+		const recovery = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		client.updateRestartSessions = [{ activeSessionId: "restored", sessionId: "session-current" }];
+		const connection = new DaemonAgentConnection(asDaemonClient(client), "active", {
+			recoverDaemon: () => recovery,
+			reconnectTimeoutMs: 1,
+		});
+		const events: AgentConnectionEvent[] = [];
+		try {
+			await connection.attach();
+			connection.subscribe((event) => {
+				events.push(event);
+			});
+			client.connected = false;
+			client.emitClose(new Error("socket closed"));
+			await vi.advanceTimersByTimeAsync(0);
+			if (boundary === "update")
+				client.emitMessage({ type: "session_closed", activeSessionId: "active", reason: "update" });
+			else
+				client.emitMessage({
+					type: "session_replaced",
+					activeSessionId: "active",
+					state: createConnectionState("active", "replacement"),
+					messages: [],
+				});
+			await vi.advanceTimersByTimeAsync(100);
+			release();
+			await vi.advanceTimersByTimeAsync(0);
+			expect(events.filter((event) => event.type === "closed")).toEqual([]);
+			expect(events.at(-1)).toEqual({ type: "connection_status", status: "connected" });
+		} finally {
+			release();
+			await connection.dispose();
+			await vi.advanceTimersByTimeAsync(100);
+			vi.useRealTimers();
+		}
+	});
+
 	it.each([false, true])("reattaches after an update restart (deferring=%s)", async (deferSessionEvents) => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.emitCloseOnClose = true;

@@ -125,7 +125,13 @@ const UPDATE_RECONNECT_TIMEOUT_MS = 120000;
 const UPDATE_RECONNECT_RETRY_MS = 100;
 const MAX_COMPLETED_SNAPSHOTS = 128;
 const OWNED_SESSION_DISPOSE_RECONNECT_WAIT_MS = 10_000;
-const updateTransportReconnects = new WeakMap<DaemonTransportClient, Promise<void>>();
+const updateTransportReconnects = new WeakMap<
+	DaemonTransportClient,
+	{
+		promise: Promise<void>;
+		participants: Set<() => boolean>;
+	}
+>();
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -139,33 +145,60 @@ function formatErrorSentence(error: unknown): string {
 	return /[.!?]$/.test(message) ? message : `${message}.`;
 }
 
-function reconnectDaemonTransportAfterUpdate(client: DaemonTransportClient): Promise<void> {
-	const existing = updateTransportReconnects.get(client);
+function withUpdateDeadline<T>(work: Promise<T>, deadline: number, error: () => unknown): Promise<T> {
+	let timeout: ReturnType<typeof setTimeout>;
+	const expired = new Promise<never>((_resolve, reject) => {
+		timeout = setTimeout(() => reject(error()), Math.max(0, deadline - Date.now()));
+		timeout.unref();
+	});
+	return Promise.race([work, expired]).finally(() => clearTimeout(timeout));
+}
+
+function reconnectDaemonTransportAfterUpdate(
+	client: DaemonTransportClient,
+	predecessorGeneration: string | undefined,
+	isActive: () => boolean,
+): Promise<void> {
+	const transport = client instanceof DaemonRoutedClient ? client.controlPlaneTransport : client;
+	const existing = updateTransportReconnects.get(transport);
 	if (existing) {
-		return existing;
+		existing.participants.add(isActive);
+		return existing.promise;
 	}
-	const reconnectPromise = Promise.resolve()
-		.then(async () => {
-			client.disconnectForReconnect("update");
-			const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
-			let lastError: unknown;
-			while (Date.now() < deadline) {
+	const participants = new Set([isActive]);
+	const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
+	let lastError: unknown;
+	const reconnectPromise = withUpdateDeadline(
+		Promise.resolve().then(async () => {
+			transport.disconnectForReconnect("update");
+			while (Date.now() < deadline && [...participants].some((active) => active())) {
 				try {
-					await client.reconnect(1000);
-					return;
+					await transport.reconnect(Math.max(1, Math.min(1000, deadline - Date.now())));
+					if (![...participants].some((active) => active())) return;
+					if (Date.now() >= deadline) throw lastError ?? new Error("the updated daemon did not become available");
+					const hello = await transport.waitForHello(Math.max(1, Math.min(3000, deadline - Date.now())));
+					if (predecessorGeneration === undefined || hello.supervisorGeneration !== predecessorGeneration) return;
+					lastError = new Error("the predecessor daemon is still retiring");
 				} catch (error) {
 					lastError = error;
+					if (Date.now() >= deadline) throw error;
+					if (![...participants].some((active) => active())) return;
+					transport.resetTransportForReconnect();
 				}
-				await delay(UPDATE_RECONNECT_RETRY_MS);
+				await delay(Math.max(0, Math.min(UPDATE_RECONNECT_RETRY_MS, deadline - Date.now())));
 			}
-			throw lastError ?? new Error("the updated daemon did not become available");
-		})
-		.finally(() => {
-			if (updateTransportReconnects.get(client) === reconnectPromise) {
-				updateTransportReconnects.delete(client);
+			if ([...participants].some((active) => active())) {
+				throw lastError ?? new Error("the updated daemon did not become available");
 			}
-		});
-	updateTransportReconnects.set(client, reconnectPromise);
+		}),
+		deadline,
+		() => lastError ?? new Error("the updated daemon did not become available"),
+	).finally(() => {
+		if (updateTransportReconnects.get(transport)?.promise === reconnectPromise) {
+			updateTransportReconnects.delete(transport);
+		}
+	});
+	updateTransportReconnects.set(transport, { promise: reconnectPromise, participants });
 	return reconnectPromise;
 }
 
@@ -267,6 +300,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private attachedSessionFile: string | undefined;
 	private daemonLogPath: string | undefined;
 	private updateRestartPending = false;
+	private updateRestartRevision = 0;
 	private updateReconnectFailed = false;
 	private terminalCloseEmitted = false;
 	private updateReconnectPromise?: Promise<void>;
@@ -328,7 +362,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (this.disposed || this.terminalCloseEmitted) {
 			return;
 		}
-		// A lost direct link invalidates the fence (holders learn via the generation bump) yet the session falls back.
+		// An owned update outlives the predecessor's shutdown broadcast. ACP pause
+		// holders still lose their fence, but update recovery owns the terminal deadline.
+		const closeReason = getDaemonSocketCloseReason(error);
+		if ((this.updateRestartPending || closeReason === "update") && !this.updateReconnectFailed) {
+			this.updateRestartPending = true;
+			void this.reconnectAfterUpdate();
+			return;
+		}
 		if (invalidatedInputPause && !(error instanceof DaemonDirectTransportClosedError)) {
 			this.terminalCloseEmitted = true;
 			void this.emit({
@@ -337,16 +378,10 @@ export class DaemonAgentConnection implements AgentConnection {
 			});
 			return;
 		}
-		// An authoritative shutdown/update reason outranks the surviving direct link.
-		const closeReason = getDaemonSocketCloseReason(error);
+		// A genuine shutdown still outranks a surviving direct session link.
 		if (closeReason === "shutdown") {
 			this.terminalCloseEmitted = true;
 			void this.emit({ type: "closed", error: this.formatDaemonSessionClosedError("shutdown") });
-			return;
-		}
-		if ((this.updateRestartPending || closeReason === "update") && !this.updateReconnectFailed) {
-			this.updateRestartPending = true;
-			void this.reconnectAfterUpdate();
 			return;
 		}
 		// A direct-transport loss is never itself a session loss: fall back through a supervisor re-attach.
@@ -537,6 +572,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getInitialSnapshot(options?: { recoverable?: boolean }): Promise<AgentConnectionSnapshot> {
+		const sessionRevision = this.sessionRevision;
 		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
 			if (this.latestSnapshotStateIsFresh) return this.latestSnapshot;
 			const snapshot = this.latestSnapshot;
@@ -546,6 +582,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				undefined,
 				options,
 			);
+			if (sessionRevision !== this.sessionRevision) throw new Error("Snapshot read was superseded");
 			if (this.latestSnapshotIsFresh && this.latestSnapshot?.messages === snapshot.messages) {
 				const recap = this.latestSnapshot.state.recap;
 				this.latestSnapshot = {
@@ -589,6 +626,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				options,
 			),
 		]);
+		if (sessionRevision !== this.sessionRevision) throw new Error("Snapshot read was superseded");
 		const children = this.latestSnapshot?.children;
 		const streamingMessage = this.latestSnapshot?.streamingMessage;
 		this.latestSnapshot = {
@@ -623,22 +661,34 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (!this.deferSessionEvents) {
 			return Promise.resolve();
 		}
+		const updateRevision = this.updateRestartRevision;
 		this.deferredSessionEventFlush = Promise.resolve()
 			.then(async () => {
 				const deliveries: Promise<void>[] = [];
-				while (!this.disposed && !this.terminalCloseEmitted) {
+				while (
+					!this.disposed &&
+					!this.terminalCloseEmitted &&
+					!this.updateRestartPending &&
+					updateRevision === this.updateRestartRevision
+				) {
 					if (this.deferredSessionEventsOverflowed) {
 						this.deferredSessionEventsOverflowed = false;
 						// Reattach provides one consistent snapshot, including the streaming message.
 						const sessionRevision = this.sessionRevision;
 						try {
-							await this.attach();
+							await this.attach({ recoverable: false });
 						} catch (error) {
 							if (sessionRevision === this.sessionRevision) throw error;
 						}
-						if (this.disposed || this.terminalCloseEmitted) return;
+						if (
+							this.disposed ||
+							this.terminalCloseEmitted ||
+							this.updateRestartPending ||
+							updateRevision !== this.updateRestartRevision
+						)
+							return;
 						if (sessionRevision !== this.sessionRevision || this.deferredSessionEventsOverflowed) continue;
-						const snapshot = await this.getInitialSnapshot();
+						const snapshot = await this.getInitialSnapshot({ recoverable: false });
 						if (sessionRevision === this.sessionRevision)
 							deliveries.push(this.emit({ type: "session_resynced", snapshot }));
 						continue;
@@ -661,7 +711,13 @@ export class DaemonAgentConnection implements AgentConnection {
 				await Promise.all(deliveries);
 			})
 			.catch(async (error: unknown) => {
-				if (this.disposed || this.terminalCloseEmitted) return;
+				if (
+					this.disposed ||
+					this.terminalCloseEmitted ||
+					this.updateRestartPending ||
+					updateRevision !== this.updateRestartRevision
+				)
+					return;
 				this.terminalCloseEmitted = true;
 				await this.emit({ type: "closed", error: `Failed to recover deferred session events: ${String(error)}` });
 			})
@@ -1141,6 +1197,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		options?: AgentConnectionPromptOptions,
 	): Promise<void> {
 		const signal = options?.signal;
+		const updateRevision = this.updateRestartRevision;
 		if (signal?.aborted) {
 			throw new AgentConnectionPromptAdmissionError("Prompt admission was cancelled.", "cancelled");
 		}
@@ -1195,6 +1252,13 @@ export class DaemonAgentConnection implements AgentConnection {
 			const first = await Promise.race([promptRequest.then(() => "settled" as const), aborted]);
 			if (first === "settled" && promptError === undefined) return;
 			if (first === "settled" && promptError instanceof AgentConnectionPromptAdmissionError) throw promptError;
+			if (this.updateRestartPending || updateRevision !== this.updateRestartRevision) {
+				throw new AgentConnectionPromptAdmissionError(
+					"Prompt admission was interrupted by a daemon update.",
+					"unknown",
+					promptError === undefined ? undefined : { cause: promptError },
+				);
+			}
 			if (
 				first === "settled" &&
 				!signal.aborted &&
@@ -1771,16 +1835,23 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private async reconnect(cause: Error): Promise<void> {
+		if (this.disposed || this.terminalCloseEmitted || this.updateRestartPending) return;
 		if (this.reconnectPromise) {
 			return this.reconnectPromise;
 		}
-		this.reconnectPromise = (async () => {
+		const updateRevision = this.updateRestartRevision;
+		const ownsRecovery = () =>
+			!this.disposed &&
+			!this.terminalCloseEmitted &&
+			!this.updateRestartPending &&
+			updateRevision === this.updateRestartRevision;
+		const reconnectPromise = (async () => {
 			void this.emit({ type: "connection_status", status: "reconnecting", error: cause.message });
 			const timeoutMs = this.options.reconnectTimeoutMs ?? DAEMON_RECONNECT_TIMEOUT_MS;
 			let deadline: number | undefined;
 			let attempt = 0;
 			let lastError: Error = cause;
-			while (!this.disposed && !this.terminalCloseEmitted) {
+			while (ownsRecovery()) {
 				// A held direct link owns session liveness: control-plane recovery retries unbounded,
 				// and the bounded session-plane deadline arms only once the direct link is gone.
 				const directSessionHeld = this.client instanceof DaemonRoutedClient && this.client.hasDirectTransport;
@@ -1793,11 +1864,13 @@ export class DaemonAgentConnection implements AgentConnection {
 				let controlPlaneHandshakeComplete = false;
 				try {
 					await this.options.recoverDaemon?.();
-					if (this.disposed || this.terminalCloseEmitted) {
+					if (!ownsRecovery()) {
 						return;
 					}
 					await this.client.connect(1000);
+					if (!ownsRecovery()) return;
 					await this.client.waitForHello(3000);
+					if (!ownsRecovery()) return;
 					controlPlaneHandshakeComplete = true;
 					if (directSessionHeld) {
 						// The roster subscription is a control-plane accessory; its usual rebind seam (attach) is skipped while held.
@@ -1805,7 +1878,7 @@ export class DaemonAgentConnection implements AgentConnection {
 						// One check after the last await, against the close handler's own dispatch outputs:
 						// terminal closes set terminalCloseEmitted, update closes set updateRestartPending
 						// (restoration owns the client), and recoverable closes joined this loop.
-						if (this.disposed || this.terminalCloseEmitted || this.updateRestartPending) {
+						if (!ownsRecovery()) {
 							return;
 						}
 						if (this.client instanceof DaemonRoutedClient && this.client.hasDirectTransport) {
@@ -1817,16 +1890,16 @@ export class DaemonAgentConnection implements AgentConnection {
 					}
 					// This loop owns the retry: a socket close must reject these instead of parking them behind a hello it can never produce.
 					await this.attach({ recoverable: false });
-					if (!this.disposed && !this.terminalCloseEmitted) {
+					if (ownsRecovery()) {
 						const snapshot = await this.getInitialSnapshot({ recoverable: false });
-						if (this.disposed || this.terminalCloseEmitted) return;
+						if (!ownsRecovery()) return;
 						void this.emit({ type: "session_resynced", snapshot });
 						void this.emit({ type: "connection_status", status: "connected" });
 					}
 					return;
 				} catch (error) {
 					lastError = error instanceof Error ? error : new Error(String(error));
-					if (this.disposed || this.terminalCloseEmitted) {
+					if (!ownsRecovery()) {
 						return;
 					}
 					// A direct-half failure must not tear down a control-plane socket with a completed handshake.
@@ -1848,16 +1921,18 @@ export class DaemonAgentConnection implements AgentConnection {
 					await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
 				}
 			}
-			if (!this.disposed && !this.terminalCloseEmitted) {
+			if (ownsRecovery()) {
 				this.sessionInputPauses.clear();
 				this.sessionInputPauseGeneration++;
+				this.terminalCloseEmitted = true;
 				this.client.close();
 				await this.emit({ type: "closed", error: `Daemon reconnection failed: ${lastError.message}` });
 			}
 		})().finally(() => {
-			this.reconnectPromise = undefined;
+			if (this.reconnectPromise === reconnectPromise) this.reconnectPromise = undefined;
 		});
-		return this.reconnectPromise;
+		this.reconnectPromise = reconnectPromise;
+		return reconnectPromise;
 	}
 
 	private async requestOk(command: DaemonCommandBody): Promise<void> {
@@ -1887,6 +1962,11 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	private async handleDaemonMessage(message: DaemonOutbound): Promise<void> {
 		if (this.disposed || this.terminalCloseEmitted) return;
+		if (message.type === "daemon_closing" && message.reason === "update") {
+			this.captureDaemonLogPath();
+			void this.reconnectAfterUpdate();
+			return;
+		}
 		if (message.type === "heartbeats_changed") {
 			await this.emit({ type: "heartbeats_changed" });
 			return;
@@ -1946,7 +2026,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			const purpose = assembly.begin?.purpose ?? "attach";
 			const snapshotError = new Error(message.error);
 			const recoveryPromise =
-				purpose === "replacement" || purpose === "resync"
+				!this.updateRestartPending && (purpose === "replacement" || purpose === "resync")
 					? this.recoverFailedSnapshot(purpose, snapshotError)
 					: undefined;
 			if (recoveryPromise) {
@@ -2054,7 +2134,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (message.type === "session_closed") {
-			if (message.reason === "update") {
+			if (message.reason === "update" || (message.reason === "shutdown" && this.updateRestartPending)) {
 				this.captureDaemonLogPath();
 				this.updateRestartPending = true;
 				void this.reconnectAfterUpdate();
@@ -2111,101 +2191,125 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private reconnectAfterUpdate(): Promise<void> {
-		if (this.updateReconnectPromise) {
-			return this.updateReconnectPromise;
-		}
+		if (this.updateReconnectPromise) return this.updateReconnectPromise;
+		if (this.disposed || this.terminalCloseEmitted || this.updateReconnectFailed) return Promise.resolve();
+		const predecessorGeneration = this.client.hello?.supervisorGeneration;
+		const updateRevision = ++this.updateRestartRevision;
+		this.updateRestartPending = true;
+		this.sessionRevision++;
+		this.reconnectPromise = undefined;
+		this.sessionInputPauses.clear();
+		this.sessionInputPauseGeneration++;
 		this.pendingExtensionUiRequests.length = 0;
+		this.deferredSessionEvents.length = 0;
+		this.deferredSessionEventsOverflowed = false;
+		this.rejectSnapshotAssemblies(new Error("Snapshot interrupted by daemon update"));
+		const isActive = () =>
+			!this.disposed &&
+			!this.terminalCloseEmitted &&
+			this.updateRestartPending &&
+			this.updateRestartRevision === updateRevision;
 		void this.emit({
 			type: "connection_status",
 			status: "reconnecting",
 			error: "The Prime Agent daemon is restarting for an update.",
 		});
-		const reconnectPromise = reconnectDaemonTransportAfterUpdate(this.client)
-			.then(() => this.restoreConnectionAfterUpdate())
+		// Publish ownership before disconnecting: a shared transport notifies its other adapters synchronously.
+		const reconnectPromise = Promise.resolve()
 			.then(() => {
-				if (!this.disposed && !this.terminalCloseEmitted) {
+				if (!isActive()) return;
+				if (this.client instanceof DaemonRoutedClient) this.client.fallbackToSupervisor();
+				return reconnectDaemonTransportAfterUpdate(this.client, predecessorGeneration, isActive);
+			})
+			.then(() => {
+				if (!isActive()) return;
+				// Keep the full restore budget after the first successor hello, not after a predecessor reconnect.
+				const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
+				return withUpdateDeadline(
+					this.restoreConnectionAfterUpdate(predecessorGeneration, deadline),
+					deadline,
+					() => new Error("the restored session did not become available before the recovery deadline"),
+				);
+			})
+			.then(() => {
+				if (!this.disposed && !this.terminalCloseEmitted && this.updateRestartRevision === updateRevision) {
 					void this.emit({ type: "connection_status", status: "connected" });
 				}
 			})
 			.catch(async (error: unknown) => {
+				if (this.updateRestartRevision !== updateRevision) return;
 				this.updateRestartPending = false;
 				this.updateReconnectFailed = true;
 				if (!this.disposed && !this.terminalCloseEmitted) {
 					this.terminalCloseEmitted = true;
-					await this.emit({
-						type: "closed",
-						error: this.formatUpdateReconnectError(error),
-					});
+					this.sessionRevision++;
+					this.rejectSnapshotAssemblies(error instanceof Error ? error : new Error(String(error)));
+					await this.emit({ type: "closed", error: this.formatUpdateReconnectError(error) });
 				}
 			})
 			.finally(() => {
-				if (this.updateReconnectPromise === reconnectPromise) {
-					this.updateReconnectPromise = undefined;
-				}
+				if (this.updateReconnectPromise === reconnectPromise) this.updateReconnectPromise = undefined;
 			});
 		this.updateReconnectPromise = reconnectPromise;
 		return reconnectPromise;
 	}
 
-	private async restoreConnectionAfterUpdate(): Promise<void> {
+	private async restoreConnectionAfterUpdate(
+		predecessorGeneration: string | undefined,
+		deadline: number,
+	): Promise<void> {
 		const sessionId = this.attachedSessionId;
 		const sessionFile = this.attachedSessionFile;
-		if (!sessionId && !sessionFile) {
-			throw new Error("the previous session identity is unavailable");
-		}
-		const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
+		if (!sessionId && !sessionFile) throw new Error("the previous session identity is unavailable");
 		let lastError: unknown;
 		while (!this.disposed && !this.terminalCloseEmitted && Date.now() < deadline) {
 			try {
-				await this.client.reconnect(1000);
-				if (this.disposed || this.terminalCloseEmitted) {
-					return;
+				await this.client.reconnect(Math.max(1, Math.min(1000, deadline - Date.now())));
+				if (this.disposed || this.terminalCloseEmitted) return;
+				const hello = await this.client.waitForHello(Math.max(1, Math.min(3000, deadline - Date.now())));
+				if (this.disposed || this.terminalCloseEmitted) return;
+				if (predecessorGeneration !== undefined && hello.supervisorGeneration === predecessorGeneration) {
+					await delay(Math.max(0, Math.min(UPDATE_RECONNECT_RETRY_MS, deadline - Date.now())));
+					continue;
 				}
-				// This loop owns the retry: a socket close must reject these instead of parking them behind a hello it can never produce.
-				const response = await this.client.request({ type: "list" }, 30000, { recoverable: false });
-				if (this.disposed || this.terminalCloseEmitted) {
-					return;
-				}
-				if (!response.success) {
-					throw deserializeDaemonError(response);
-				}
-				const sessions = readSessionSummaries(response.data);
-				const restored = sessions.find(
+				// This loop owns retries. Its requests must reject on close, never park behind their own reconnect.
+				const response = await this.client.request(
+					{ type: "list" },
+					Math.max(1, Math.min(30000, deadline - Date.now())),
+					{ recoverable: false },
+				);
+				if (this.disposed || this.terminalCloseEmitted) return;
+				if (!response.success) throw deserializeDaemonError(response);
+				const restored = readSessionSummaries(response.data).find(
 					(summary) =>
 						summary.activeSessionId !== undefined &&
 						((sessionFile !== undefined && summary.sessionFile === sessionFile) ||
 							(sessionId !== undefined && summary.sessionId === sessionId)),
 				);
-				if (restored?.activeSessionId) {
-					if (this.disposed || this.terminalCloseEmitted) {
-						return;
-					}
+				// Wait for restoration to make the session ready; clients must not reclaim it.
+				if (restored?.activeSessionId && (restored.workerState === undefined || restored.workerState === "ready")) {
 					this.sessionRevision++;
 					this.activeSessionId = restored.activeSessionId;
 					this.lastEventSequence = undefined;
 					this.lastEventCursor = undefined;
 					this.retiredEventGenerations.clear();
 					await this.attach({ recoverable: false });
-					if (this.disposed || this.terminalCloseEmitted) {
-						return;
-					}
+					if (this.disposed || this.terminalCloseEmitted) return;
 					const snapshot = await this.getInitialSnapshot({ recoverable: false });
-					if (this.disposed || this.terminalCloseEmitted) {
-						return;
-					}
+					if (this.disposed || this.terminalCloseEmitted) return;
 					this.updateRestartPending = false;
 					void this.emit({ type: "session_resynced", snapshot });
 					return;
 				}
 			} catch (error) {
 				lastError = error;
+				// A sibling may already own a connected socket whose hello is still pending.
+				if (!this.client.isConnected) this.client.resetTransportForReconnect();
 			}
 			if (this.disposed || this.terminalCloseEmitted) return;
-			await delay(UPDATE_RECONNECT_RETRY_MS);
+			await delay(Math.max(0, Math.min(UPDATE_RECONNECT_RETRY_MS, deadline - Date.now())));
 		}
-		if (this.disposed || this.terminalCloseEmitted) {
-			return;
-		}
+		if (this.disposed || this.terminalCloseEmitted) return;
 		throw lastError ?? new Error("the restored session did not become available");
 	}
 
@@ -2272,13 +2376,20 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private async recoverFailedSnapshot(purpose: "replacement" | "resync", snapshotError: Error): Promise<void> {
+		const sessionRevision = this.sessionRevision;
+		if (this.updateRestartPending) return;
 		this.latestSnapshotIsFresh = false;
 		if (purpose === "replacement") {
 			this.latestSnapshot = undefined;
 		}
 		try {
-			const snapshot = await this.getInitialSnapshot();
-			if (this.disposed || this.terminalCloseEmitted) {
+			const snapshot = await this.getInitialSnapshot({ recoverable: false });
+			if (
+				this.disposed ||
+				this.terminalCloseEmitted ||
+				this.updateRestartPending ||
+				sessionRevision !== this.sessionRevision
+			) {
 				return;
 			}
 			this.attachedSessionId = snapshot.state.sessionId;
@@ -2289,7 +2400,12 @@ export class DaemonAgentConnection implements AgentConnection {
 				await this.emit({ type: "session_resynced", snapshot });
 			}
 		} catch (recoveryError) {
-			if (this.disposed || this.terminalCloseEmitted) {
+			if (
+				this.disposed ||
+				this.terminalCloseEmitted ||
+				this.updateRestartPending ||
+				sessionRevision !== this.sessionRevision
+			) {
 				return;
 			}
 			this.terminalCloseEmitted = true;
