@@ -34,6 +34,39 @@ export function copilotApiVersion(): string {
 	return env("COPILOT_API_VERSION") || COPILOT_API_VERSION_FALLBACK;
 }
 
+const STATIC_IDENTITY_HEADERS: ReadonlySet<string> = new Set([
+	"user-agent",
+	"editor-version",
+	"copilot-integration-id",
+]);
+
+/** Remove stale static headers before overlaying the current CLI identity. */
+export function sanitizeCopilotModelHeaders(
+	headers: Record<string, string> | undefined,
+	api: Api,
+): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(headers ?? {}).filter(([name]) => {
+			const normalized = name.toLowerCase();
+			if (normalized === "editor-plugin-version") return false;
+			if (STATIC_IDENTITY_HEADERS.has(normalized)) return false;
+			return api !== "anthropic-messages" || normalized !== "openai-intent";
+		}),
+	);
+}
+
+// The SDKs accept null values to omit their default fingerprint headers.
+export const COPILOT_SDK_HEADER_OVERRIDES: Readonly<Record<string, string | null>> = {
+	"X-Stainless-Lang": null,
+	"X-Stainless-Package-Version": null,
+	"X-Stainless-OS": null,
+	"X-Stainless-Arch": null,
+	"X-Stainless-Runtime": null,
+	"X-Stainless-Runtime-Version": null,
+	"X-Stainless-Retry-Count": null,
+	"X-Stainless-Timeout": null,
+};
+
 function nodePlatform(): string {
 	return typeof process !== "undefined" && process.platform ? process.platform : "linux";
 }

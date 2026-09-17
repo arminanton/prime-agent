@@ -22,7 +22,17 @@ import {
 	streamFailureFromStopReason,
 } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
-import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import {
+	applyCopilotRequestAdjustment,
+	classifyCopilotRequestError,
+	isAdjustableCopilotError,
+} from "./copilot-request-adjust.js";
+import {
+	buildCopilotDynamicHeaders,
+	COPILOT_SDK_HEADER_OVERRIDES,
+	hasCopilotVisionInput,
+	sanitizeCopilotModelHeaders,
+} from "./github-copilot-headers.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
 import { withOpenCodeHeaders } from "./opencode-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
@@ -46,7 +56,7 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 function getCompat(model: Model<"openai-responses">): Required<OpenAIResponsesCompat> {
 	return {
 		sendSessionIdHeader: model.compat?.sendSessionIdHeader ?? true,
-		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
+		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? model.provider !== "github-copilot",
 	};
 }
 
@@ -59,8 +69,31 @@ function getPromptCacheRetention(
 
 export interface OpenAIResponsesOptions extends StreamOptions {
 	reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	/** Explicit reasoning toggle. undefined preserves the provider/model default. */
+	reasoningEnabled?: boolean;
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
+}
+
+async function createResponseWithCopilotAdjustment(
+	client: OpenAI,
+	model: Model<"openai-responses">,
+	params: ResponseCreateParamsStreaming,
+	requestOptions: { signal?: AbortSignal; timeout?: number },
+) {
+	try {
+		return await client.responses.create(params, requestOptions).withResponse();
+	} catch (error) {
+		if (model.provider !== "github-copilot" || !isAdjustableCopilotError(error)) throw error;
+		const adjustment = classifyCopilotRequestError(error instanceof Error ? error.message : String(error));
+		const adjusted = adjustment
+			? applyCopilotRequestAdjustment(params as unknown as Record<string, unknown>, adjustment)
+			: undefined;
+		if (!adjusted) throw error;
+		return await client.responses
+			.create(adjusted as unknown as ResponseCreateParamsStreaming, requestOptions)
+			.withResponse();
+	}
 }
 
 export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIResponsesOptions> = (
@@ -103,7 +136,12 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses", OpenAIRes
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 			};
-			const { data: openaiStream, response } = await client.responses.create(params, requestOptions).withResponse();
+			const { data: openaiStream, response } = await createResponseWithCopilotAdjustment(
+				client,
+				model,
+				params,
+				requestOptions,
+			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			const requestId = response.headers.get("x-request-id") ?? undefined;
 			stream.push({ type: "start", partial: output });
@@ -151,12 +189,15 @@ export const streamSimpleOpenAIResponses: StreamFunction<"openai-responses", Sim
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
-	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+	const requestedReasoning = options?.reasoning;
+	const reasoningSpecified = requestedReasoning !== undefined;
+	const clampedReasoning = reasoningSpecified ? clampThinkingLevel(model, requestedReasoning) : undefined;
 	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
 	return streamOpenAIResponses(model, context, {
 		...base,
 		reasoningEffort,
+		reasoningEnabled: reasoningSpecified ? clampedReasoning !== "off" : undefined,
 	} satisfies OpenAIResponsesOptions);
 };
 
@@ -178,17 +219,25 @@ function createClient(
 	}
 
 	const compat = getCompat(model);
-	const headers = { ...model.headers };
+	const headers =
+		model.provider === "github-copilot"
+			? sanitizeCopilotModelHeaders(model.headers, model.api)
+			: { ...model.headers };
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
 			messages: context.messages,
 			hasImages,
+			api: model.api,
+			sessionId: conversationId,
+			isStreaming: true,
 		});
 		Object.assign(headers, copilotHeaders);
 	}
 
-	if (cacheSessionId) {
+	// Copilot's front door has no OpenAI cache-affinity routing; the CLI sends
+	// neither header, and X-Client-Session-Id already carries the session.
+	if (cacheSessionId && model.provider !== "github-copilot") {
 		if (compat.sendSessionIdHeader) {
 			headers.session_id = cacheSessionId;
 		}
@@ -196,7 +245,10 @@ function createClient(
 	}
 
 	if (optionsHeaders) {
-		Object.assign(headers, optionsHeaders);
+		Object.assign(
+			headers,
+			model.provider === "github-copilot" ? sanitizeCopilotModelHeaders(optionsHeaders, model.api) : optionsHeaders,
+		);
 	}
 
 	const defaultHeaders =
@@ -206,7 +258,9 @@ function createClient(
 					Authorization: headers.Authorization ?? null,
 					"cf-aig-authorization": `Bearer ${apiKey}`,
 				}
-			: headers;
+			: model.provider === "github-copilot"
+				? { ...COPILOT_SDK_HEADER_OVERRIDES, ...headers }
+				: headers;
 
 	return new OpenAI({
 		apiKey,
@@ -226,8 +280,11 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		model: model.id,
 		input: messages,
 		stream: true,
-		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
-		prompt_cache_retention: getPromptCacheRetention(compat, cacheRetention),
+		// Copilot never sees prompt_cache_key: the CLI omits it and CAPI ignores it.
+		prompt_cache_key:
+			cacheRetention === "none" || model.provider === "github-copilot" ? undefined : options?.sessionId,
+		prompt_cache_retention:
+			model.provider === "github-copilot" ? undefined : getPromptCacheRetention(compat, cacheRetention),
 		store: false,
 	};
 
@@ -235,7 +292,10 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.max_output_tokens = options?.maxTokens;
 	}
 
-	if (options?.temperature !== undefined) {
+	// Copilot /responses rejects sampling parameters on reasoning models with a 400
+	// ("Unsupported parameter: 'temperature'"); the CLI never sends them.
+	const copilotReasoning = model.provider === "github-copilot" && model.reasoning;
+	if (options?.temperature !== undefined && !copilotReasoning) {
 		params.temperature = options?.temperature;
 	}
 
@@ -247,6 +307,10 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 
 	if (context.tools && context.tools.length > 0) {
 		params.tools = convertResponsesTools(context.tools);
+		if (model.provider === "github-copilot") {
+			// Copilot CLI 1.0.84-5 opts into parallel calls when tools exist.
+			params.parallel_tool_calls = true;
+		}
 	}
 
 	if (model.reasoning) {
@@ -259,7 +323,11 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 				summary: options?.reasoningSummary || "auto",
 			};
 			params.include = ["reasoning.encrypted_content"];
-		} else if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null) {
+		} else if (
+			model.thinkingLevelMap?.off !== null &&
+			(model.provider !== "github-copilot" ||
+				(options?.reasoningEnabled === false && typeof model.thinkingLevelMap?.off === "string"))
+		) {
 			params.reasoning = {
 				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
 			};

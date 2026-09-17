@@ -4863,7 +4863,7 @@ export const MODELS = {
 			baseUrl: "https://api.individual.githubcopilot.com",
 			headers: {"User-Agent":"copilot/1.0.84-5","Editor-Version":"copilot/1.0.84-5","Copilot-Integration-Id":"copilot-developer-cli"},
 			reasoning: true,
-			thinkingLevelMap: {"off":null,"minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":null},
+			thinkingLevelMap: {"off":"none","minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":null},
 			input: ["text", "image"],
 			cost: {
 				input: 2.5,
@@ -4882,7 +4882,7 @@ export const MODELS = {
 			baseUrl: "https://api.individual.githubcopilot.com",
 			headers: {"User-Agent":"copilot/1.0.84-5","Editor-Version":"copilot/1.0.84-5","Copilot-Integration-Id":"copilot-developer-cli"},
 			reasoning: true,
-			thinkingLevelMap: {"off":null,"minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":null},
+			thinkingLevelMap: {"off":"none","minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":null},
 			input: ["text", "image"],
 			cost: {
 				input: 0.75,
@@ -4901,7 +4901,7 @@ export const MODELS = {
 			baseUrl: "https://api.individual.githubcopilot.com",
 			headers: {"User-Agent":"copilot/1.0.84-5","Editor-Version":"copilot/1.0.84-5","Copilot-Integration-Id":"copilot-developer-cli"},
 			reasoning: true,
-			thinkingLevelMap: {"off":null,"minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":null},
+			thinkingLevelMap: {"off":"none","minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":null},
 			input: ["text", "image"],
 			cost: {
 				input: 0.2,
@@ -4920,7 +4920,7 @@ export const MODELS = {
 			baseUrl: "https://api.individual.githubcopilot.com",
 			headers: {"User-Agent":"copilot/1.0.84-5","Editor-Version":"copilot/1.0.84-5","Copilot-Integration-Id":"copilot-developer-cli"},
 			reasoning: true,
-			thinkingLevelMap: {"off":null,"minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":null},
+			thinkingLevelMap: {"off":"none","minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":null},
 			input: ["text", "image"],
 			cost: {
 				input: 5,
@@ -4939,7 +4939,7 @@ export const MODELS = {
 			baseUrl: "https://api.individual.githubcopilot.com",
 			headers: {"User-Agent":"copilot/1.0.84-5","Editor-Version":"copilot/1.0.84-5","Copilot-Integration-Id":"copilot-developer-cli"},
 			reasoning: true,
-			thinkingLevelMap: {"off":null,"minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"},
+			thinkingLevelMap: {"off":"none","minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"},
 			input: ["text", "image"],
 			cost: {
 				input: 0.2,
@@ -4958,7 +4958,7 @@ export const MODELS = {
 			baseUrl: "https://api.individual.githubcopilot.com",
 			headers: {"User-Agent":"copilot/1.0.84-5","Editor-Version":"copilot/1.0.84-5","Copilot-Integration-Id":"copilot-developer-cli"},
 			reasoning: true,
-			thinkingLevelMap: {"off":null,"minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"},
+			thinkingLevelMap: {"off":"none","minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"},
 			input: ["text", "image"],
 			cost: {
 				input: 4,
@@ -4977,7 +4977,7 @@ export const MODELS = {
 			baseUrl: "https://api.individual.githubcopilot.com",
 			headers: {"User-Agent":"copilot/1.0.84-5","Editor-Version":"copilot/1.0.84-5","Copilot-Integration-Id":"copilot-developer-cli"},
 			reasoning: true,
-			thinkingLevelMap: {"off":null,"minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"},
+			thinkingLevelMap: {"off":"none","minimal":null,"low":"low","medium":"medium","high":"high","xhigh":"xhigh","max":"max"},
 			input: ["text", "image"],
 			cost: {
 				input: 2,

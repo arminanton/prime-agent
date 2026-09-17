@@ -28,6 +28,7 @@ import type {
 	StreamOptions,
 	TextContent,
 	ThinkingContent,
+	ThinkingLevel,
 	Tool,
 	ToolCall,
 	ToolResultMessage,
@@ -47,9 +48,27 @@ import {
 } from "../utils/stream-failure.js";
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
-import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import {
+	knownCopilotClaudeOutputCap,
+	parseCopilotCombinedLimitError,
+	parseCopilotOutputCapError,
+	reducedMaxTokensForCombinedLimit,
+	rememberCopilotClaudeOutputCap,
+	resolveCopilotClaudeMaxTokens,
+} from "./copilot-output-caps.js";
+import {
+	applyCopilotRequestAdjustment,
+	classifyCopilotRequestError,
+	isAdjustableCopilotError,
+} from "./copilot-request-adjust.js";
+import {
+	buildCopilotDynamicHeaders,
+	COPILOT_SDK_HEADER_OVERRIDES,
+	hasCopilotVisionInput,
+	sanitizeCopilotModelHeaders,
+} from "./github-copilot-headers.js";
 import { withOpenCodeHeaders } from "./opencode-headers.js";
-import { adjustMaxTokensForThinking, buildBaseOptions } from "./simple-options.js";
+import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
 /**
@@ -456,6 +475,58 @@ async function* iterateAnthropicEvents(
 	}
 }
 
+function withCopilotOutputLimit(
+	params: MessageCreateParamsStreaming,
+	maxTokens: number,
+): MessageCreateParamsStreaming | undefined {
+	if (params.thinking?.type !== "enabled") return { ...params, max_tokens: maxTokens };
+	if (maxTokens <= 1024) return undefined;
+	return {
+		...params,
+		max_tokens: maxTokens,
+		thinking: { ...params.thinking, budget_tokens: Math.min(params.thinking.budget_tokens, maxTokens - 1) },
+	};
+}
+
+/** Retry a fixable Copilot 400 once, before any stream output reaches the caller. */
+async function createWithCopilotAdjustment(
+	client: Anthropic,
+	model: Model<"anthropic-messages">,
+	params: MessageCreateParamsStreaming,
+	requestOptions: { signal?: AbortSignal; timeout?: number },
+): Promise<Response> {
+	const send = (body: MessageCreateParamsStreaming) =>
+		client.messages.create({ ...body, stream: true }, requestOptions).asResponse();
+	try {
+		return await send(params);
+	} catch (error) {
+		if (model.provider !== "github-copilot" || !isAdjustableCopilotError(error)) throw error;
+		const message = error instanceof Error ? error.message : String(error);
+		const cap = parseCopilotOutputCapError(message);
+		const combinedLimit = parseCopilotCombinedLimitError(message);
+		let adjusted: MessageCreateParamsStreaming | undefined;
+		if (cap !== undefined) {
+			if (params.max_tokens <= cap) throw error;
+			rememberCopilotClaudeOutputCap(model, cap);
+			adjusted = withCopilotOutputLimit(params, cap);
+		} else if (combinedLimit !== undefined) {
+			const reduced = reducedMaxTokensForCombinedLimit(combinedLimit);
+			if (reduced === undefined || reduced >= params.max_tokens) throw error;
+			adjusted = withCopilotOutputLimit(params, reduced);
+		} else {
+			const adjustment = classifyCopilotRequestError(message);
+			if (adjustment) {
+				adjusted = applyCopilotRequestAdjustment(
+					params as unknown as Record<string, unknown>,
+					adjustment,
+				) as unknown as MessageCreateParamsStreaming | undefined;
+			}
+		}
+		if (!adjusted) throw error;
+		return await send(adjusted);
+	}
+}
+
 export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	model: Model<"anthropic-messages">,
 	context: Context,
@@ -498,6 +569,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					copilotDynamicHeaders = buildCopilotDynamicHeaders({
 						messages: context.messages,
 						hasImages,
+						api: model.api,
+						sessionId: options?.sessionId,
+						isStreaming: true,
 					});
 				}
 
@@ -528,7 +602,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 			};
-			const response = await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
+			const response = await createWithCopilotAdjustment(client, model, params, requestOptions);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			const requestId = response.headers.get("request-id") ?? undefined;
 			stream.push({ type: "start", partial: output });
@@ -821,6 +895,7 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 	}
 
 	const base = buildBaseOptions(model, options, apiKey);
+	const isCopilot = model.provider === "github-copilot";
 	if (!options?.reasoning || options.reasoning === "off") {
 		return streamAnthropic(model, context, { ...base, thinkingEnabled: false } satisfies AnthropicOptions);
 	}
@@ -833,6 +908,30 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 			...base,
 			thinkingEnabled: true,
 			effort,
+		} satisfies AnthropicOptions);
+	}
+
+	if (isCopilot) {
+		// Manual-thinking models on Copilot (haiku) follow the CLI budget ladder:
+		// low 1024, medium 2048, high 4096, xhigh/max 32000, clamped under max_tokens.
+		const cap = knownCopilotClaudeOutputCap(model) ?? model.maxTokens;
+		const maxTokens = options.maxTokens ?? cap;
+		if (maxTokens <= 1024) {
+			throw new Error("Budget-based thinking requires at least 1024 thinking tokens plus room for the response");
+		}
+		const budget = Math.min(
+			Math.max(
+				1024,
+				options.thinkingBudgets?.[clampReasoning(options.reasoning)!] ??
+					copilotCliThinkingBudget(options.reasoning),
+			),
+			maxTokens - 1,
+		);
+		return streamAnthropic(model, context, {
+			...base,
+			maxTokens,
+			thinkingEnabled: true,
+			thinkingBudgetTokens: budget,
 		} satisfies AnthropicOptions);
 	}
 
@@ -850,6 +949,22 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 		thinkingBudgetTokens: adjusted.thinkingBudget,
 	} satisfies AnthropicOptions);
 };
+
+/** Budget the official Copilot CLI sends for manual-thinking Claude models per effort level. */
+function copilotCliThinkingBudget(level: ThinkingLevel): number {
+	switch (level) {
+		case "minimal":
+		case "low":
+			return 1024;
+		case "medium":
+			return 2048;
+		case "xhigh":
+		case "max":
+			return 32_000;
+		default:
+			return 4096;
+	}
+}
 
 function isOAuthToken(apiKey: string): boolean {
 	return apiKey.includes("sk-ant-oat");
@@ -900,6 +1015,7 @@ function createClient(
 	}
 
 	if (model.provider === "github-copilot") {
+		// Copilot does not use Anthropic beta or SDK fingerprint headers.
 		const client = new Anthropic({
 			maxRetries: 0,
 			apiKey: null,
@@ -907,14 +1023,10 @@ function createClient(
 			baseURL: model.baseUrl,
 			dangerouslyAllowBrowser: true,
 			defaultHeaders: mergeHeaders(
-				{
-					accept: "application/json",
-					"anthropic-dangerous-direct-browser-access": "true",
-					...(betaFeatures.length > 0 ? { "anthropic-beta": betaFeatures.join(",") } : {}),
-				},
-				model.headers,
+				{ accept: "*/*", "anthropic-dangerous-direct-browser-access": null, ...COPILOT_SDK_HEADER_OVERRIDES },
+				sanitizeCopilotModelHeaders(model.headers, model.api),
+				sanitizeCopilotModelHeaders(optionsHeaders, model.api),
 				dynamicHeaders,
-				optionsHeaders,
 			),
 		});
 
@@ -967,6 +1079,14 @@ function createClient(
 	return { client, isOAuthToken: false };
 }
 
+// Copilot uses its observed output cap; other Anthropic hosts keep their default.
+function resolveMaxTokens(model: Model<"anthropic-messages">, options?: AnthropicOptions): number {
+	if (options?.maxTokens) return options.maxTokens;
+	const copilotCap = resolveCopilotClaudeMaxTokens(model);
+	if (copilotCap !== undefined) return copilotCap;
+	return (model.maxTokens / 3) | 0;
+}
+
 function buildParams(
 	model: Model<"anthropic-messages">,
 	context: Context,
@@ -977,7 +1097,7 @@ function buildParams(
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
 		messages: convertMessages(context.messages, model, isOAuthToken, cacheControl),
-		max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
+		max_tokens: resolveMaxTokens(model, options),
 		stream: true,
 	};
 
@@ -1012,6 +1132,9 @@ function buildParams(
 	// and always-on models reject sampling params outright.
 	if (options?.temperature !== undefined && !options?.thinkingEnabled && !isAlwaysOnAdaptiveThinkingModel(model.id)) {
 		params.temperature = options.temperature;
+	} else if (model.provider === "github-copilot") {
+		// Copilot accepts the CLI temperature with adaptive and manual thinking.
+		params.temperature = 1;
 	}
 
 	if (context.tools && context.tools.length > 0) {

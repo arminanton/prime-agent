@@ -1,0 +1,3 @@
+- Fixed Copilot request fields and output limits, with one retry for correctable server rejections.
+- Fixed Copilot Gemini responses to retain reasoning text and tool-call state.
+- Fixed explicit reasoning-off requests for Copilot GPT models that support them.

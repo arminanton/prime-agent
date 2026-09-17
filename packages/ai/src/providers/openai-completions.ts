@@ -5,6 +5,8 @@ import type {
 	ChatCompletionContentPart,
 	ChatCompletionContentPartImage,
 	ChatCompletionContentPartText,
+	ChatCompletionCreateParams,
+	ChatCompletionCreateParamsNonStreaming,
 	ChatCompletionDeveloperMessageParam,
 	ChatCompletionMessageParam,
 	ChatCompletionSystemMessageParam,
@@ -37,7 +39,17 @@ import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
 import { recordStreamFailure } from "../utils/stream-failure.js";
 import { isCloudflareProvider, resolveCloudflareBaseUrl } from "./cloudflare.js";
-import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
+import {
+	applyCopilotRequestAdjustment,
+	classifyCopilotRequestError,
+	isAdjustableCopilotError,
+} from "./copilot-request-adjust.js";
+import {
+	buildCopilotDynamicHeaders,
+	COPILOT_SDK_HEADER_OVERRIDES,
+	hasCopilotVisionInput,
+	sanitizeCopilotModelHeaders,
+} from "./github-copilot-headers.js";
 import { withOpenCodeHeaders } from "./opencode-headers.js";
 import { buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
@@ -138,6 +150,87 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 	return "short";
 }
 
+async function createCompletionWithCopilotAdjustment(
+	client: OpenAI,
+	model: Model<"openai-completions">,
+	params: ChatCompletionCreateParams,
+	requestOptions: { signal?: AbortSignal; timeout?: number },
+): Promise<{ data: AsyncIterable<ChatCompletionChunk>; response: Response }> {
+	const send = (body: ChatCompletionCreateParams) =>
+		body.stream !== true
+			? createNonStreamingChunkSource(client, body, requestOptions)
+			: client.chat.completions.create(body, requestOptions).withResponse();
+	try {
+		return await send(params);
+	} catch (error) {
+		if (model.provider !== "github-copilot" || !isAdjustableCopilotError(error)) throw error;
+		const adjustment = classifyCopilotRequestError(error instanceof Error ? error.message : String(error));
+		const adjusted = adjustment
+			? applyCopilotRequestAdjustment(params as unknown as Record<string, unknown>, adjustment)
+			: undefined;
+		if (!adjusted) throw error;
+		return await send(adjusted as unknown as ChatCompletionCreateParams);
+	}
+}
+
+/**
+ * Fetch one non-streaming completion and expose it through the same chunk
+ * iterator the streaming path consumes: message fields become a single delta,
+ * so reasoning text, tool calls, usage, and finish reason flow unchanged.
+ */
+async function createNonStreamingChunkSource(
+	client: OpenAI,
+	params: ChatCompletionCreateParamsNonStreaming,
+	requestOptions: { signal?: AbortSignal; timeout?: number },
+): Promise<{ data: AsyncIterable<ChatCompletionChunk>; response: Response }> {
+	const { data: completion, response } = await client.chat.completions.create(params, requestOptions).withResponse();
+	const chunks: ChatCompletionChunk[] = [];
+	const choices = Array.isArray(completion.choices) ? completion.choices : [];
+	// The streaming path consumes only the first choice, not alternate completions.
+	for (const choice of choices.slice(0, 1)) {
+		const message = choice.message as unknown as Record<string, unknown>;
+		const { role: _role, content, tool_calls, ...reasoningFields } = message;
+		const toolCalls = Array.isArray(tool_calls)
+			? tool_calls.map((toolCall, index) => ({ index, ...(toolCall as Record<string, unknown>) }))
+			: undefined;
+		chunks.push({
+			id: completion.id,
+			object: "chat.completion.chunk",
+			created: completion.created,
+			model: completion.model,
+			choices: [
+				{
+					index: choice.index,
+					delta: {
+						...reasoningFields,
+						...(typeof content === "string" ? { content } : {}),
+						...(toolCalls ? { tool_calls: toolCalls } : {}),
+					} as ChatCompletionChunk.Choice.Delta,
+					finish_reason: choice.finish_reason,
+					logprobs: null,
+				},
+			],
+			...(completion.usage ? { usage: completion.usage } : {}),
+		});
+	}
+	if (chunks.length === 0) {
+		chunks.push({
+			id: completion.id,
+			object: "chat.completion.chunk",
+			created: completion.created,
+			model: completion.model,
+			choices: [],
+			...(completion.usage ? { usage: completion.usage } : {}),
+		});
+	}
+	return {
+		data: (async function* () {
+			for (const chunk of chunks) yield chunk;
+		})(),
+		response,
+	};
+}
+
 export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenAICompletionsOptions> = (
 	model: Model<"openai-completions">,
 	context: Context,
@@ -186,15 +279,18 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			let params = buildParams(model, context, options, compat, cacheRetention, cacheControl);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
-				params = nextParams as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming;
+				params = nextParams as ChatCompletionCreateParams;
 			}
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 			};
-			const { data: openaiStream, response } = await client.chat.completions
-				.create(params, requestOptions)
-				.withResponse();
+			const { data: openaiStream, response } = await createCompletionWithCopilotAdjustment(
+				client,
+				model,
+				params,
+				requestOptions,
+			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
@@ -380,12 +476,24 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 						}
 					}
 
+					const reasoningOpaque = (choice.delta as { reasoning_opaque?: unknown }).reasoning_opaque;
 					if (choice?.delta?.tool_calls) {
 						for (const toolCall of choice.delta.tool_calls) {
 							const block = ensureToolCallBlock(toolCall);
 							if (!block.id && toolCall.id) {
 								block.id = toolCall.id;
 								toolCallBlocksById.set(toolCall.id, block);
+							}
+							// Copilot (Gemini) sends the encrypted reasoning state once, on the
+							// tool_calls delta; keep it with the call so the continuation can
+							// resume the model's reasoning instead of re-deriving it.
+							if (
+								model.provider === "github-copilot" &&
+								typeof reasoningOpaque === "string" &&
+								reasoningOpaque.length > 0 &&
+								!block.thoughtSignature
+							) {
+								block.thoughtSignature = encodeCopilotReasoningOpaque(reasoningOpaque);
 							}
 							if (!block.name && toolCall.function?.name) {
 								block.name = toolCall.function.name;
@@ -537,12 +645,18 @@ function createClient(
 		apiKey = process.env.OPENAI_API_KEY;
 	}
 
-	const headers = { ...model.headers };
+	const headers =
+		model.provider === "github-copilot"
+			? sanitizeCopilotModelHeaders(model.headers, model.api)
+			: { ...model.headers };
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
 			messages: context.messages,
 			hasImages,
+			api: model.api,
+			sessionId: conversationId,
+			isStreaming: !compat.nonStreaming,
 		});
 		Object.assign(headers, copilotHeaders);
 	}
@@ -559,7 +673,10 @@ function createClient(
 	}
 
 	if (optionsHeaders) {
-		Object.assign(headers, optionsHeaders);
+		Object.assign(
+			headers,
+			model.provider === "github-copilot" ? sanitizeCopilotModelHeaders(optionsHeaders, model.api) : optionsHeaders,
+		);
 	}
 
 	const defaultHeaders =
@@ -569,7 +686,9 @@ function createClient(
 					Authorization: headers.Authorization ?? null,
 					"cf-aig-authorization": `Bearer ${apiKey}`,
 				}
-			: headers;
+			: model.provider === "github-copilot"
+				? { ...COPILOT_SDK_HEADER_OVERRIDES, ...headers }
+				: headers;
 
 	return new OpenAI({
 		apiKey,
@@ -578,6 +697,41 @@ function createClient(
 		defaultHeaders: withOpenCodeHeaders(model.provider, conversationId, defaultHeaders),
 		maxRetries: 0,
 	});
+}
+
+const COPILOT_REASONING_OPAQUE_PREFIX = "copilot-reasoning-opaque:";
+
+function encodeCopilotReasoningOpaque(opaque: string): string {
+	return `${COPILOT_REASONING_OPAQUE_PREFIX}${opaque}`;
+}
+
+/** Returns the opaque blob when the signature was recorded by the Copilot path. */
+function decodeCopilotReasoningOpaque(signature: string | undefined): string | undefined {
+	if (!signature || !signature.startsWith(COPILOT_REASONING_OPAQUE_PREFIX)) return undefined;
+	const opaque = signature.slice(COPILOT_REASONING_OPAQUE_PREFIX.length);
+	return opaque.length > 0 ? opaque : undefined;
+}
+
+const COPILOT_EFFORT_PREFERENCE = ["max", "xhigh", "high", "medium", "low", "minimal"] as const;
+
+/** Use a supported requested effort, or the highest listed effort when none was requested. */
+function resolveCopilotCompletionsEffort(
+	model: Model<"openai-completions">,
+	requested: string | undefined,
+): string | undefined {
+	const map = model.thinkingLevelMap;
+	if (requested) {
+		const mapped = map?.[requested as keyof typeof map];
+		if (mapped === null) return undefined;
+		if (typeof mapped === "string") return mapped;
+		return map ? undefined : requested;
+	}
+	if (!map) return undefined;
+	for (const level of COPILOT_EFFORT_PREFERENCE) {
+		const mapped = map[level];
+		if (typeof mapped === "string") return mapped;
+	}
+	return undefined;
 }
 
 function buildParams(
@@ -590,19 +744,23 @@ function buildParams(
 ) {
 	const messages = convertMessages(model, context, compat);
 
-	const params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
+	const params: ChatCompletionCreateParams = {
 		model: model.id,
 		messages,
-		stream: true,
+		stream: !compat.nonStreaming,
 		prompt_cache_key:
-			(model.baseUrl.includes("api.openai.com") && cacheRetention !== "none") ||
-			(cacheRetention === "long" && compat.supportsLongCacheRetention)
+			model.provider !== "github-copilot" &&
+			((model.baseUrl.includes("api.openai.com") && cacheRetention !== "none") ||
+				(cacheRetention === "long" && compat.supportsLongCacheRetention))
 				? options?.sessionId
 				: undefined,
-		prompt_cache_retention: cacheRetention === "long" && compat.supportsLongCacheRetention ? "24h" : undefined,
+		prompt_cache_retention:
+			model.provider !== "github-copilot" && cacheRetention === "long" && compat.supportsLongCacheRetention
+				? "24h"
+				: undefined,
 	};
 
-	if (compat.supportsUsageInStreaming !== false) {
+	if (compat.supportsUsageInStreaming !== false && !compat.nonStreaming) {
 		(params as any).stream_options = { include_usage: true };
 	}
 
@@ -640,7 +798,21 @@ function buildParams(
 		params.tool_choice = options.toolChoice;
 	}
 
-	if (compat.thinkingFormat === "zai" && model.reasoning) {
+	if (model.provider === "github-copilot" && model.reasoning && options?.reasoningEnabled !== false) {
+		// Copilot adds fields and tool-choice values outside the OpenAI schema.
+		const copilotParams = params as unknown as Record<string, unknown>;
+		const effort = resolveCopilotCompletionsEffort(model, options?.reasoningEffort);
+		if (effort) {
+			copilotParams.reasoning_effort = effort;
+		}
+		if (params.temperature === undefined) {
+			params.temperature = 1;
+		}
+		if (params.tools && params.tools.length > 0 && !params.tool_choice) {
+			copilotParams.tool_choice = "validated";
+		}
+		copilotParams.snippy = { enabled: false };
+	} else if (compat.thinkingFormat === "zai" && model.reasoning) {
 		(params as any).enable_thinking = !!options?.reasoningEffort;
 	} else if (compat.thinkingFormat === "qwen" && model.reasoning) {
 		(params as any).enable_thinking = !!options?.reasoningEffort;
@@ -968,8 +1140,21 @@ export function convertMessages(
 						arguments: JSON.stringify(tc.arguments),
 					},
 				}));
+				const copilotOpaque = toolCalls
+					.map((tc) => decodeCopilotReasoningOpaque(tc.thoughtSignature))
+					.find(Boolean);
+				if (model.provider === "github-copilot" && copilotOpaque) {
+					// CLI replay shape: the visible summary as reasoning_text plus the opaque blob.
+					const record = assistantMsg as unknown as Record<string, unknown>;
+					if (typeof record.reasoning_text !== "string") {
+						record.reasoning_text = nonEmptyThinkingBlocks
+							.map((block) => sanitizeSurrogates(block.thinking))
+							.join("\n");
+					}
+					record.reasoning_opaque = copilotOpaque;
+				}
 				const reasoningDetails = toolCalls
-					.filter((tc) => tc.thoughtSignature)
+					.filter((tc) => tc.thoughtSignature && !decodeCopilotReasoningOpaque(tc.thoughtSignature))
 					.map((tc) => {
 						try {
 							return JSON.parse(tc.thoughtSignature!);
@@ -1217,7 +1402,8 @@ function detectCompat(model: Model<"openai-completions">): ResolvedOpenAIComplet
 		supportsStrictMode: !isMoonshot && !isCloudflareAiGateway && !isPrimeInference,
 		cacheControlFormat,
 		sendSessionAffinityHeaders: false,
-		supportsLongCacheRetention: !(isCloudflareWorkersAI || isCloudflareAiGateway),
+		supportsLongCacheRetention: !(isCloudflareWorkersAI || isCloudflareAiGateway || provider === "github-copilot"),
+		nonStreaming: provider === "github-copilot" && model.id.startsWith("gemini-"),
 	};
 }
 
@@ -1250,5 +1436,6 @@ function getCompat(model: Model<"openai-completions">): ResolvedOpenAICompletion
 		cacheControlFormat: model.compat.cacheControlFormat ?? detected.cacheControlFormat,
 		sendSessionAffinityHeaders: model.compat.sendSessionAffinityHeaders ?? detected.sendSessionAffinityHeaders,
 		supportsLongCacheRetention: model.compat.supportsLongCacheRetention ?? detected.supportsLongCacheRetention,
+		nonStreaming: model.compat.nonStreaming ?? detected.nonStreaming,
 	};
 }

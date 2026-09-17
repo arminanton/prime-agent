@@ -1,7 +1,8 @@
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getModel } from "../src/models.js";
-import { streamOpenAIResponses } from "../src/providers/openai-responses.js";
-import type { Model } from "../src/types.js";
+import { streamOpenAIResponses, streamSimpleOpenAIResponses } from "../src/providers/openai-responses.js";
+import type { Context, Model } from "../src/types.js";
 
 type CapturedHeaders = Headers | string[][] | Record<string, string | readonly string[]> | undefined;
 
@@ -180,4 +181,151 @@ describe("openai-responses provider defaults", () => {
 			expect((wireBody as Record<string, unknown>).service_tier).toBe(serviceTier);
 		}
 	});
+});
+
+const copilotResponseModel: Model<"openai-responses"> = {
+	...getModel("openai", "gpt-5.4"),
+	provider: "github-copilot",
+	baseUrl: "https://copilot.invalid",
+	compat: { supportsLongCacheRetention: true, sendSessionIdHeader: true },
+};
+const responseContext: Context = {
+	messages: [{ role: "user", content: "Echo x", timestamp: 1 }],
+	tools: [{ name: "echo", description: "Echo", parameters: Type.Object({ value: Type.String() }) }],
+};
+function recordResponseRequests(rejection?: { message: string; status: number; repeat?: boolean }) {
+	const requests: Array<{ body: Record<string, unknown>; headers: Headers }> = [];
+	vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+		requests.push({
+			body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+			headers: new Headers(init?.headers),
+		});
+		return rejection && (requests.length === 1 || rejection.repeat)
+			? Response.json({ error: { message: rejection.message } }, { status: rejection.status })
+			: new Response(
+					`data: ${JSON.stringify({
+						type: "response.completed",
+						response: {
+							status: "completed",
+							usage: {
+								input_tokens: 1,
+								output_tokens: 1,
+								total_tokens: 2,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					})}\n\n`,
+					{ headers: { "content-type": "text/event-stream" } },
+				);
+	});
+	return requests;
+}
+
+describe("Copilot Responses wire contract", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
+	});
+
+	it("uses the CLI identity and omits sampling and cache hints even with long retention enabled", async () => {
+		vi.stubEnv("GITHUB_COPILOT_INTEGRATION_ID", "");
+		const requests = recordResponseRequests();
+		const result = await streamOpenAIResponses(copilotResponseModel, responseContext, {
+			apiKey: "test-key",
+			sessionId: "copilot-responses",
+			cacheRetention: "long",
+			temperature: 0.2,
+			reasoningEffort: "high",
+			serviceTier: "default",
+			headers: { "User-Agent": "stale", "Editor-Version": "stale", "Editor-Plugin-Version": "stale" },
+		}).result();
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(1);
+		const { body, headers } = requests[0];
+		expect(body).toMatchObject({
+			stream: true,
+			store: false,
+			reasoning: { effort: "high", summary: "auto" },
+			include: ["reasoning.encrypted_content"],
+			parallel_tool_calls: true,
+		});
+		for (const field of ["temperature", "prompt_cache_key", "prompt_cache_retention", "service_tier", "long_context"])
+			expect(body[field]).toBeUndefined();
+		expect(headers.get("authorization")).toBe("Bearer test-key");
+		expect(headers.get("user-agent")).toMatch(/^copilot\/1\.0\.84-5 .* client\/github\/cli$/);
+		expect(headers.get("copilot-integration-id")).toBe("copilot-developer-cli");
+		expect(headers.get("x-client-session-id")).toBe("copilot-responses");
+		expect(headers.get("openai-intent")).toBe("conversation-agent");
+		for (const name of [
+			"editor-plugin-version",
+			"x-stainless-lang",
+			"x-stainless-runtime-version",
+			"session_id",
+			"x-client-request-id",
+		])
+			expect(headers.get(name)).toBeNull();
+	});
+
+	it.each([
+		["github-copilot", undefined, undefined],
+		["github-copilot", 2048, 2048],
+		["openai", undefined, 32_000],
+		["openai", 2048, 2048],
+	] as const)("scopes simple output defaults to %s (override=%s)", async (provider, maxTokens, expected) => {
+		const requests = recordResponseRequests();
+		const result = await streamSimpleOpenAIResponses({ ...copilotResponseModel, provider }, responseContext, {
+			apiKey: "test-key",
+			maxTokens,
+		}).result();
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(1);
+		expect(requests[0].body.max_output_tokens).toBe(expected);
+	});
+
+	it.each(["off", undefined] as const)("honors explicit Copilot reasoning selection: %s", async (reasoning) => {
+		const requests = recordResponseRequests();
+		const model = getModel("github-copilot", "gpt-5.4");
+		const result = await streamSimpleOpenAIResponses(model, responseContext, {
+			apiKey: "test-key",
+			reasoning,
+		}).result();
+		expect(result.stopReason).toBe("stop");
+		expect(requests).toHaveLength(1);
+		expect(requests[0].body.reasoning).toEqual(reasoning === "off" ? { effort: "none" } : undefined);
+		expect(requests[0].body.include).toBeUndefined();
+	});
+
+	const sampling = "Unsupported parameter: 'temperature' is not supported with this model.";
+	const effortError = 'reasoning_effort "max" is not supported by model gpt-5.4; supported values: [low medium high]';
+	it.each([
+		["sampling", 400, "github-copilot", sampling, false, 2, "stop", undefined, "max"],
+		["effort", 400, "github-copilot", effortError, false, 2, "stop", 0.5, "high"],
+		["second rejection", 400, "github-copilot", sampling, true, 2, "error", undefined, "max"],
+		["tools", 400, "github-copilot", "Unsupported parameter: 'tools'", false, 1, "error", 0.5, "max"],
+		["input", 400, "github-copilot", "Unsupported parameter: 'input'", false, 1, "error", 0.5, "max"],
+		["unknown error", 400, "github-copilot", "Bad request", false, 1, "error", 0.5, "max"],
+		["non-400", 422, "github-copilot", sampling, false, 1, "error", 0.5, "max"],
+		["other provider", 400, "openai", sampling, false, 1, "error", 0.5, "max"],
+	] as const)(
+		"adjusts only a fixable Copilot 400 once: %s",
+		async (_name, status, provider, message, repeat, attempts, stopReason, temperature, effort) => {
+			const requests = recordResponseRequests({ status, message, repeat });
+			const result = await streamOpenAIResponses({ ...copilotResponseModel, provider }, responseContext, {
+				apiKey: "test-key",
+				onPayload: (payload) => ({
+					...(payload as Record<string, unknown>),
+					temperature: 0.5,
+					reasoning: { effort: "max", summary: "auto" },
+				}),
+			}).result();
+			expect(requests).toHaveLength(attempts);
+			expect(result.stopReason).toBe(stopReason);
+			expect(result.errorMessage).toEqual(stopReason === "error" ? expect.stringContaining(message) : undefined);
+			const last = requests[requests.length - 1].body;
+			expect(last.temperature).toBe(temperature);
+			expect(last.reasoning).toEqual({ effort, summary: "auto" });
+			expect(last.input).toEqual(requests[0].body.input);
+			expect(last.tools).toEqual(requests[0].body.tools);
+		},
+	);
 });

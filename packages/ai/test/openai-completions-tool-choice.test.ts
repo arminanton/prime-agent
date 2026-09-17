@@ -1419,6 +1419,7 @@ describe("openai-completions tool-result content", () => {
 		cacheControlFormat: "anthropic",
 		sendSessionAffinityHeaders: false,
 		supportsLongCacheRetention: true,
+		nonStreaming: false,
 	};
 
 	function imageModel(): Model<"openai-completions"> {

@@ -366,7 +366,8 @@ function isGemma4Model(modelId: string): boolean {
 function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (
 		(model.api === "openai-responses" || model.api === "azure-openai-responses") &&
-		model.id.startsWith("gpt-5")
+		model.id.startsWith("gpt-5") &&
+		(model.provider !== "github-copilot" || typeof model.thinkingLevelMap?.off !== "string")
 	) {
 		mergeThinkingLevelMap(model, { off: null });
 	}

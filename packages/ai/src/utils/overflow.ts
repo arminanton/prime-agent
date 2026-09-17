@@ -1,3 +1,4 @@
+import { parseCopilotCombinedLimitError, reducedMaxTokensForCombinedLimit } from "../providers/copilot-output-caps.js";
 import type { AssistantMessage } from "../types.js";
 
 /**
@@ -40,6 +41,7 @@ const OVERFLOW_PATTERNS = [
 	/maximum context length is \d+ tokens/i, // OpenRouter (all backends)
 	/exceeds the model's maximum context length/i, // LiteLLM (input + requested output)
 	/exceeds the limit of \d+/i, // GitHub Copilot
+	/model_max_prompt_tokens_exceeded/i, // GitHub Copilot /responses error code (grok and other CAPI-fronted models)
 	/exceeds the available context size/i, // llama.cpp server
 	/greater than the context length/i, // LM Studio
 	/context window exceeds limit/i, // MiniMax
@@ -123,6 +125,10 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 		const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!));
 		if (!isNonOverflow && OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!))) {
 			return true;
+		}
+		if (!isNonOverflow && message.provider === "github-copilot") {
+			const combinedLimit = parseCopilotCombinedLimitError(message.errorMessage);
+			if (combinedLimit && reducedMaxTokensForCombinedLimit(combinedLimit) === undefined) return true;
 		}
 	}
 

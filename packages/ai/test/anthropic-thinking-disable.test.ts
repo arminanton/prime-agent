@@ -1,11 +1,13 @@
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { getModel } from "../src/models.js";
-import { type AnthropicOptions, streamAnthropic } from "../src/providers/anthropic.js";
+import { type AnthropicOptions, streamAnthropic, streamSimpleAnthropic } from "../src/providers/anthropic.js";
 import { streamSimple } from "../src/stream.js";
-import type { Context, Model, SimpleStreamOptions, Tool } from "../src/types.js";
+import type { Context, Model, SimpleStreamOptions, Tool, UserMessage } from "../src/types.js";
+import { isContextOverflow } from "../src/utils/overflow.js";
 
 interface AnthropicThinkingPayload {
 	thinking?: { type: string; budget_tokens?: number; display?: string };
@@ -191,6 +193,11 @@ const toolContext: Context = {
 };
 
 describe("Anthropic request wire contract", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
+	});
 	const testModel: Model<"anthropic-messages"> = {
 		...getModel("anthropic", "claude-opus-4-7"),
 		provider: "test-anthropic",
@@ -247,37 +254,128 @@ describe("Anthropic request wire contract", () => {
 		expect(toolsOf(apiKey.body).map((entry) => entry.name)).toEqual(["todowrite", "find", "my_custom_tool"]);
 	});
 
-	it("sends Copilot bearer auth, Copilot headers, and a valid Anthropic Messages payload", async () => {
-		const model = getModel("github-copilot", "claude-sonnet-4.6");
+	it("sends Copilot bearer auth, CLI identity, and a valid Anthropic Messages payload", async () => {
+		vi.stubEnv("GITHUB_COPILOT_INTEGRATION_ID", "");
+		const model = getModel("github-copilot", "claude-fable-5.1");
 		expect(model.api).toBe("anthropic-messages");
-
 		const request = await captureAnthropicRequest(
 			model as Model<"anthropic-messages">,
 			{ systemPrompt: "You are a helpful assistant.", messages: [{ role: "user", content: "Hello", timestamp: 1 }] },
-			{ apiKey: "tid_copilot_session_test_token" },
+			{
+				apiKey: "tid_copilot_session_test_token",
+				headers: { "User-Agent": "stale", "Editor-Plugin-Version": "stale", "Openai-Intent": "conversation-edits" },
+			},
 		);
-
 		expect(request.headers.authorization).toBe("Bearer tid_copilot_session_test_token");
 		expect(request.headers["x-api-key"]).toBeUndefined();
-		expect(request.headers["user-agent"]).toContain("copilot/1.0.84-5");
+		expect(request.headers["user-agent"]).toMatch(/^copilot\/1\.0\.84-5 .* client\/github\/cli$/);
 		expect(request.headers["copilot-integration-id"]).toBe("copilot-developer-cli");
 		expect(request.headers["x-initiator"]).toBe("user");
-		expect(request.headers["openai-intent"]).toBe("conversation-agent");
-		expect(request.headers["anthropic-beta"] ?? "").not.toContain("fine-grained-tool-streaming");
-
-		expect(request.body.model).toBe("claude-sonnet-4.6");
-		expect(request.body.stream).toBe(true);
-		expect(request.body.max_tokens as number).toBeGreaterThan(0);
+		expect(request.headers["openai-intent"]).toBeUndefined();
+		expect(request.headers["editor-plugin-version"]).toBeUndefined();
+		expect(request.body).toMatchObject({
+			model: "claude-fable-5.1",
+			stream: true,
+			max_tokens: 128_000,
+			temperature: 1,
+		});
 		expect(Array.isArray(request.body.messages)).toBe(true);
 	});
 
-	it("includes the interleaved-thinking beta for non-adaptive Copilot Claude models", async () => {
+	it("allows browser clients without Copilot beta or browser-access headers", async () => {
+		vi.stubGlobal("window", { document: {} });
+		vi.stubGlobal("navigator", { userAgent: "test-browser" });
 		const request = await captureAnthropicRequest(
 			getModel("github-copilot", "claude-haiku-4.5") as Model<"anthropic-messages">,
 			{ messages: [{ role: "user", content: "Hello", timestamp: 1 }] },
 			{ apiKey: "tid_copilot_session_test_token", interleavedThinking: true },
 		);
+		for (const name of [
+			"anthropic-beta",
+			"anthropic-dangerous-direct-browser-access",
+			"x-stainless-lang",
+			"x-stainless-runtime-version",
+		]) {
+			expect(request.headers[name]).toBeUndefined();
+		}
+		expect(request.headers.accept).toBe("*/*");
+		expect(request.headers["x-stainless-helper-method"]).toBe("stream");
+	});
 
-		expect(request.headers["anthropic-beta"]).toContain("interleaved-thinking-2025-05-14");
+	it.each([false, true])("keeps the 128K Copilot output cap on large contexts (image=%s)", async (image) => {
+		const content: UserMessage["content"] = [{ type: "text", text: "word ".repeat(780_000) }];
+		if (image) {
+			const data = readFileSync(new URL("./data/red-circle.png", import.meta.url)).toString("base64");
+			content.push({ type: "image", mimeType: "image/png", data });
+		}
+		const context: Context = { messages: [{ role: "user", timestamp: 1, content }] };
+		const request = await captureAnthropicRequest(
+			getModel("github-copilot", "claude-fable-5.1") as Model<"anthropic-messages">,
+			context,
+			{ apiKey: "test-key" },
+		);
+		expect(request.body.max_tokens).toBe(128_000);
+		expect(request.headers["copilot-vision-request"]).toBe(image ? "true" : undefined);
+	});
+
+	const capError = "max_tokens: 64000 > 8192, which is the maximum allowed number of output tokens";
+	const combinedError = "input length and `max_tokens` exceed context limit: 190000 + 64000 > 200000";
+	const completed =
+		'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n';
+	it.each([
+		["reported cap", capError, 8192, 8192],
+		["combined context", combinedError, 5904, 64_000],
+	] as const)(
+		"reduces output and manual thinking once for a Copilot %s rejection",
+		async (_name, message, reduced, nextCap) => {
+			const model: Model<"anthropic-messages"> = {
+				...getModel("github-copilot", "claude-haiku-4.5"),
+				baseUrl: `https://copilot.invalid/${crypto.randomUUID()}`,
+			};
+			const requests: Record<string, unknown>[] = [];
+			vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+				requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+				return requests.length === 1
+					? Response.json({ type: "error", error: { type: "invalid_request_error", message } }, { status: 400 })
+					: new Response(completed, { headers: { "content-type": "text/event-stream" } });
+			});
+			const context: Context = { messages: [{ role: "user", content: "Hello", timestamp: 1 }] };
+			const result = await streamSimpleAnthropic(model, context, { apiKey: "test-key", reasoning: "max" }).result();
+			expect(result.stopReason).toBe("stop");
+			expect(requests.map((body) => body.max_tokens)).toEqual([64_000, reduced]);
+			expect(requests[0].thinking).toMatchObject({ type: "enabled", budget_tokens: 32_000 });
+			expect(requests[1].thinking).toMatchObject({ type: "enabled", budget_tokens: reduced - 1 });
+			await streamSimpleAnthropic(model, context, { apiKey: "test-key", reasoning: "off" }).result();
+			expect(requests).toHaveLength(3);
+			expect(requests[2].max_tokens).toBe(nextCap);
+		},
+	);
+
+	it.each([
+		["repeated cap", 400, capError, 2, false],
+		["non-400 cap", 422, capError, 1, false],
+		["prompt overflow", 400, "prompt is too long: 1000001 tokens > 1000000 maximum", 1, true],
+		[
+			"exhausted combined context",
+			400,
+			"input length and `max_tokens` exceed context limit: 201000 + 64000 > 200000",
+			1,
+			true,
+		],
+	] as const)("surfaces %s without unbounded adjustment", async (_name, status, message, attempts, overflow) => {
+		const fetchMock = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () =>
+				Response.json({ type: "error", error: { type: "invalid_request_error", message } }, { status }),
+			);
+		const model: Model<"anthropic-messages"> = {
+			...getModel("github-copilot", "claude-haiku-4.5"),
+			baseUrl: `https://copilot.invalid/${crypto.randomUUID()}`,
+		};
+		const result = await streamAnthropic(model, toolContext, { apiKey: "test-key" }).result();
+		expect(fetchMock).toHaveBeenCalledTimes(attempts);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain(message);
+		expect(isContextOverflow(result)).toBe(overflow);
 	});
 });

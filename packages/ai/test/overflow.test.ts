@@ -121,4 +121,16 @@ describe("isContextOverflow", () => {
 		const message = createLengthStopMessage(100, 0, 0);
 		expect(isContextOverflow(message, 200000)).toBe(false);
 	});
+
+	describe("Copilot context rejection", () => {
+		it.each([
+			["model_max_prompt_tokens_exceeded", "github-copilot", true],
+			["input length and `max_tokens` exceed context limit: 190000 + 128000 > 200000", "github-copilot", false],
+			["input length and `max_tokens` exceed context limit: 201000 + 128000 > 200000", "github-copilot", true],
+			["input length and `max_tokens` exceed context limit: 201000 + 128000 > 200000", "anthropic", false],
+			["429 rate limit: model_max_prompt_tokens_exceeded", "github-copilot", false],
+		] as const)("classifies %s for %s", (message, provider, expected) => {
+			expect(isContextOverflow({ ...createErrorMessage(message), provider })).toBe(expected);
+		});
+	});
 });

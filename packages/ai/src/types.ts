@@ -312,6 +312,8 @@ export interface OpenAICompletionsCompat {
 	sendSessionAffinityHeaders?: boolean;
 	/** Whether the provider supports long prompt cache retention (`prompt_cache_retention: "24h"` or Anthropic-style `cache_control.ttl: "1h"`, depending on format). Default: true. */
 	supportsLongCacheRetention?: boolean;
+	/** Use a JSON completion and replay it as events. Defaults to true for Copilot Gemini, false otherwise. */
+	nonStreaming?: boolean;
 }
 
 /** Compatibility settings for OpenAI Responses APIs. */
