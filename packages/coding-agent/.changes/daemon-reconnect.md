@@ -1,2 +1,2 @@
 - Fixed attached clients losing update-restart recovery to stale connection failures or shutdown notices from the retiring daemon.
-- Fixed prepared update restarts archiving sessions and deleting worker descriptors during shutdown.
+- Fixed the daemon archiving sessions and deleting descriptors of workers still registered when a prepared update restart shut down. A manual stop or SIGTERM in the prepared phase now emits `daemon_closing:update`, so clients wait for a successor even when none will start.

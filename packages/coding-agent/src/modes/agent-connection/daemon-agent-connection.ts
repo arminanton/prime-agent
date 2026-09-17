@@ -129,7 +129,7 @@ const updateTransportReconnects = new WeakMap<
 	DaemonTransportClient,
 	{
 		promise: Promise<void>;
-		participants: Set<() => boolean>;
+		participants: Map<() => boolean, string>;
 	}
 >();
 
@@ -157,37 +157,51 @@ function withUpdateDeadline<T>(work: Promise<T>, deadline: number, error: () => 
 function reconnectDaemonTransportAfterUpdate(
 	client: DaemonTransportClient,
 	predecessorGeneration: string | undefined,
+	activeSessionId: string,
 	isActive: () => boolean,
 ): Promise<void> {
 	const transport = client instanceof DaemonRoutedClient ? client.controlPlaneTransport : client;
 	const existing = updateTransportReconnects.get(transport);
 	if (existing) {
-		existing.participants.add(isActive);
+		existing.participants.set(isActive, activeSessionId);
 		return existing.promise;
 	}
-	const participants = new Set([isActive]);
+	const participants = new Map([[isActive, activeSessionId]]);
 	const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
 	let lastError: unknown;
 	const reconnectPromise = withUpdateDeadline(
 		Promise.resolve().then(async () => {
 			transport.disconnectForReconnect("update");
-			while (Date.now() < deadline && [...participants].some((active) => active())) {
+			while (Date.now() < deadline && [...participants.keys()].some((active) => active())) {
 				try {
 					await transport.reconnect(Math.max(1, Math.min(1000, deadline - Date.now())));
-					if (![...participants].some((active) => active())) return;
+					if (![...participants.keys()].some((active) => active())) return;
 					if (Date.now() >= deadline) throw lastError ?? new Error("the updated daemon did not become available");
 					const hello = await transport.waitForHello(Math.max(1, Math.min(3000, deadline - Date.now())));
 					if (predecessorGeneration === undefined || hello.supervisorGeneration !== predecessorGeneration) return;
+					const response = await transport.request(
+						{ type: "list" },
+						Math.max(1, Math.min(30000, deadline - Date.now())),
+						{ recoverable: false },
+					);
+					if (!response.success) throw deserializeDaemonError(response);
+					const readySessionIds = new Set(
+						readSessionSummaries(response.data)
+							.filter((summary) => summary.workerState === undefined || summary.workerState === "ready")
+							.map((summary) => summary.activeSessionId),
+					);
+					// A failed prepare can leave the predecessor serving the same ready session.
+					if ([...participants].some(([active, id]) => active() && readySessionIds.has(id))) return;
 					lastError = new Error("the predecessor daemon is still retiring");
 				} catch (error) {
 					lastError = error;
 					if (Date.now() >= deadline) throw error;
-					if (![...participants].some((active) => active())) return;
+					if (![...participants.keys()].some((active) => active())) return;
 					transport.resetTransportForReconnect();
 				}
 				await delay(Math.max(0, Math.min(UPDATE_RECONNECT_RETRY_MS, deadline - Date.now())));
 			}
-			if ([...participants].some((active) => active())) {
+			if ([...participants.keys()].some((active) => active())) {
 				throw lastError ?? new Error("the updated daemon did not become available");
 			}
 		}),
@@ -1963,6 +1977,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private async handleDaemonMessage(message: DaemonOutbound): Promise<void> {
 		if (this.disposed || this.terminalCloseEmitted) return;
 		if (message.type === "daemon_closing" && message.reason === "update") {
+			if (this.initialAttachPending) return;
 			this.captureDaemonLogPath();
 			void this.reconnectAfterUpdate();
 			return;
@@ -2219,11 +2234,16 @@ export class DaemonAgentConnection implements AgentConnection {
 			.then(() => {
 				if (!isActive()) return;
 				if (this.client instanceof DaemonRoutedClient) this.client.fallbackToSupervisor();
-				return reconnectDaemonTransportAfterUpdate(this.client, predecessorGeneration, isActive);
+				return reconnectDaemonTransportAfterUpdate(
+					this.client,
+					predecessorGeneration,
+					this.activeSessionId,
+					isActive,
+				);
 			})
 			.then(() => {
 				if (!isActive()) return;
-				// Keep the full restore budget after the first successor hello, not after a predecessor reconnect.
+				// Give restoration its own budget once a successor or ready predecessor is available.
 				const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
 				return withUpdateDeadline(
 					this.restoreConnectionAfterUpdate(predecessorGeneration, deadline),
@@ -2268,10 +2288,8 @@ export class DaemonAgentConnection implements AgentConnection {
 				if (this.disposed || this.terminalCloseEmitted) return;
 				const hello = await this.client.waitForHello(Math.max(1, Math.min(3000, deadline - Date.now())));
 				if (this.disposed || this.terminalCloseEmitted) return;
-				if (predecessorGeneration !== undefined && hello.supervisorGeneration === predecessorGeneration) {
-					await delay(Math.max(0, Math.min(UPDATE_RECONNECT_RETRY_MS, deadline - Date.now())));
-					continue;
-				}
+				const isPredecessor =
+					predecessorGeneration !== undefined && hello.supervisorGeneration === predecessorGeneration;
 				// This loop owns retries. Its requests must reject on close, never park behind their own reconnect.
 				const response = await this.client.request(
 					{ type: "list" },
@@ -2283,6 +2301,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				const restored = readSessionSummaries(response.data).find(
 					(summary) =>
 						summary.activeSessionId !== undefined &&
+						(!isPredecessor || summary.activeSessionId === this.activeSessionId) &&
 						((sessionFile !== undefined && summary.sessionFile === sessionFile) ||
 							(sessionId !== undefined && summary.sessionId === sessionId)),
 				);

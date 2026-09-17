@@ -763,39 +763,50 @@ function emitSequencedQueueUpdate(client: FakeDaemonClient, activeSessionId: str
 }
 
 describe("DaemonAgentConnection", () => {
-	it("falls back to the supervisor when the direct socket closes during initial attach", async () => {
-		const supervisor = new FakeDaemonClient();
-		const closeListeners = new Set<(error: Error) => void>();
-		let directConnected = true;
-		const direct = {
-			get isConnected() {
-				return directConnected;
-			},
-			onMessage: () => () => {},
-			onClose: (listener: (error: Error) => void) => {
-				closeListeners.add(listener);
-				return () => closeListeners.delete(listener);
-			},
-			request: async () => {
-				directConnected = false;
-				const error = new Error("direct attach socket closed");
-				for (const listener of [...closeListeners]) listener(error);
+	it.each(["socket loss", "update fence"])(
+		"falls back to the supervisor during initial attach after %s (#2260)",
+		async (cause) => {
+			vi.useFakeTimers();
+			const supervisor = new FakeDaemonClient();
+			supervisor.hello = { ...supervisor.hello!, supervisorGeneration: "predecessor" };
+			supervisor.updateRestartSessions = [
+				{ activeSessionId: "active-1", sessionId: "session-current", workerState: "ready" },
+			];
+			const direct = new FakeDaemonClient();
+			let release!: () => void;
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			direct.request = async () => {
+				if (cause === "update fence") direct.emitMessage({ type: "daemon_closing", reason: "update" });
+				direct.connected = false;
+				const error = new DaemonSocketClosedError(
+					"/tmp/worker.sock",
+					cause === "update fence" ? "update" : undefined,
+				);
+				direct.emitClose(error);
+				await gate;
 				throw error;
-			},
-			close: () => {
-				directConnected = false;
-			},
-		} as unknown as DaemonWorkerClient;
-		const routed = new DaemonRoutedClient(asDaemonClient(supervisor), direct);
-
-		const connection = await DaemonAgentConnection.attach(routed, "active-1");
-
-		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
-			state: { activeSessionId: "active-1" },
-		});
-		expect(supervisor.requests.filter((request) => request.type === "attach")).toHaveLength(1);
-		await connection.dispose();
-	});
+			};
+			const routed = new DaemonRoutedClient(asDaemonClient(supervisor), direct as unknown as DaemonWorkerClient);
+			let connection: DaemonAgentConnection | undefined;
+			try {
+				const pendingAttach = DaemonAgentConnection.attach(routed, "active-1");
+				await vi.advanceTimersByTimeAsync(0);
+				release();
+				connection = await pendingAttach;
+				await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+					state: { activeSessionId: "active-1" },
+				});
+				expect(supervisor.requests.filter((request) => request.type === "attach")).toHaveLength(1);
+			} finally {
+				release();
+				await connection?.dispose();
+				routed.close();
+				vi.useRealTimers();
+			}
+		},
+	);
 
 	it("keeps serving the session on the direct link and reconnects a lost supervisor socket", async () => {
 		const supervisor = new FakeDaemonClient();
@@ -1157,57 +1168,50 @@ describe("DaemonAgentConnection", () => {
 		await connection.dispose();
 	});
 
-	it("takes update restoration when the direct link closes for an update while a pause is held", async () => {
-		const supervisor = new FakeDaemonClient();
-		supervisor.serverCapabilities.add("session_input_pause");
-		supervisor.updateRestartSessions = [
-			{
-				id: "active-restored",
-				activeSessionId: "active-restored",
-				sessionId: "session-current",
-				sessionFile: "/tmp/session-current.jsonl",
-			},
-		];
-		const closeListeners = new Set<(error: Error) => void>();
-		let directConnected = true;
-		const direct = {
-			get isConnected() {
-				return directConnected;
-			},
-			hello: supervisor.hello,
-			supportsServerCapability: (capability: string) => supervisor.supportsServerCapability(capability),
-			onMessage: () => () => {},
-			onClose: (listener: (error: Error) => void) => {
-				closeListeners.add(listener);
-				return () => closeListeners.delete(listener);
-			},
-			request: async (command: Extract<DaemonCommand, { type: "attach" }>) => ({
-				type: "response" as const,
-				command: "attach" as const,
-				success: true as const,
-				data: createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12),
-			}),
-			close: () => {
-				directConnected = false;
-			},
-		} as unknown as DaemonWorkerClient;
-		const routed = new DaemonRoutedClient(asDaemonClient(supervisor), direct);
-		const connection = await DaemonAgentConnection.attach(routed, "active-1");
-		const events: AgentConnectionEvent[] = [];
-		connection.subscribe(async (event) => {
-			events.push(event);
-		});
-		await connection.acquireSessionInputPause("lease-1");
-
-		directConnected = false;
-		for (const listener of [...closeListeners]) {
-			listener(new DaemonSocketClosedError("/tmp/worker.sock", "update"));
-		}
-
-		await vi.waitFor(() => expect(events.some((event) => event.type === "session_resynced")).toBe(true));
-		expect(events.some((event) => event.type === "closed")).toBe(false);
-		await connection.dispose();
-	});
+	it.each([
+		["rollback", "ready"],
+		["rollback", undefined],
+		["restart", "ready"],
+	] as const)(
+		"restores a pause-held direct link after update prepare %s (workerState=%s, #2260)",
+		async (outcome, workerState) => {
+			vi.useFakeTimers();
+			const supervisor = new FakeDaemonClient();
+			supervisor.hello = { ...supervisor.hello!, supervisorGeneration: "predecessor" };
+			supervisor.serverCapabilities.add("session_input_pause");
+			const activeSessionId = outcome === "rollback" ? "active-1" : "active-restored";
+			supervisor.updateRestartSessions = [{ activeSessionId, sessionId: "session-current", workerState }];
+			const direct = new FakeDaemonClient();
+			const routed = new DaemonRoutedClient(asDaemonClient(supervisor), direct as unknown as DaemonWorkerClient);
+			const connection = new DaemonAgentConnection(routed, "active-1");
+			const events: AgentConnectionEvent[] = [];
+			try {
+				await connection.attach();
+				connection.subscribe((event) => {
+					events.push(event);
+				});
+				const pause = await connection.acquireSessionInputPause("lease-1");
+				direct.emitMessage({ type: "daemon_closing", reason: "update" });
+				direct.connected = false;
+				direct.emitClose(new DaemonSocketClosedError("/tmp/worker.sock", "update"));
+				await vi.advanceTimersByTimeAsync(0);
+				if (outcome === "restart") {
+					expect(events.filter((event) => event.type === "session_resynced")).toEqual([]);
+					supervisor.hello = { ...supervisor.hello!, supervisorGeneration: "successor" };
+				}
+				await vi.advanceTimersByTimeAsync(120100);
+				expect(events.filter((event) => event.type === "closed")).toEqual([]);
+				expect(events.filter((event) => event.type === "session_resynced")).toMatchObject([
+					{ snapshot: { state: { activeSessionId, sessionId: "session-current" } } },
+				]);
+				await expect(pause.release()).rejects.toThrow("invalidated by a daemon reconnect");
+			} finally {
+				await connection.dispose();
+				routed.close();
+				vi.useRealTimers();
+			}
+		},
+	);
 
 	it("outlives the reconnect deadline while the direct link streams, then bounds recovery once it dies", async () => {
 		const supervisor = new FakeDaemonClient();
@@ -1287,7 +1291,7 @@ describe("DaemonAgentConnection", () => {
 			supervisor.emitClose(new DaemonSocketClosedError("/tmp/fake.sock", "shutdown"));
 			await vi.advanceTimersByTimeAsync(0);
 			expect(events.flat().filter((event) => event.type === "closed")).toEqual([]);
-			expect(supervisor.requests.filter((request) => request.type === "list")).toEqual([]);
+			expect(events.flat().filter((event) => event.type === "session_resynced")).toEqual([]);
 			supervisor.hello = { ...supervisor.hello!, supervisorGeneration: "successor" };
 			await vi.advanceTimersByTimeAsync(100);
 			expect(supervisor.closeCount).toBe(1);
