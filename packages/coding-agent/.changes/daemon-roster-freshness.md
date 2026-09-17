@@ -1,0 +1,1 @@
+- Fixed stale subagent running and inactive counts after reconnecting to the daemon.

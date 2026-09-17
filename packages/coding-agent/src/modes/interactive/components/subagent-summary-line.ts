@@ -67,6 +67,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 	focused = false;
 	private counts: SubagentSummaryCounts = { total: 0, running: 0, idle: 0, inactive: 0 };
 	private openable = false;
+	private reconnecting = false;
 
 	onOpen?: () => void;
 	onCancel?: () => void;
@@ -87,8 +88,12 @@ export class SubagentSummaryLine implements Component, Focusable {
 		this.openable = openable;
 	}
 
+	setReconnecting(reconnecting: boolean): void {
+		this.reconnecting = reconnecting;
+	}
+
 	isSelectable(): boolean {
-		return !this.getPickerOpen() && this.counts.total > 0 && this.openable;
+		return !this.reconnecting && !this.getPickerOpen() && this.counts.total > 0 && this.openable;
 	}
 
 	handleInput(data: string): void {
@@ -111,7 +116,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 	render(width: number): string[] {
 		if (this.getPickerOpen()) return [];
 		const lines = this.renderInfoLine(width);
-		if (this.counts.total === 0) return lines;
+		if (this.reconnecting || this.counts.total === 0) return lines;
 		if (width < 2) return lines;
 		const safeWidth = width;
 		const inner = safeWidth - 2;

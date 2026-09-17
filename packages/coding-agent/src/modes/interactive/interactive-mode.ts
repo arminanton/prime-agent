@@ -1225,6 +1225,7 @@ export class InteractiveMode {
 	private subagentSummaryLine: SubagentSummaryLine;
 	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private rlmNodeId: string | undefined;
+	private preferResyncedSubagentSnapshots = false;
 	private rosterBar: { summaries(): SessionSummary[]; dispose(): Promise<void> } | undefined;
 
 	private toolOutputExpanded = false;
@@ -1248,6 +1249,8 @@ export class InteractiveMode {
 	private closeServiceCatalogPicker: (() => void) | undefined;
 	private configurationModelSelection: Promise<void> | undefined;
 	private connectionState: AgentConnectionState | undefined;
+	private connectionReconnecting = false;
+	private connectionUiEpoch = 0;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
 	private heartbeatCatalog: AgentConnectionHeartbeat[] = [];
 	private heartbeatRefreshPromise: Promise<void> | undefined;
@@ -3340,6 +3343,7 @@ export class InteractiveMode {
 	}
 
 	private resetCurrentSessionRenderState(options?: { clearPromptStash?: boolean }): void {
+		this.connectionReconnecting = false;
 		this.chatContainer.clear();
 		this.shortcutGuideContainer.clear();
 		this.pendingMessagesContainer.clear();
@@ -5621,6 +5625,7 @@ export class InteractiveMode {
 		if (!this.agentConnection.subscribeAgentRoster) return;
 		try {
 			this.rosterBar = await this.agentConnection.subscribeAgentRoster(() => {
+				if (!this.connectionReconnecting) this.preferResyncedSubagentSnapshots = false;
 				this.updateSubagentSummaryLine();
 				this.ui.requestRender();
 			});
@@ -5686,16 +5691,40 @@ export class InteractiveMode {
 				} else if (event.type === "extension_ui_request") {
 					await this.handleConnectionExtensionUiRequest(event.request);
 				} else if (event.type === "connection_status") {
+					if (event.status === "reconnecting") {
+						this.connectionReconnecting = true;
+						this.connectionUiEpoch++;
+						this.subagentSummaryLine.setReconnecting(true);
+						this.updateSubagentSummaryLine();
+					}
 					this.showStatus(
 						event.status === "connected" ? "Daemon reconnected" : "Daemon connection lost; reconnecting…",
 						event.status === "reconnecting" ? "warning" : "dim",
 					);
 					if (event.status === "connected") {
+						const generation = this.sessionEventGeneration;
+						const epoch = this.connectionUiEpoch;
+						// The adapter emits connected without awaiting its queued resync render.
+						await this.sessionEventQueue;
+						if (
+							generation !== this.sessionEventGeneration ||
+							epoch !== this.connectionUiEpoch ||
+							!this.isInitialized ||
+							this.isShuttingDown ||
+							this.isReturningToAgentsView
+						)
+							return;
+						// A callback during the gap may have been queued by the old roster.
+						if (this.connectionReconnecting) this.preferResyncedSubagentSnapshots = true;
+						this.connectionReconnecting = false;
+						this.subagentSummaryLine.setReconnecting(false);
+						this.updateSubagentSummaryLine();
 						await this.refreshHeartbeatCatalog();
 					}
 				} else if (event.type === "heartbeats_changed") {
 					await this.refreshHeartbeatCatalog();
 				} else if (event.type === "closed") {
+					this.connectionUiEpoch++;
 					this.showError(event.error ?? "Agent connection closed");
 				}
 			} catch (error) {
@@ -6517,9 +6546,10 @@ export class InteractiveMode {
 	}
 
 	private updateSubagentSummaryLine(): void {
-		const rosterSummaries = this.rosterBar?.summaries();
-		// A client-owned session has no row on the public roster; only then do the
-		// snapshots carry the bar. A public parent with zero roster children shows zero.
+		const rosterSummaries = this.preferResyncedSubagentSnapshots ? undefined : this.rosterBar?.summaries();
+		// Without a confirmed roster refresh, use the session's child snapshots.
+		// Otherwise a public parent with zero roster children shows zero; a
+		// client-owned session absent from the roster uses the snapshot fallback.
 		const sessionOnRoster =
 			rosterSummaries?.some((row) => row.sessionId === this.connectionState?.sessionId) === true;
 		this.subagentSummaryLine.setSubagentCounts(
@@ -6542,6 +6572,8 @@ export class InteractiveMode {
 	}
 
 	private resetSubagentSummary(): void {
+		this.subagentSummaryLine.setReconnecting(false);
+		this.preferResyncedSubagentSnapshots = false;
 		this.subagentSnapshots.clear();
 		this.rlmNodeId = undefined;
 		this.updateSubagentSummaryLine();

@@ -16,6 +16,8 @@ import type {
 	AgentConnectionSnapshot,
 	AgentConnectionState,
 } from "../src/modes/agent-connection/types.js";
+import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { SubagentSummaryLine } from "../src/modes/interactive/components/subagent-summary-line.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { QueueSelection } from "../src/modes/interactive/queue-selection.js";
@@ -155,11 +157,11 @@ async function renderMessages(
 	);
 }
 
-describe("InteractiveMode.renderSessionContext", () => {
-	beforeAll(() => {
-		initTheme("dark");
-	});
+beforeAll(() => {
+	initTheme("dark");
+});
 
+describe("InteractiveMode.renderSessionContext", () => {
 	test("renders only the recent tail for very long initial transcripts", async () => {
 		const { harness, chatContainer, addMessageToChat } = createRenderSessionContextHarness();
 		const messages = Array.from({ length: 405 }, (_, index) => userMessage(`message ${index}`, index));
@@ -365,57 +367,88 @@ describe("InteractiveMode connection events", () => {
 		expect(fakeThis.applyConnectionStateSnapshot).toHaveBeenCalledWith(state);
 	});
 
-	test("resynchronizes transcript state without destructive session teardown", async () => {
-		const { fakeThis, emit } = createSubscribeHarness();
-		const snapshot = { state: createConnectionState(), messages: [] as [] };
-
-		await emit({ type: "session_resynced", snapshot });
-
-		expect(fakeThis.renderResyncedSession).toHaveBeenCalledWith(snapshot);
-		// The command catalog must be current before the resynced transcript renders.
-		expect(callOrder(fakeThis.refreshCommandCatalogForCurrentSession)).toBeLessThan(
-			callOrder(fakeThis.renderResyncedSession),
-		);
+	test.each([false, true])("keeps fresh child counts after reconnect (gap callback: %s)", async (gapCallback) => {
+		const line = new SubagentSummaryLine();
+		line.setOpenable(true);
+		const snapshot: AgentConnectionSnapshot = {
+			state: createConnectionState(),
+			messages: [],
+			children: [{ id: "child", label: "child", status: "done", sessionDir: "/tmp/child" }],
+		};
+		const rows = [
+			{ id: "parent", sessionId: "session-1", lifecycle: "live" },
+			{
+				lifecycle: "live",
+				runtimeKind: "subagent",
+				parentSessionId: "session-1",
+				rosterStatus: "running",
+			},
+		] as SessionSummary[];
+		let rosterCallback = () => {};
+		const { fakeThis, emit } = createSubscribeHarness({
+			...createResyncHarness(),
+			isInitialized: true,
+			connectionUiEpoch: 0,
+			connectionState: snapshot.state,
+			subagentSummaryLine: line,
+			subagentSnapshots: new Map(),
+			showStatus: vi.fn(),
+			refreshHeartbeatCatalog: vi.fn(async () => {}),
+			updateWorkingPulse: vi.fn(),
+		});
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+		delete fakeThis.replaceSubagentSummary;
+		delete fakeThis.renderResyncedSession;
+		fakeThis.agentConnection.subscribeAgentRoster = async (callback: () => void) => {
+			rosterCallback = callback;
+			return { summaries: () => rows, dispose: async () => {} };
+		};
+		await fakeThis.subscribeToRosterBar();
+		await emit({ type: "connection_status", status: "connected" });
+		expect(line.render(120).join("\n")).toContain("1 running");
+		for (const resync of [true, false]) {
+			await emit({ type: "connection_status", status: "reconnecting" });
+			if (gapCallback) rosterCallback();
+			const pending = createDeferred<void>();
+			fakeThis.refreshCommandCatalogForCurrentSession.mockReturnValueOnce(pending.promise);
+			const rendering = resync ? emit({ type: "session_resynced", snapshot }) : Promise.resolve();
+			const connected = emit({ type: "connection_status", status: "connected" });
+			expect(line.render(120)).toEqual([]);
+			expect(line.isSelectable()).toBe(false);
+			pending.resolve();
+			await Promise.all([rendering, connected]);
+			expect(line.render(120).join("\n")).toContain("1 inactive");
+			rosterCallback();
+			expect(line.render(120).join("\n")).toContain("1 running");
+		}
 		expect(fakeThis.resetSideQuestion).not.toHaveBeenCalled();
 		expect(fakeThis.resetExtensionUI).not.toHaveBeenCalled();
 		expect(fakeThis.resetCurrentSessionRenderState).not.toHaveBeenCalled();
 		expect(fakeThis.rebindCurrentSession).not.toHaveBeenCalled();
 	});
 
-	test("drops a resync superseded while its command catalog refreshes", async () => {
-		const catalogStarted = createDeferred<void>();
-		const catalog = createDeferred<void>();
+	test.each(["resync", "source event"])("drops a pending %s after the session is replaced", async (kind) => {
+		const started = createDeferred<void>();
+		const pending = createDeferred<void>();
+		const snapshot = { state: createConnectionState(), messages: [] };
 		const { fakeThis, emit } = createSubscribeHarness({
+			sessionEventQueue: kind === "source event" ? pending.promise : Promise.resolve(),
 			refreshCommandCatalogForCurrentSession: vi.fn(() => {
-				catalogStarted.resolve();
-				return catalog.promise;
+				started.resolve();
+				return pending.promise;
 			}),
 		});
-
-		const resync = emit({ type: "session_resynced", snapshot: { state: createConnectionState(), messages: [] } });
-		await catalogStarted.promise;
-		expect(fakeThis.refreshCommandCatalogForCurrentSession).toHaveBeenCalledOnce();
-		const replacement = emit({ type: "session_replaced", state: createConnectionState(), messages: [] });
-		catalog.resolve();
-		await Promise.all([resync, replacement]);
-
-		expect(fakeThis.renderResyncedSession).not.toHaveBeenCalled();
-		expect(fakeThis.renderInitialMessages).toHaveBeenCalledOnce();
-	});
-
-	test("drops a queued source event after the session is replaced", async () => {
-		let releaseQueue: (() => void) | undefined;
-		const blocked = new Promise<void>((resolve) => {
-			releaseQueue = resolve;
-		});
-		const { fakeThis, emit } = createSubscribeHarness({ sessionEventQueue: blocked });
-
-		const staleEvent = emit({ type: "session_event", event: { type: "message_update" } });
-		const replacement = emit({ type: "session_replaced", state: createConnectionState() });
-		releaseQueue?.();
-		await Promise.all([staleEvent, replacement]);
-
+		const stale = emit(
+			kind === "resync"
+				? { type: "session_resynced", snapshot }
+				: { type: "session_event", event: { type: "message_update" } },
+		);
+		if (kind === "resync") await started.promise;
+		const replacement = emit({ type: "session_replaced", state: snapshot.state });
+		pending.resolve();
+		await Promise.all([stale, replacement]);
 		expect(fakeThis.handleEvent).not.toHaveBeenCalled();
+		expect(fakeThis.renderResyncedSession).not.toHaveBeenCalled();
 		expect(fakeThis.renderInitialMessages).toHaveBeenCalledOnce();
 	});
 
